@@ -232,27 +232,24 @@ def _station_footprint_walls(
     *,
     exclude: set[tuple[int, int]] | None = None,
 ) -> set[tuple[int, int]]:
-    """Return the 3x3 footprint of every workstation as wall cells.
+    """Return the diagonal corners of each station's 3x3 footprint as walls.
 
-    The station's center cell stays passable (so workers can reach pickup /
-    delivery), but the 8 surrounding cells are treated as wall. Cells in
-    ``exclude`` are kept passable (used to whitelist this robot's own goal /
-    pickup / delivery so it can still enter from any side).
+    Blocking the full 3x3 sealed every zone in — workers could no longer
+    reach the center because every cardinal approach cell was walled. We
+    only block the 4 diagonal corners; the 4 cardinal-adjacent cells stay
+    passable so a worker can enter the center from any side.
     """
     excluded = exclude or set()
     blocked: set[tuple[int, int]] = set()
     for ws in world_state.get("workstations", []):
         wx, wy = ws.get("pos", [0, 0])
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                if dx == 0 and dy == 0:
-                    continue  # leave the center passable
-                cell = (wx + dx, wy + dy)
-                if cell in excluded:
-                    continue
-                if not (0 <= cell[0] < GRID_WIDTH and 0 <= cell[1] < GRID_HEIGHT):
-                    continue
-                blocked.add(cell)
+        for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            cell = (wx + dx, wy + dy)
+            if cell in excluded:
+                continue
+            if not (0 <= cell[0] < GRID_WIDTH and 0 <= cell[1] < GRID_HEIGHT):
+                continue
+            blocked.add(cell)
     return blocked
 
 
