@@ -466,10 +466,6 @@ def _complete_task_delivery(
         f"task-{task['id']} {task.get('pickup_name','?')}→{task.get('delivery_name','?')} done",
         route_time=route_time,
     )
-    pickup_name = str(task.get("pickup_name", ""))
-    quotas = world_state.get("station_quotas") or {}
-    if pickup_name in quotas:
-        quotas[pickup_name]["completed"] = quotas[pickup_name].get("completed", 0) + 1
 
     robot["path"] = []
     robot["yield_streak"] = 0
@@ -506,6 +502,7 @@ def _reconcile_stationary_task_progress(
     pos = list(robot["pos"])
     if task["status"] == "open" and pos == list(task["pickup"]):
         task["status"] = "in_transit"
+        _apply_station_pickup_quota(task, world_state)
         robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
     if task["status"] == "in_transit" and pos == list(task["delivery"]):
         _complete_task_delivery(robot, task, world_state, blackboard)
@@ -532,6 +529,7 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
     # If at pickup and task not yet in transit
     if list(pos) == list(task["pickup"]) and task["status"] == "open":
         task["status"] = "in_transit"
+        _apply_station_pickup_quota(task, world_state)
         robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
 
     # If at delivery — task done, then stop until the next user task.
@@ -938,6 +936,42 @@ def _enqueue_fleet_tasks(
     return len(routes)
 
 
+def _interleave_station_route_groups(
+    requests: list[tuple[dict, dict, int]],
+) -> list[tuple[dict, dict]]:
+    """Round-robin across station groups so the queue mixes legs (spread workload).
+
+    Without this, ``5x Parts->Assembly`` then ``2x Assembly->QA`` runs every
+    Parts leg before any Assembly pickup — looks like one station at a time.
+    """
+    buckets: list[list[tuple[dict, dict]]] = [
+        [(pickup_ws, delivery_ws)] * count
+        for pickup_ws, delivery_ws, count in requests
+        if count > 0
+    ]
+    routes: list[tuple[dict, dict]] = []
+    while True:
+        progressed = False
+        for bucket in buckets:
+            if bucket:
+                routes.append(bucket.pop(0))
+                progressed = True
+        if not progressed:
+            break
+    return routes
+
+
+def _apply_station_pickup_quota(task: dict, world_state: dict) -> None:
+    """Count 'N tasks for Station' when the worker reaches that station (pickup)."""
+    if task.get("_pickup_quota_applied"):
+        return
+    pickup_name = str(task.get("pickup_name", ""))
+    quotas = world_state.get("station_quotas") or {}
+    if pickup_name in quotas:
+        quotas[pickup_name]["completed"] = quotas[pickup_name].get("completed", 0) + 1
+    task["_pickup_quota_applied"] = True
+
+
 def _generate_fleet_routes(
     world_state: dict,
     count: int,
@@ -968,32 +1002,35 @@ def _generate_fleet_routes(
     return routes
 
 
-def _fleet_pick_worker_deterministic(
+def _fleet_pick_worker_nearest(
     task: dict,
     idle_workers: list[dict],
     wall_set: set,
     world_state: dict,
 ) -> tuple[dict | None, int]:
-    """Assign tasks in stable round-robin order (master plan, not nearest-neighbor chaos)."""
+    """Pick the idle worker closest to this task's pickup (spread + less convoy)."""
     if not idle_workers:
         return None, 10**6
-    ordered = sorted(idle_workers, key=lambda r: r["id"])
-    cursor = int(world_state.get("fleet_dispatch_cursor", 0))
-    n = len(ordered)
-    for offset in range(n):
-        worker = ordered[(cursor + offset) % n]
+    best_worker: dict | None = None
+    best_cost = 10**6
+    for worker in sorted(idle_workers, key=lambda r: r["id"]):
         cost = _estimate_task_cost(worker, task, wall_set, world_state)
-        if cost < 10**6:
-            world_state["fleet_dispatch_cursor"] = (cursor + offset + 1) % n
-            return worker, cost
-    return None, 10**6
+        if cost >= 10**6:
+            continue
+        if cost < best_cost or (cost == best_cost and best_worker is not None and worker["id"] < best_worker["id"]):
+            best_cost = cost
+            best_worker = worker
+    if best_worker is None:
+        return None, 10**6
+    return best_worker, best_cost
 
 
 def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
     """One tick of the autonomous fleet loop.
 
-    Drains queued tasks onto idle workers in FIFO queue order with deterministic
-    round-robin worker selection. Returns the number of tasks dispatched.
+    Drains queued tasks in order, assigning each to the idle worker nearest
+    that task's pickup (deterministic tie-break by robot id). Returns the number
+    of tasks dispatched this tick.
     """
     queue: list[dict] = world_state.get("task_queue", []) or []
     if not queue:
@@ -1025,7 +1062,7 @@ def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
 
     while queue and idle_workers:
         task = queue[0]
-        worker, cost = _fleet_pick_worker_deterministic(
+        worker, cost = _fleet_pick_worker_nearest(
             task, idle_workers, wall_set, world_state,
         )
         if worker is None or cost >= 10**6:
@@ -1489,7 +1526,7 @@ def _interpret_user_task_requests(
             blackboard.post(
                 -1,
                 "STRATEGY",
-                f"Master understood: {summary} (queued in order, exact counts).",
+                f"Master understood: {summary} (interleaved in the queue, exact counts).",
             )
     return requests
 
@@ -1580,8 +1617,8 @@ def _apply_user_task_request(
 
     if requests:
         _apply_station_quota_targets(world_state, requests)
+        routes = _interleave_station_route_groups(requests)
         for pickup_ws, delivery_ws, count in requests:
-            routes.extend([(pickup_ws, delivery_ws)] * count)
             route_summaries.append(f"{count}x {pickup_ws['name']}->{delivery_ws['name']}")
     else:
         # Bulk fleet request: rotate through the whole flow.
@@ -1596,7 +1633,7 @@ def _apply_user_task_request(
         -1,
         "STRATEGY",
         (
-            f"OpenClaw fleet accepted: {summary}; queued={enqueued}, "
+            f"OpenClaw fleet accepted: {summary}; interleaved queue; queued={enqueued}, "
             f"first wave dispatched={dispatched}, queue_remaining="
             f"{len(world_state.get('task_queue', []))}."
         ),

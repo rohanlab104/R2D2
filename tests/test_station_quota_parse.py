@@ -33,3 +33,14 @@ def test_apply_sets_station_targets():
     assert ok
     assert ws["station_quotas"]["QA"]["target"] == 3
     assert ws["station_quotas"]["QA"]["completed"] == 0
+
+
+def test_interleave_station_route_groups_mixes_legs():
+    ws = create_initial_state(OPEN_FLOOR)
+    stations = {w["name"]: w for w in ws["workstations"]}
+    parts, asm, qa = stations["Parts"], stations["Assembly"], stations["QA"]
+    routes = M._interleave_station_route_groups([(parts, asm, 4), (asm, qa, 2)])
+    assert len(routes) == 6
+    assert routes[0][0]["name"] == "Parts" and routes[1][0]["name"] == "Assembly"
+    assert routes[2][0]["name"] == "Parts" and routes[3][0]["name"] == "Assembly"
+    assert routes[4][0]["name"] == "Parts" and routes[5][0]["name"] == "Parts"
