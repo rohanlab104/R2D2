@@ -470,8 +470,16 @@ function syncFactories(world) {
   const seen = new Set();
   for (const f of world.factories || []) {
     seen.add(f.id);
+    const signature = `${f.name}|${f.color}|${JSON.stringify(f.color_rgb || [])}|${f.belt_length || 5}|${JSON.stringify(f.drop_pad || [])}`;
+    if (factories.has(f.id) && factories.get(f.id).userData.signature !== signature) {
+      const stale = factories.get(f.id);
+      scene.remove(stale);
+      dispose(stale);
+      factories.delete(f.id);
+    }
     if (!factories.has(f.id)) {
       const g = new THREE.Group();
+      g.userData.signature = signature;
       const color = hexFrom(f.color_rgb, f.color);
       const shell = new THREE.Mesh(new THREE.BoxGeometry(3.2, 1.45, 2.7), new THREE.MeshStandardMaterial({ color: 0x303944, roughness: 0.52, metalness: 0.38 }));
       shell.position.set(1.6, 0.72, 1.35); shell.castShadow = true; g.add(shell);
@@ -547,8 +555,16 @@ function syncDropboxes(world) {
   const seen = new Set();
   for (const b of world.dropboxes || []) {
     seen.add(b.id);
+    const signature = `${b.name}|${b.color}|${JSON.stringify(b.color_rgb || [])}`;
+    if (dropboxes.has(b.id) && dropboxes.get(b.id).userData.signature !== signature) {
+      const stale = dropboxes.get(b.id);
+      scene.remove(stale);
+      dispose(stale);
+      dropboxes.delete(b.id);
+    }
     if (!dropboxes.has(b.id)) {
       const g = new THREE.Group();
+      g.userData.signature = signature;
       const color = hexFrom(b.color_rgb, b.color);
       const mat = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.12, roughness: 0.48, metalness: 0.25 });
       const floor = new THREE.Mesh(new THREE.BoxGeometry(3, 0.12, 2.2), new THREE.MeshStandardMaterial({ color: 0x202731 }));

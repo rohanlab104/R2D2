@@ -116,6 +116,65 @@ def test_uploaded_generic_bins_match_nearest_conveyor_color() -> None:
     assert [box["color"] for box in world_state["dropboxes"]] == ["Blue", "Green", "Red"]
 
 
+def test_uploaded_typed_bins_keep_exact_legend_colors() -> None:
+    colors = ["Red", "Blue", "Green", "Yellow", "Magenta", "Cyan"]
+    action = {
+        "type": "apply_layout",
+        "worker_count": 3,
+        "order_volume": 6,
+        "layout": {
+            "id": "typed-legend",
+            "name": "Typed Legend",
+            "grid": [["floor"]],
+            "layout": {
+                "shelves": [],
+                "conveyors": [
+                    {
+                        "id": f"conveyor-{color.lower()}",
+                        "x": 3,
+                        "y": 3 + index * 7,
+                        "tile": f"conveyor_{color.lower()}",
+                        "packageColor": color,
+                        "cells": [[3, 3 + index * 7]],
+                    }
+                    for index, color in enumerate(colors)
+                ],
+                "bins": [
+                    {
+                        "id": f"bin-{color.lower()}",
+                        "x": 40,
+                        "y": 3 + index * 7,
+                        "tile": f"bin_{color.lower()}",
+                        "packageColor": color,
+                        "acceptsType": color,
+                        "cells": [[40, 3 + index * 7]],
+                    }
+                    for index, color in enumerate(colors)
+                ],
+                "chargers": [],
+                "obstacles": [],
+                "workerSpawns": [{"id": "spawn", "x": 24, "y": 42, "cells": [[24, 42]]}],
+            },
+        },
+    }
+
+    world_state = _state_from_uploaded_layout(action, 1, "online", "test", False)
+
+    assert [factory["color"] for factory in world_state["factories"]] == colors
+    assert [box["color"] for box in world_state["dropboxes"]] == colors
+
+    blue_factory = world_state["factories"][1]
+    package = _make_package(world_state, blue_factory)
+    package["status"] = "pad"
+    package["progress"] = blue_factory["belt_length"]
+    blue_factory["pad_packages"].append(package)
+    assignments = _deterministic_assignments(world_state)
+    assert assignments
+    target_box = next(box for box in world_state["dropboxes"] if box["id"] == assignments[0]["dropbox_id"])
+    assert package["color"] == "Blue"
+    assert target_box["color"] == "Blue"
+
+
 def test_worker_replans_around_traffic_blocker() -> None:
     world_state = create_initial_state()
     blackboard = Blackboard()
