@@ -647,20 +647,56 @@ def _station_mentions_in_order(text: str, world_state: dict) -> list[dict]:
     return ordered
 
 
-def _requested_task_count(text: str) -> int:
-    words = set(re.findall(r"[a-z0-9]+", text.lower()))
-    word_counts = {
-        "one": 1,
-        "two": 2,
-        "three": 3,
-        "four": 4,
-        "five": 5,
-    }
-    for word, count in word_counts.items():
-        if word in words:
+def _station_mentions_with_positions(text: str, world_state: dict) -> list[tuple[int, int, dict]]:
+    """Return workstation mentions as (start, end, station), preserving repeats."""
+    lower = text.lower()
+    mentions: list[tuple[int, int, str]] = []
+    for alias, canonical in _station_aliases().items():
+        for match in re.finditer(rf"\b{re.escape(alias)}\b", lower):
+            mentions.append((match.start(), match.end(), canonical))
+
+    ordered: list[tuple[int, int, dict]] = []
+    seen_spans: set[tuple[int, int, str]] = set()
+    for start, end, name in sorted(mentions):
+        key = (start, end, name)
+        if key in seen_spans:
+            continue
+        station = _station_by_name(name, world_state)
+        if station:
+            ordered.append((start, end, station))
+            seen_spans.add(key)
+    return ordered
+
+
+_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+}
+
+
+def _count_requested_in_text(text: str, default: int = 1) -> int | str:
+    """Return a small worker count, or 'all'/'rest' for relative requests."""
+    lower = text.lower()
+    if re.search(r"\b(rest|remaining|others)\b", lower):
+        return "rest"
+    if re.search(r"\b(all|everyone|everybody)\b", lower):
+        return "all"
+    for word, count in _COUNT_WORDS.items():
+        if re.search(rf"\b{word}\b", lower):
             return count
-    number = re.search(r"\b([1-5])\b", text)
-    return int(number.group(1)) if number else 1
+    number = re.search(r"\b([1-8])\b", lower)
+    return int(number.group(1)) if number else default
+
+
+def _requested_task_count(text: str) -> int:
+    count = _count_requested_in_text(text)
+    return count if isinstance(count, int) else 1
 
 
 def _parse_user_task_request(text: str, world_state: dict) -> tuple[dict, dict, int] | None:
@@ -962,12 +998,128 @@ def _station_hold_targets(station_pos: list[int], world_state: dict, count: int)
     return targets or [station_pos]
 
 
+def _parse_worker_hold_requests(text: str, world_state: dict) -> list[tuple[dict, int]]:
+    """Parse commands like 'two workers to Shipping, two workers to Parts'."""
+    lower = text.lower()
+    words = set(re.findall(r"[a-z0-9]+", lower))
+    has_motion = bool(words & {"go", "move", "send", "park", "route", "hold", "wait"})
+    if not has_motion:
+        return []
+
+    mentions = _station_mentions_with_positions(text, world_state)
+    if not mentions:
+        return []
+
+    worker_count = max(1, sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER))
+    has_worker_scope = bool(words & {"worker", "workers", "robot", "robots", "bot", "bots", "r2d2"})
+    has_count = bool(re.search(r"\b(?:[1-8]|one|two|three|four|five|six|seven|eight|all|everyone|everybody|rest|remaining|others)\b", lower))
+    has_hold_word = bool(words & {"park", "hold", "wait"})
+    if not (has_worker_scope or has_count or has_hold_word):
+        return []
+
+    requests: list[tuple[dict, int]] = []
+    remaining = worker_count
+    previous_end = 0
+    for start, end, station in mentions:
+        chunk = text[previous_end:start]
+        raw_count = _count_requested_in_text(chunk, default=1)
+        if raw_count == "all":
+            count = remaining
+        elif raw_count == "rest":
+            count = remaining
+        else:
+            count = int(raw_count)
+        count = max(0, min(count, remaining))
+        if count:
+            requests.append((station, count))
+            remaining -= count
+        previous_end = end
+        if remaining <= 0:
+            break
+
+    return requests
+
+
+def _apply_worker_hold_requests(
+    requests: list[tuple[dict, int]],
+    world_state: dict,
+    blackboard: Blackboard,
+) -> bool:
+    """Route workers to requested station hold positions with global nearest matching."""
+    if not requests:
+        return False
+
+    _cancel_pending_decisions()
+    workers = [r for r in world_state.get("robots", []) if r.get("role") == WORKER]
+    if not workers:
+        return False
+
+    for robot in workers:
+        robot["current_task"] = None
+        robot["path"] = []
+
+    for task in world_state.get("tasks", []):
+        if task.get("status") != "done":
+            task["status"] = "cancelled"
+            task["assigned_to"] = None
+
+    targets: list[tuple[dict, list[int]]] = []
+    for station, count in requests:
+        for target in _station_hold_targets(list(station["pos"]), world_state, count):
+            targets.append((station, target))
+            if sum(1 for s, _ in targets if s["name"] == station["name"]) >= count:
+                break
+
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    unassigned_workers = list(workers)
+    assignments: list[tuple[dict, dict, list[int], int]] = []
+    for station, target in targets:
+        if not unassigned_workers:
+            break
+        worker = min(
+            unassigned_workers,
+            key=lambda r: (_route_cost(r["pos"], target, wall_set), r["id"]),
+        )
+        cost = _route_cost(worker["pos"], target, wall_set)
+        if cost >= 10**6:
+            continue
+        assignments.append((worker, station, target, cost))
+        unassigned_workers.remove(worker)
+
+    for worker, station, target, _ in assignments:
+        worker["path"] = _planned_path_to(worker, target, world_state)
+        worker["hold_target"] = target
+        worker["hold_station"] = station["name"]
+
+    world_state["manual_control"] = True
+    summary_counts: dict[str, int] = {}
+    for _, station, _, _ in assignments:
+        summary_counts[station["name"]] = summary_counts.get(station["name"], 0) + 1
+    summary = "; ".join(f"{count} worker(s) to {name}" for name, count in summary_counts.items())
+    blackboard.post(
+        -1,
+        "STRATEGY",
+        f"Manual split command: {summary}.",
+    )
+    print(
+        f"[command] split hold: {summary}",
+        flush=True,
+    )
+    return bool(assignments)
+
+
 def _apply_go_to_station_and_stop(
     text: str,
     world_state: dict,
     blackboard: Blackboard,
 ) -> bool:
     """Handle hard commands like 'go to Parts and stop' without LLM routing."""
+    hold_requests = _parse_worker_hold_requests(text, world_state)
+    if len(hold_requests) > 1 or (
+        hold_requests and re.search(r"\b(worker|workers|robot|robots|bot|bots)\b", text, flags=re.IGNORECASE)
+    ):
+        return _apply_worker_hold_requests(hold_requests, world_state, blackboard)
+
     station = _station_for_user_command(text, world_state)
     if station is None or not _is_go_and_stop_command(text):
         return False
