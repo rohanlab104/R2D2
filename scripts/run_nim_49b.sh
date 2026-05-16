@@ -42,7 +42,15 @@ echo "Logging in to nvcr.io (using NGC_API_KEY)..."
 echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
 echo "Pulling ${IMAGE} (large download — be patient)..."
-docker pull "${IMAGE}"
+if ! docker pull "${IMAGE}"; then
+  cat <<'EOS' >&2
+docker pull failed. If you see "access denied" / "denied" from the registry:
+  • Use an API key from NGC Setup (org.ngc.nvidia.com/setup/api-keys), not only a generic dev key.
+  • In NGC Catalog, accept the license / Get started for this NIM image so your org can pull nvcr.io/nim/...
+  • Ask the lab mentor if your NGC user must be added to an org with NIM entitlement.
+EOS
+  exit 1
+fi
 
 docker rm -f "${NAME}" >/dev/null 2>&1 || true
 

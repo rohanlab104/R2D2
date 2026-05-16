@@ -135,6 +135,15 @@ nvidia-smi && docker --version    # confirm Blackwell GPU + Docker
 
 First pull is 20–40 min; weights are cached in `~/.cache/nim` for fast restarts.
 
+**If `docker pull` says `access denied` after login succeeded**
+
+The token logged into `nvcr.io`, but your **account is not entitled** to pull that **NIM** image path. Try, in order:
+
+1. **NGC API key** — Create one under [NGC → Setup → API key](https://org.ngc.nvidia.com/setup/api-keys) and put it in `.env` as `NVIDIA_API_KEY` (scripts copy it to `NGC_API_KEY` for Docker). A key from another NVIDIA page may work for cloud APIs but **not** for `nvcr.io/nim/...`.
+2. **Catalog license** — In [NGC Catalog](https://catalog.ngc.nvidia.com/), find the **NIM** (e.g. Nemotron Nano 9B), open it, and complete **Get started** / **license acceptance** so your user/org can pull it.
+3. **Org / event** — Hackathon GX10s often need your NGC user in the **team org**, or a mentor **service-account** key with NIM pull access.
+4. **Retry clean login:** `docker logout nvcr.io`, then run the script again (or paste the key manually into `docker login`).
+
 **Verify (third terminal on the GX10)**
 
 ```bash
