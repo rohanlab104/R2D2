@@ -540,9 +540,8 @@ if __name__ == "__main__":
 
     screen = init_display()
     clock  = pygame.time.Clock()
-    end    = time.time() + 8.0
 
-    while time.time() < end:
+    while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
@@ -554,6 +553,3 @@ if __name__ == "__main__":
                     fake_state["connection_status"] = "offline" if s == "online" else "online"
         render(screen, fake_state)
         clock.tick(60)
-
-    pygame.quit()
-    print("render.py v2 smoke test OK")
