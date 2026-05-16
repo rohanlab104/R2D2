@@ -1,0 +1,54 @@
+# FactoryMind R2D2 — runtime agent policy
+# Wraps the simulation so each robot agent (and the strategist) can ONLY
+# touch the resources it actually needs. Logs every blocked attempt to
+# logs/nemoclaw.log for the demo.
+
+name: factorymind
+description: Multi-agent factory simulation with autonomous Nemotron robots.
+
+# Network: agents may only reach the local NIM endpoints on the GX10.
+network:
+  allow:
+    - "127.0.0.1:8000"   # leader / worker NIM (Nemotron Nano 9B)
+    - "127.0.0.1:8001"   # strategist NIM (Llama-3.3 Nemotron Super 49B)
+    - "localhost:8000"
+    - "localhost:8001"
+  deny:
+    - "*"                # every other host, including build.nvidia.com
+
+# Filesystem: agents read their own code + persist memory, nothing else.
+filesystem:
+  read:
+    - "./factorymind/"
+    - "./scripts/"
+    - "./logs/"
+    - "./.env"
+  write:
+    - "./factorymind_memory.db"
+    - "./logs/"
+  deny:
+    - "/etc/"
+    - "/home/"
+    - "/root/"
+    - "/var/"
+    - "/proc/"
+
+# Process: no spawning shells, no SSH, no curl/wget out to the world.
+process:
+  allow_exec:
+    - "python3"
+    - "python"
+  deny_exec:
+    - "/bin/sh"
+    - "/bin/bash"
+    - "ssh"
+    - "scp"
+    - "curl"
+    - "wget"
+
+# Logging: capture every policy decision for the demo
+logging:
+  path: "./logs/nemoclaw.log"
+  events:
+    - allow
+    - deny

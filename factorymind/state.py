@@ -38,11 +38,18 @@ GRID_HEIGHT = 50
 # Workstation definitions per layout
 # ---------------------------------------------------------------------------
 _WORKSTATIONS_BASE = [
-    {"name": "Parts",    "pos": [5,  5],  "color": [220, 50,  50]},
-    {"name": "Assembly", "pos": [30, 5],  "color": [50,  80,  220]},
-    {"name": "QA",       "pos": [30, 35], "color": [50,  180, 80]},
-    {"name": "Shipping", "pos": [5,  35], "color": [220, 200, 50]},
+    {"name": "Parts",    "pos": [4,  4],  "color": [220, 50,  50]},
+    {"name": "Assembly", "pos": [45, 4],  "color": [50,  80,  220]},
+    {"name": "QA",       "pos": [45, 45], "color": [50,  180, 80]},
+    {"name": "Shipping", "pos": [4,  45], "color": [220, 200, 50]},
 ]
+
+# 8 spawn slots arranged in a 4×2 block at grid centre (22–25, 23–24)
+_SPAWN_POSITIONS: list[list[int]] = [
+    [22, 23], [23, 23], [24, 23], [25, 23],
+    [22, 24], [23, 24], [24, 24], [25, 24],
+]
+
 
 def _make_workstations(layout: str) -> list[dict]:
     """Return a fresh copy of workstations for the given layout."""
@@ -85,6 +92,7 @@ def create_initial_state(
         "wall":        [[x, y], ...],
         "stats":       {"completed": 0, "elapsed": 0.0, "rate": 0.0},
         "connection_status": "online",
+        "spawn_positions": [list(sp) for sp in _SPAWN_POSITIONS[:num_leaders + num_workers]],
         "tick":        0,
     }
     """
@@ -92,20 +100,24 @@ def create_initial_state(
     robot_id = 0
 
     for _ in range(num_leaders):
+        sp = _SPAWN_POSITIONS[robot_id % len(_SPAWN_POSITIONS)]
         robots.append({
             "id": robot_id,
             "role": LEADER,
-            "pos": [random.randint(10, 40), random.randint(10, 40)],
+            "pos": list(sp),
+            "spawn_pos": list(sp),
             "path": [],
             "current_task": None,
         })
         robot_id += 1
 
     for _ in range(num_workers):
+        sp = _SPAWN_POSITIONS[robot_id % len(_SPAWN_POSITIONS)]
         robots.append({
             "id": robot_id,
             "role": WORKER,
-            "pos": [random.randint(10, 40), random.randint(10, 40)],
+            "pos": list(sp),
+            "spawn_pos": list(sp),
             "path": [],
             "current_task": None,
         })

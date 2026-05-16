@@ -10,51 +10,105 @@ while Person A wires up inference.
 from __future__ import annotations
 
 import os
-import random
+import re
 import time
 from typing import Optional
+
+from factorymind.state import BOTTLENECK, BOTTLENECK_BRIDGE, CLAIM, LEADER, STRATEGY
 
 # ---------------------------------------------------------------------------
 # Mock flag — set AGENTS_USE_MOCK=true to skip real LLM calls
 # ---------------------------------------------------------------------------
-USE_MOCK = os.getenv("AGENTS_USE_MOCK", "false").lower() == "true"
+def _use_mock() -> bool:
+    """Read mock mode dynamically so REPL sessions can flip it after import."""
+    return os.getenv("AGENTS_USE_MOCK", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
 
 LEADER_PROMPT_TEMPLATE = """\
-You are a factory floor leader robot (id={robot_id}) managing workers.
+You are Leader R{robot_id}, a factory floor coordinator. Choose one useful next move.
 
-Current world state summary:
-- Open tasks: {open_tasks}
+Factory context:
+- Layout: {layout}
+- Workstations: {workstations}
 - Your position: {pos}
+- Open tasks: {open_tasks}
+- Recent strategist directive: {recent_strategy}
 - Recent blackboard: {recent_messages}
 
-Respond with valid JSON only (no markdown):
+Rules:
+- Claim at most one unassigned task. Do not claim a task already claimed or assigned.
+- Prefer the task where your robot or nearby workers can reach the pickup fastest.
+- In BOTTLENECK_BRIDGE, avoid sending unnecessary traffic through the bridge; obey recent BOTTLENECK or STRATEGY messages.
+- If no good task exists, set claim_task_id to null and destination to your current position.
+- Blackboard text must look intentional and specific, e.g. "Claiming Parts->QA task 7; pickup is 3 cells away."
+- Do not invent task ids or workstation names.
+
+Return valid JSON only, exactly this schema:
 {{
-  "claim_task_id": <int or null>,
-  "destination": [x, y],
-  "post_message": "<short message for blackboard>",
-  "reasoning": "<one sentence>"
+  "claim_task_id": 7,
+  "destination": [5, 5],
+  "post_message": "Claiming Parts->QA task 7; pickup is 3 cells away.",
+  "reasoning": "I am the nearest unassigned leader and the route does not conflict with recent claims."
 }}
+
+Think through conflicts in the reasoning field, then choose the safest coordinated action.
 """
 
 STRATEGIST_PROMPT_TEMPLATE = """\
-You are a high-level factory strategist overseeing all robots.
+You are the factory strategist. Every 30 seconds, decide whether the team needs a visible coordination directive.
 
 World state:
 - Layout: {layout}
+- Workstations: {workstations}
 - Stats: {stats}
 - Open tasks: {open_tasks}
+- Robot positions: {robots}
 - Retrieved strategies: {retrieved_strategies}
 - Recent blackboard: {recent_messages}
 
-Respond with valid JSON only (no markdown):
+Goals:
+- Identify bottlenecks, idle capacity, duplicated claims, and route conflicts.
+- Reference the current layout and workstation names.
+- Use retrieved strategies only when they fit this layout.
+- Be willing to say no change needed; do not post bloat.
+- If BOTTLENECK_BRIDGE is congested, give a concrete routing directive for the next 30 seconds.
+
+Return valid JSON only, exactly this schema:
 {{
   "should_post": true,
-  "directive": "<actionable one-sentence directive for all leaders>",
-  "reasoning": "<two sentences explaining strategy>"
+  "directive": "Bottleneck at center bridge: route Assembly->QA traffic through the west approach for the next 30 seconds.",
+  "reasoning": "Several active routes cross y=25 while open work remains on both sides. A temporary lane preference should reduce head-on congestion."
+}}
+
+Most important: post only when the directive changes behavior on screen; otherwise set should_post false.
+{user_instruction}"""
+
+WORKER_PROMPT_TEMPLATE = """\
+You are Worker R{robot_id}, an autonomous floor robot. Pick the single best task to commit to right now.
+
+Factory context:
+- Layout: {layout}
+- Workstations: {workstations}
+- Your position: {pos}
+- Current strategist directive: {recent_strategy}
+- Open or recently claimed tasks: {open_tasks}
+- Recent blackboard: {recent_messages}
+
+Rules:
+- Choose at most one task. Prefer the unassigned task whose pickup is closest to you.
+- You may take over a leader-claimed task only if its leader is farther from the pickup than you (the candidate list includes "pickup_distance" for each).
+- In BOTTLENECK_BRIDGE, avoid tasks whose route crosses y=25 if a recent BOTTLENECK or STRATEGY message says so.
+- If nothing is worth grabbing, set claim_task_id to null and stay put.
+- post_message must be short, specific, and reference the chosen task id, e.g. "W4 grabbing task 12 (Parts->QA), 4 cells to pickup."
+
+Return valid JSON only, exactly this schema:
+{{
+  "claim_task_id": 12,
+  "post_message": "W{robot_id} grabbing task 12 (Parts->QA); 4 cells to pickup.",
+  "reasoning": "I am the closest worker to the Parts pickup and no leader has a shorter path."
 }}
 """
 
@@ -72,14 +126,16 @@ class Blackboard:
     def __init__(self) -> None:
         self._messages: list[dict] = []
 
-    def post(self, from_id: int, msg_type: str, content: str) -> None:
-        """Append a new message to the board."""
-        self._messages.append({
+    def post(self, from_id: int, msg_type: str, content: str, **extra) -> None:
+        """Append a new message to the board. Extra kwargs are merged into the dict."""
+        msg = {
             "from": from_id,
             "type": msg_type,
             "content": content,
             "timestamp": time.time(),
-        })
+        }
+        msg.update(extra)
+        self._messages.append(msg)
 
     def read_recent(self, n: int = 20) -> list[dict]:
         """Return the last n messages."""
@@ -88,6 +144,14 @@ class Blackboard:
     def read_by_type(self, msg_type: str) -> list[dict]:
         """Return all messages matching msg_type."""
         return [m for m in self._messages if m["type"] == msg_type]
+
+    def read_recent_by_type(self, msg_type: str, seconds: float = 30.0) -> list[dict]:
+        """Return recent messages of a type within the last ``seconds``."""
+        cutoff = time.time() - seconds
+        return [
+            m for m in self._messages
+            if m["type"] == msg_type and m.get("timestamp", 0.0) >= cutoff
+        ]
 
     def clear(self) -> None:
         """Remove all messages from the board."""
@@ -111,31 +175,38 @@ def leader_decide(robot: dict, world_state: dict, blackboard: Blackboard) -> dic
         post_message  : str
         reasoning     : str
     """
-    if USE_MOCK:
-        return _mock_leader_decide(robot, world_state)
+    if _use_mock():
+        return _mock_leader_decide(robot, world_state, blackboard)
 
     from factorymind import inference
 
-    open_tasks = [t for t in world_state["tasks"] if t.get("status") == "open"]
-    recent = blackboard.read_recent(5)
+    open_tasks = _candidate_tasks(world_state)
+    recent = blackboard.read_recent(8)
     prompt = LEADER_PROMPT_TEMPLATE.format(
         robot_id=robot["id"],
-        open_tasks=open_tasks[:5],
+        layout=world_state.get("layout"),
+        workstations=_summarize_workstations(world_state),
+        open_tasks=[_summarize_task(t, robot["pos"]) for t in open_tasks[:6]],
         pos=robot["pos"],
+        recent_strategy=_latest_directive(blackboard),
         recent_messages=recent,
     )
-    raw = inference.ask_leader(prompt)
-    parsed = inference.safe_parse_json(raw)
+    try:
+        raw = inference.ask_leader(prompt)
+        parsed = inference.safe_parse_json(raw)
+    except Exception as exc:
+        print(f"[leader {robot['id']}] LLM call failed, using mock: {exc}", flush=True)
+        parsed = None
     if parsed and isinstance(parsed, dict):
-        return parsed
-    # Fallback to mock if parse fails
-    return _mock_leader_decide(robot, world_state)
+        return _normalize_leader_decision(parsed, robot, world_state)
+    return _mock_leader_decide(robot, world_state, blackboard)
 
 
 def strategist_decide(
     world_state: dict,
     blackboard: Blackboard,
     retrieved_strategies: list[dict],
+    user_message: str = "",
 ) -> dict:
     """High-level strategic directive for all leaders.
 
@@ -144,25 +215,77 @@ def strategist_decide(
         directive   : str
         reasoning   : str
     """
-    if USE_MOCK:
-        return _mock_strategist_decide(world_state)
+    if _use_mock():
+        return _mock_strategist_decide(world_state, user_message)
 
     from factorymind import inference
 
-    open_tasks = [t for t in world_state["tasks"] if t.get("status") == "open"]
-    recent = blackboard.read_recent(10)
+    open_tasks = _candidate_tasks(world_state, include_assigned=True)
+    recent = blackboard.read_recent(12)
+    user_section = (
+        f"\nDirect user command: \"{user_message}\"\n"
+        "Your directive MUST address this command specifically.\n"
+        if user_message else ""
+    )
     prompt = STRATEGIST_PROMPT_TEMPLATE.format(
         layout=world_state.get("layout"),
+        workstations=_summarize_workstations(world_state),
         stats=world_state.get("stats"),
-        open_tasks=open_tasks[:10],
+        open_tasks=[_summarize_task(t) for t in open_tasks[:10]],
+        robots=_summarize_robots(world_state),
         retrieved_strategies=retrieved_strategies,
         recent_messages=recent,
+        user_instruction=user_section,
     )
-    raw = inference.ask_strategist(prompt)
-    parsed = inference.safe_parse_json(raw)
+    try:
+        raw = inference.ask_strategist(prompt)
+        parsed = inference.safe_parse_json(raw)
+    except Exception as exc:
+        print(f"[strategist] LLM call failed, using mock: {exc}", flush=True)
+        parsed = None
     if parsed and isinstance(parsed, dict):
-        return parsed
+        return _normalize_strategist_decision(parsed)
     return _mock_strategist_decide(world_state)
+
+
+def worker_decide(robot: dict, world_state: dict, blackboard: Blackboard) -> dict:
+    """LLM-driven decision for a single worker robot.
+
+    Each worker is its own agent: it gets a Nemotron call (the fast 9B leader
+    model) and decides which task to commit to. The path itself is still
+    computed by A* in main.py so movement is deterministic; the LLM's job is
+    goal selection, not motor control.
+
+    Returns a dict with keys:
+        claim_task_id : int | None
+        post_message  : str
+        reasoning     : str
+    """
+    if _use_mock():
+        return _mock_worker_decide(robot, world_state, blackboard)
+
+    from factorymind import inference
+
+    candidate_tasks = _candidate_tasks(world_state, include_assigned=True)
+    recent = blackboard.read_recent(6)
+    prompt = WORKER_PROMPT_TEMPLATE.format(
+        robot_id=robot["id"],
+        layout=world_state.get("layout"),
+        workstations=_summarize_workstations(world_state),
+        pos=robot["pos"],
+        recent_strategy=_latest_directive(blackboard),
+        open_tasks=[_summarize_task(t, robot["pos"]) for t in candidate_tasks[:8]],
+        recent_messages=recent,
+    )
+    try:
+        raw = inference.ask_worker(prompt)  # workers use the fast 9B model
+        parsed = inference.safe_parse_json(raw)
+    except Exception as exc:
+        print(f"[worker {robot['id']}] LLM call failed, using mock: {exc}", flush=True)
+        parsed = None
+    if parsed and isinstance(parsed, dict):
+        return _normalize_worker_decision(parsed, robot, world_state)
+    return _mock_worker_decide(robot, world_state, blackboard)
 
 
 def worker_step(worker_robot: dict, world_state: dict, blackboard: Blackboard) -> list[int]:
@@ -177,42 +300,280 @@ def worker_step(worker_robot: dict, world_state: dict, blackboard: Blackboard) -
     return worker_robot["pos"]
 
 
+def choose_worker_task(worker_robot: dict, world_state: dict, blackboard: Blackboard) -> Optional[int]:
+    """Choose an open task for an idle worker using blackboard-aware heuristics.
+
+    Workers prefer the nearest unassigned pickup. If a leader has claimed a task
+    but this worker is closer to pickup, the worker may assist by taking it over.
+    Recent bottleneck messages penalize cross-bridge traffic.
+    """
+    if worker_robot.get("current_task") is not None or worker_robot.get("path"):
+        return None
+
+    tasks = _candidate_tasks(world_state, include_assigned=True)
+    if not tasks:
+        return None
+
+    leaders = {r["id"]: r for r in world_state["robots"] if r.get("role") == LEADER}
+    claimed_ids = _claimed_task_ids(blackboard)
+    bottleneck_recent = bool(blackboard.read_recent_by_type(BOTTLENECK, seconds=35.0))
+
+    best_task: Optional[dict] = None
+    best_score = 10**9
+    for task in tasks:
+        assigned_to = task.get("assigned_to")
+        worker_dist = _manhattan(worker_robot["pos"], task["pickup"])
+
+        if assigned_to is not None:
+            leader = leaders.get(assigned_to)
+            if not leader:
+                continue
+            if worker_dist >= _manhattan(leader["pos"], task["pickup"]):
+                continue
+
+        score = worker_dist
+        if task["id"] in claimed_ids:
+            score -= 2
+        if bottleneck_recent and _crosses_bridge(task):
+            score += 12
+
+        if score < best_score:
+            best_task = task
+            best_score = score
+
+    return best_task["id"] if best_task else None
+
+
 # ---------------------------------------------------------------------------
 # Mock implementations
 # ---------------------------------------------------------------------------
 
-def _mock_leader_decide(robot: dict, world_state: dict) -> dict:
+def _mock_leader_decide(robot: dict, world_state: dict, blackboard: Optional[Blackboard] = None) -> dict:
     """Return a sensible mock leader decision without calling any LLM."""
-    open_tasks = [t for t in world_state["tasks"] if t.get("status") == "open"]
+    # Don't re-claim while already executing a task
+    if robot.get("current_task") is not None:
+        return {
+            "claim_task_id": None,
+            "destination": robot["pos"],
+            "post_message": f"Leader {robot['id']} busy on task {robot['current_task']}.",
+            "reasoning": "Mock: already executing a task; holding position.",
+        }
+
+    open_tasks = _candidate_tasks(world_state)
     claim_id: Optional[int] = None
     destination = robot["pos"]
+    task: Optional[dict] = None
 
     if open_tasks:
-        task = random.choice(open_tasks)
+        task = min(
+            open_tasks,
+            key=lambda t: (_manhattan(robot["pos"], t["pickup"]), t["id"]),
+        )
         claim_id = task["id"]
         destination = task["pickup"]
+
+    distance = _manhattan(robot["pos"], destination)
+    message = (
+        _format_claim_message(task, distance)
+        if task
+        else f"Leader {robot['id']} holding position; no unassigned task is ready."
+    )
+    return {
+        "claim_task_id": claim_id,
+        "destination": destination,
+        "post_message": message,
+        "reasoning": "Mock: chose the nearest unassigned pickup while avoiding duplicate claims.",
+    }
+
+
+def _mock_worker_decide(robot: dict, world_state: dict, blackboard: Optional[Blackboard] = None) -> dict:
+    """Heuristic worker decision used when AGENTS_USE_MOCK=true or LLM fails."""
+    task_id = choose_worker_task(robot, world_state, blackboard or Blackboard())
+    if task_id is None:
+        return {
+            "claim_task_id": None,
+            "post_message": f"W{robot['id']} idle; no nearby task worth grabbing.",
+            "reasoning": "Mock: no candidate tasks improve on current rule-based heuristic.",
+        }
+    task = next((t for t in world_state["tasks"] if t["id"] == task_id), None)
+    distance = _manhattan(robot["pos"], task["pickup"]) if task else 0
+    route = (
+        f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
+        if task else "?"
+    )
+    return {
+        "claim_task_id": task_id,
+        "post_message": f"W{robot['id']} grabbing task {task_id} ({route}); {distance} cells to pickup.",
+        "reasoning": "Mock: closest unassigned (or shorter than the assigned leader) pickup wins.",
+    }
+
+
+def _mock_strategist_decide(world_state: dict, user_message: str = "") -> dict:
+    """Return a hardcoded reasonable strategist directive."""
+    open_count = sum(1 for t in world_state["tasks"] if t.get("status") == "open")
+    layout = world_state.get("layout")
+    if user_message:
+        directive = f"Acknowledged: {user_message[:80]}. Assigning nearest workers to priority tasks."
+    elif layout == BOTTLENECK_BRIDGE:
+        directive = (
+            "Bottleneck at center bridge: keep cross-wall trips sparse and let nearest workers assist claimed pickups."
+        )
+    elif open_count > 3:
+        directive = (
+            "Open floor surge: nearest idle workers should clear pickup queues before leaders take long routes."
+        )
+    else:
+        directive = "No change needed: task flow is light, so keep nearest-pickup dispatch."
+    return {
+        "should_post": open_count > 0 or bool(user_message),
+        "directive": directive,
+        "reasoning": (
+            f"Mock: responding to user command." if user_message else
+            "Mock strategist: layout and queue depth are the main heuristics. "
+            "The directive is concise so the blackboard stays readable."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared heuristics and formatting
+# ---------------------------------------------------------------------------
+
+def _candidate_tasks(world_state: dict, include_assigned: bool = False) -> list[dict]:
+    """Return open tasks, optionally including leader-assigned tasks for assist logic."""
+    tasks = []
+    for task in world_state.get("tasks", []):
+        if task.get("status") != "open":
+            continue
+        if include_assigned or task.get("assigned_to") is None:
+            tasks.append(task)
+    return tasks
+
+
+def _manhattan(a: list[int], b: list[int]) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def _summarize_task(task: dict, from_pos: Optional[list[int]] = None) -> dict:
+    summary = {
+        "id": task.get("id"),
+        "route": f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}",
+        "pickup": task.get("pickup"),
+        "delivery": task.get("delivery"),
+        "assigned_to": task.get("assigned_to"),
+    }
+    if from_pos is not None and task.get("pickup"):
+        summary["pickup_distance"] = _manhattan(from_pos, task["pickup"])
+    return summary
+
+
+def _summarize_workstations(world_state: dict) -> list[dict]:
+    return [
+        {"name": ws.get("name"), "pos": ws.get("pos")}
+        for ws in world_state.get("workstations", [])
+    ]
+
+
+def _summarize_robots(world_state: dict) -> list[dict]:
+    return [
+        {
+            "id": r.get("id"),
+            "role": r.get("role"),
+            "pos": r.get("pos"),
+            "task": r.get("current_task"),
+        }
+        for r in world_state.get("robots", [])
+    ]
+
+
+def _latest_directive(blackboard: Blackboard) -> str:
+    for msg in reversed(blackboard.read_recent(20)):
+        if msg.get("type") in {STRATEGY, BOTTLENECK}:
+            return str(msg.get("content", ""))
+    return "None."
+
+
+def _claimed_task_ids(blackboard: Blackboard) -> set[int]:
+    ids: set[int] = set()
+    for msg in blackboard.read_recent_by_type(CLAIM, seconds=30.0):
+        content = str(msg.get("content", ""))
+        for match in re.findall(r"(?:task\s*#?|task-)(\d+)", content, flags=re.IGNORECASE):
+            ids.add(int(match))
+    return ids
+
+
+def _format_claim_message(task: dict, distance: int) -> str:
+    route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
+    return f"Claiming {route} task {task['id']}; pickup is {distance} cells away."
+
+
+def _crosses_bridge(task: dict) -> bool:
+    pickup = task.get("pickup") or [0, 0]
+    delivery = task.get("delivery") or [0, 0]
+    return (pickup[1] < 25 < delivery[1]) or (delivery[1] < 25 < pickup[1])
+
+
+def _normalize_leader_decision(parsed: dict, robot: dict, world_state: dict) -> dict:
+    """Validate model output and keep it inside the simulation contract."""
+    open_ids = {t["id"] for t in _candidate_tasks(world_state)}
+    claim_id = parsed.get("claim_task_id")
+    if claim_id not in open_ids:
+        claim_id = None
+
+    task = next((t for t in world_state.get("tasks", []) if t.get("id") == claim_id), None)
+    destination = parsed.get("destination")
+    if task:
+        destination = task["pickup"]
+    elif not (
+        isinstance(destination, list)
+        and len(destination) == 2
+        and all(isinstance(v, int) for v in destination)
+    ):
+        destination = robot["pos"]
+
+    message = str(parsed.get("post_message", "")).strip()
+    if task and ("task" not in message.lower() or str(task["id"]) not in message):
+        message = _format_claim_message(task, _manhattan(robot["pos"], task["pickup"]))
+    elif not message:
+        message = f"Leader {robot['id']} holding position; no safe claim right now."
 
     return {
         "claim_task_id": claim_id,
         "destination": destination,
-        "post_message": f"Leader {robot['id']} claiming task {claim_id}",
-        "reasoning": "Mock: picked random open task.",
+        "post_message": message[:180],
+        "reasoning": str(parsed.get("reasoning", "Validated model decision."))[:220],
     }
 
 
-def _mock_strategist_decide(world_state: dict) -> dict:
-    """Return a hardcoded reasonable strategist directive."""
-    open_count = sum(1 for t in world_state["tasks"] if t.get("status") == "open")
-    directive = (
-        "Prioritise clearing the Parts queue — dispatch all idle workers to pickup."
-        if open_count > 3
-        else "Steady state: maintain round-robin task distribution across workstations."
-    )
+def _normalize_strategist_decision(parsed: dict) -> dict:
+    directive = str(parsed.get("directive", "")).strip()
+    should_post = bool(parsed.get("should_post")) and bool(directive)
     return {
-        "should_post": True,
-        "directive": directive,
-        "reasoning": (
-            "Mock strategist: queue depth used as primary heuristic. "
-            "Leaders should coordinate via CLAIM messages to avoid contention."
-        ),
+        "should_post": should_post,
+        "directive": directive[:220],
+        "reasoning": str(parsed.get("reasoning", ""))[:260],
+    }
+
+
+def _normalize_worker_decision(parsed: dict, robot: dict, world_state: dict) -> dict:
+    """Validate worker LLM output against the live task list."""
+    candidates = _candidate_tasks(world_state, include_assigned=True)
+    candidate_ids = {t["id"] for t in candidates}
+    claim_id = parsed.get("claim_task_id")
+    if claim_id not in candidate_ids:
+        claim_id = None
+
+    task = next((t for t in candidates if t.get("id") == claim_id), None)
+    message = str(parsed.get("post_message", "")).strip()
+    if task and ("task" not in message.lower() or str(task["id"]) not in message):
+        distance = _manhattan(robot["pos"], task["pickup"])
+        route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
+        message = f"W{robot['id']} grabbing task {task['id']} ({route}); {distance} cells to pickup."
+    elif not message:
+        message = f"W{robot['id']} idle; holding position."
+
+    return {
+        "claim_task_id": claim_id,
+        "post_message": message[:180],
+        "reasoning": str(parsed.get("reasoning", "Validated worker decision."))[:220],
     }
