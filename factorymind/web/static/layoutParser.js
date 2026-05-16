@@ -20,7 +20,7 @@ export async function parseLayoutImageFile(file, options = {}) {
   canvas.width = gridWidth;
   canvas.height = gridHeight;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingEnabled = false;
   ctx.clearRect(0, 0, gridWidth, gridHeight);
   ctx.drawImage(image, 0, 0, gridWidth, gridHeight);
   const { data } = ctx.getImageData(0, 0, gridWidth, gridHeight);

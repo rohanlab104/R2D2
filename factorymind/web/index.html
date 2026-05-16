@@ -53,7 +53,7 @@
   .metric .k { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; white-space: nowrap; }
   .metric .v { margin-top: 4px; color: var(--text); font-size: 20px; font-weight: 800; white-space: nowrap; }
   .metric .v.good { color: var(--green); } .metric .v.warn { color: var(--amber); }
-  .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
   .tab-panel { display: none; flex: 1 1 auto; min-height: 0; overflow: hidden; flex-direction: column; gap: 12px; }
   .tab-panel.active { display: flex; }
   .controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
@@ -75,6 +75,49 @@
     background: var(--panel2); color: var(--text); padding: 0 10px;
     font: 700 12px/1 Inter, ui-sans-serif, system-ui;
   }
+  input[type="file"] {
+    width: 100%; color: var(--muted); font-size: 11px;
+  }
+  input[type="range"] {
+    width: 100%;
+    accent-color: var(--cyan);
+  }
+  .twin-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  #layout-preview {
+    width: 100%;
+    height: 190px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #0b1017;
+  }
+  #layout-status, #recommendations, #scenario-table {
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.45;
+  }
+  #layout-status strong { color: var(--text); }
+  #layout-status .bad { color: var(--red); }
+  #layout-status .good { color: var(--green); }
+  #recommendations {
+    display: grid;
+    gap: 6px;
+    padding: 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(255,255,255,.025);
+  }
+  .scenario-row {
+    display: grid;
+    grid-template-columns: 1.2fr .8fr .8fr .8fr;
+    gap: 6px;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(255,255,255,.06);
+  }
+  .scenario-row:last-child { border-bottom: 0; }
   .build-note { color: var(--muted); font-size: 11px; line-height: 1.45; }
   .section { display: flex; justify-content: space-between; align-items: center; color: var(--cyan); font-size: 11px; font-weight: 800; letter-spacing: .08em; }
   #status { color: var(--amber); }
@@ -115,6 +158,7 @@
     <div class="tabs">
       <button class="active" id="tab-ops">OPERATIONS</button>
       <button id="tab-build">BUILD MODE</button>
+      <button id="tab-twin">DIGITAL TWIN</button>
     </div>
     <div class="tab-panel active" id="ops-panel">
       <div class="metrics">
@@ -172,11 +216,50 @@
         <div class="metric"><div class="k">Drop bins</div><div class="v" id="b-dropbins">0</div></div>
       </div>
     </div>
+    <div class="tab-panel" id="twin-panel">
+      <div class="build-card">
+        <div class="section"><span>LAYOUT UPLOAD</span><span>PNG COLOR MAP</span></div>
+        <label class="field">Upload controlled PNG
+          <input type="file" id="layout-file" accept="image/png">
+        </label>
+        <canvas id="layout-preview" width="320" height="220"></canvas>
+        <div id="layout-status">Upload a PNG using the warehouse color map.</div>
+        <div class="twin-grid">
+          <label class="field">Workers <span id="worker-count-value">3</span>
+            <input type="range" id="worker-count" min="1" max="16" value="3">
+          </label>
+          <label class="field">Order volume <span id="order-volume-value">6</span>
+            <input type="range" id="order-volume" min="1" max="20" value="6">
+          </label>
+        </div>
+        <div class="controls">
+          <button class="good" id="apply-layout">APPLY LAYOUT</button>
+          <button id="save-layout-json">SAVE JSON</button>
+          <button id="load-layout-json-btn">LOAD JSON</button>
+        </div>
+        <input type="file" id="layout-json-file" accept="application/json,.json" hidden>
+      </div>
+      <div class="section"><span>SCENARIOS</span><span>BASELINE / VARIANTS</span></div>
+      <div class="controls">
+        <button id="capture-baseline">SET BASELINE</button>
+        <button id="capture-variant">SAVE VARIANT</button>
+        <button id="clear-scenarios">CLEAR</button>
+      </div>
+      <div id="scenario-table"></div>
+      <div class="section"><span>RECOMMENDATIONS</span></div>
+      <div id="recommendations">Run a scenario to generate layout recommendations.</div>
+    </div>
   </aside>
 </div>
 <script type="module">
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { parseLayoutImageFile, drawLayoutPreview } from "./static/layoutParser.js";
+import { validateLayout } from "./static/layoutValidation.js";
+import { buildApplyLayoutAction, downloadJson, exportLayoutJson, readJsonFile } from "./static/layoutAdapter.js";
+import { collectMetrics, formatMetric } from "./static/metricsCollector.js";
+import { buildRecommendations } from "./static/recommendationEngine.js";
+import { compareScenarios, createScenario } from "./static/scenarioRunner.js";
 
 const GRID = 50;
 const STATE_URL = "/state.json";
@@ -239,6 +322,9 @@ const workerVisual = new Map();
 let pathLines = [], latestWorld = {}, leaderTower = null;
 let buildMode = "camera";
 let activeTab = "ops";
+let uploadedLayout = null;
+let uploadedValidation = null;
+let scenarios = [];
 const buildRotation = { dropbox: 0 };
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
@@ -605,6 +691,7 @@ function updatePanel(world, info) {
       log.appendChild(row);
     });
   }
+  updateRecommendations(world);
 }
 function workerStatus(w, world) {
   if (w.status === "to_pickup") return `to ${(world.factories || []).find(f => f.id === w.target_factory_id)?.name || "intake"}`;
@@ -613,6 +700,93 @@ function workerStatus(w, world) {
   return "idle, awaiting task";
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+function updateLayoutStatus() {
+  const box = document.getElementById("layout-status");
+  if (!uploadedLayout) {
+    box.textContent = "Upload a PNG using the warehouse color map.";
+    return;
+  }
+  const layout = uploadedLayout.layout || {};
+  const counts = uploadedValidation?.counts || {};
+  const errors = uploadedValidation?.errors || [];
+  const warnings = uploadedValidation?.warnings || [];
+  box.innerHTML = `
+    <strong>${escapeHtml(uploadedLayout.name)}</strong><br>
+    ${uploadedLayout.width}x${uploadedLayout.height} grid ·
+    ${layout.conveyors?.length || 0} conveyors ·
+    ${layout.bins?.length || 0} bins ·
+    ${layout.workerSpawns?.length || 0} worker spawns ·
+    ${counts.shelf || 0} shelf cells<br>
+    ${errors.map(err => `<span class="bad">${escapeHtml(err)}</span>`).join("<br>")}
+    ${warnings.map(warn => `<span>${escapeHtml(warn)}</span>`).join("<br>")}
+    ${!errors.length ? `<span class="good">Valid layout. Ready to apply.</span>` : ""}
+  `;
+}
+
+function currentExperimentOptions() {
+  return {
+    workerCount: Number(document.getElementById("worker-count").value || 3),
+    orderVolume: Number(document.getElementById("order-volume").value || 6),
+  };
+}
+
+function currentMetrics() {
+  return collectMetrics(latestWorld, currentExperimentOptions());
+}
+
+function updateRecommendations(world) {
+  const box = document.getElementById("recommendations");
+  if (!box) return;
+  const metrics = collectMetrics(world || latestWorld, currentExperimentOptions());
+  box.innerHTML = buildRecommendations(metrics, world || latestWorld)
+    .map(item => `<div>${escapeHtml(item)}</div>`)
+    .join("");
+}
+
+function captureScenario(name) {
+  const options = currentExperimentOptions();
+  const scenario = createScenario({
+    name,
+    layoutId: uploadedLayout?.id || latestWorld.layout || "live-layout",
+    workerCount: options.workerCount,
+    orderVolume: options.orderVolume,
+    metrics: currentMetrics(),
+  });
+  if (name === "Baseline") {
+    scenarios = [scenario, ...scenarios.filter(item => item.scenarioName !== "Baseline")];
+  } else {
+    scenarios.push(scenario);
+  }
+  renderScenarioTable();
+}
+
+function renderScenarioTable() {
+  const table = document.getElementById("scenario-table");
+  if (!scenarios.length) {
+    table.textContent = "No scenarios captured yet.";
+    return;
+  }
+  const rows = compareScenarios(scenarios);
+  table.innerHTML = `
+    <div class="scenario-row muted"><b>Name</b><b>Throughput</b><b>Avg</b><b>Cong.</b></div>
+    ${rows.map(row => `
+      <div class="scenario-row">
+        <span>${escapeHtml(row.scenarioName)}</span>
+        <span>${formatMetric(row.metrics.throughput)} ${delta(row.deltaThroughput)}</span>
+        <span>${formatMetric(row.metrics.averageDeliveryTime, "s")} ${delta(row.deltaAverageDeliveryTime, true)}</span>
+        <span>${formatMetric(row.metrics.congestionScore)} ${delta(row.deltaCongestionScore, true)}</span>
+      </div>
+    `).join("")}
+  `;
+}
+
+function delta(value, lowerIsBetter = false) {
+  if (!value) return "";
+  const good = lowerIsBetter ? value < 0 : value > 0;
+  const sign = value > 0 ? "+" : "";
+  return `<span style="color:${good ? "var(--green)" : "var(--red)"}">${sign}${Number(value).toFixed(1)}</span>`;
+}
 
 async function pollState() {
   try {
@@ -659,8 +833,10 @@ function setTab(tab) {
   activeTab = tab;
   document.getElementById("tab-ops").classList.toggle("active", tab === "ops");
   document.getElementById("tab-build").classList.toggle("active", tab === "build");
+  document.getElementById("tab-twin").classList.toggle("active", tab === "twin");
   document.getElementById("ops-panel").classList.toggle("active", tab === "ops");
   document.getElementById("build-panel").classList.toggle("active", tab === "build");
+  document.getElementById("twin-panel").classList.toggle("active", tab === "twin");
   if (tab !== "build") setBuildMode("camera");
 }
 function eventToCell(event) {
@@ -741,6 +917,7 @@ document.getElementById("disable").onclick = () => {
 };
 document.getElementById("tab-ops").onclick = () => setTab("ops");
 document.getElementById("tab-build").onclick = () => setTab("build");
+document.getElementById("tab-twin").onclick = () => setTab("twin");
 document.getElementById("build-shelf").onclick = () => setBuildMode(buildMode === "shelf" ? "camera" : "shelf");
 document.getElementById("build-conveyor").onclick = () => setBuildMode(buildMode === "factory" ? "camera" : "factory");
 document.getElementById("build-dropbin").onclick = () => setBuildMode(buildMode === "dropbox" ? "camera" : "dropbox");
@@ -749,6 +926,65 @@ document.getElementById("remove-shelf").onclick = () => setBuildMode(buildMode =
 document.getElementById("camera-mode").onclick = () => setBuildMode("camera");
 document.getElementById("build-color").onchange = () => {
   preview.visible = false;
+};
+document.getElementById("layout-file").onchange = async (event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  try {
+    uploadedLayout = await parseLayoutImageFile(file, { gridWidth: GRID, gridHeight: GRID, tolerance: 54 });
+    uploadedValidation = validateLayout(uploadedLayout);
+    drawLayoutPreview(document.getElementById("layout-preview"), uploadedLayout);
+    updateLayoutStatus();
+  } catch (error) {
+    uploadedLayout = null;
+    uploadedValidation = { valid: false, errors: [`Could not parse PNG: ${error.message || error}`], warnings: [] };
+    updateLayoutStatus();
+  }
+};
+document.getElementById("apply-layout").onclick = () => {
+  if (!uploadedLayout) {
+    uploadedValidation = { valid: false, errors: ["Upload a PNG or load layout JSON first."], warnings: [] };
+    updateLayoutStatus();
+    return;
+  }
+  uploadedValidation = validateLayout(uploadedLayout);
+  updateLayoutStatus();
+  if (!uploadedValidation.valid) return;
+  sendAction(buildApplyLayoutAction(uploadedLayout, currentExperimentOptions()));
+  setTab("ops");
+};
+document.getElementById("save-layout-json").onclick = () => {
+  if (!uploadedLayout) return;
+  downloadJson(`${uploadedLayout.name || "factorymind-layout"}.json`, exportLayoutJson(uploadedLayout));
+};
+document.getElementById("load-layout-json-btn").onclick = () => document.getElementById("layout-json-file").click();
+document.getElementById("layout-json-file").onchange = async (event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  try {
+    uploadedLayout = await readJsonFile(file);
+    uploadedValidation = validateLayout(uploadedLayout);
+    drawLayoutPreview(document.getElementById("layout-preview"), uploadedLayout);
+    updateLayoutStatus();
+  } catch (error) {
+    uploadedLayout = null;
+    uploadedValidation = { valid: false, errors: [`Could not load JSON: ${error.message || error}`], warnings: [] };
+    updateLayoutStatus();
+  }
+};
+document.getElementById("worker-count").oninput = (event) => {
+  document.getElementById("worker-count-value").textContent = event.target.value;
+};
+document.getElementById("worker-count").onchange = (event) => sendAction({ type: "set_worker_count", worker_count: Number(event.target.value || 3) });
+document.getElementById("order-volume").oninput = (event) => {
+  document.getElementById("order-volume-value").textContent = event.target.value;
+};
+document.getElementById("order-volume").onchange = (event) => sendAction({ type: "set_order_volume", order_volume: Number(event.target.value || 6) });
+document.getElementById("capture-baseline").onclick = () => captureScenario("Baseline");
+document.getElementById("capture-variant").onclick = () => captureScenario(`Variant ${Math.max(1, scenarios.length)}`);
+document.getElementById("clear-scenarios").onclick = () => {
+  scenarios = [];
+  renderScenarioTable();
 };
 window.addEventListener("keydown", e => {
   const target = e.target;
@@ -786,6 +1022,8 @@ renderer.domElement.addEventListener("pointerup", e => {
 });
 setBuildMode("camera");
 setTab("ops");
+updateLayoutStatus();
+renderScenarioTable();
 
 const clock = new THREE.Clock();
 function animate() {

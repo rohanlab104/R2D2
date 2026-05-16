@@ -75,7 +75,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_state()
             return
         if path.startswith("/static/"):
-            self._serve_static(path[len("/static/"):])
+            self._serve_static("static/" + path[len("/static/"):])
             return
         self.send_error(404, "not found")
 
