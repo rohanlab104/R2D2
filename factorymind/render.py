@@ -598,50 +598,14 @@ def draw_factory_interior_structures(
     screen: "pygame.Surface",
     wall_set: set[tuple[int, int]],
 ) -> None:
-    """Warehouse modules, racks, and floor obstacles — visual only; not in ``wall``."""
-    # Low office / subassembly bays (footprints sit behind workstation art).
-    modules = [
-        (18, 8,  26, 16, (34, 38, 58)),
-        (31, 17, 41, 25, (38, 34, 56)),
-        (9,  33, 18, 42, (30, 36, 54)),
-    ]
-    for gx0, gy0, gx1, gy1, fill in modules:
-        r = _cell_block_rect(gx0, gy0, gx1, gy1)
-        pygame.draw.rect(screen, fill, r)
-        hi = tuple(min(255, c + 45) for c in fill)
-        pygame.draw.line(screen, hi, (r.x + 3, r.y + 5), (r.right - 4, r.y + 5), 2)
-        pygame.draw.rect(screen, _dim(hi, 160), r, 2)
-        # Roof louvre lines
-        for yy in range(r.y + 12, r.bottom - 6, 9):
-            pygame.draw.line(screen, _dim(fill, 90), (r.x + 4, yy), (r.right - 5, yy), 1)
+    """Clean factory floor — color-zoned layout, no decorative clutter.
 
-    # Tall rack silhouette along two north–south aisles (thin columns).
-    rack_xs = [11, 37]
-    for gx in rack_xs:
-        for gz in range(6, 44, 3):
-            if (gx, gz) in wall_set:
-                continue
-            px = GRID_OFFSET_X + gx * CELL_SIZE + CELL_SIZE // 2
-            py_top = GRID_OFFSET_Y + gz * CELL_SIZE + 2
-            pygame.draw.line(screen, (48, 50, 72), (px, py_top),
-                             (px, py_top + CELL_SIZE - 6), 3)
-            pygame.draw.line(screen, (85, 88, 115), (px - 4, py_top + 3),
-                             (px + 4, py_top + 3), 1)
-
-    _draw_conveyor_belt(screen, 20, 14, 29)
-    _draw_machine_cell(screen, 33, 9, (40, 42, 62), (0, 212, 255))
-    _draw_machine_cell(screen, 14, 37, (48, 44, 58), (255, 140, 60))
-
-    # Floor hazard islands (tape + barrel clusters)
-    for (cx, cy) in [(24, 22), (40, 32)]:
-        cell = pygame.Rect(
-            GRID_OFFSET_X + cx * CELL_SIZE + 3,
-            GRID_OFFSET_Y + cy * CELL_SIZE + 3,
-            CELL_SIZE - 6, CELL_SIZE - 6,
-        )
-        pygame.draw.rect(screen, (55, 45, 22), cell, border_radius=2)
-        pygame.draw.rect(screen, (210, 170, 40), cell, 1, border_radius=2)
-        _draw_drum(screen, cell.centerx, cell.centery - 2)
+    The previous version drew warehouse modules, racks, conveyors, and barrels
+    that distracted from the actual gameplay. The new layout is intentionally
+    minimal: pickup stockpiles on the left, drop boxes on the right, open
+    floor between. Workers and zone art carry the visual interest.
+    """
+    return
 
 
 def draw_charging_area(screen: "pygame.Surface", world_state: dict) -> None:
@@ -778,7 +742,11 @@ def draw_spawn_points(screen: "pygame.Surface", world_state: dict) -> None:
         pygame.draw.circle(screen, _dim(C_ACCENT, 70), (px, py), 2)
 
 
-_WS_ABBREV = {"Parts": "P", "Assembly": "A", "QA": "Q", "Shipping": "S"}
+_WS_ABBREV = {
+    "Parts": "P", "Assembly": "A", "QA": "Q", "Shipping": "S",
+    "Red-Pickup": "R", "Blue-Pickup": "B", "Green-Pickup": "G", "Yellow-Pickup": "Y",
+    "Red-Drop": "R", "Blue-Drop": "B", "Green-Drop": "G", "Yellow-Drop": "Y",
+}
 
 
 def draw_cargo_pickups(screen: "pygame.Surface", world_state: dict) -> None:
@@ -836,40 +804,68 @@ def draw_cargo_pickups(screen: "pygame.Surface", world_state: dict) -> None:
 
 
 def draw_workstations(screen: "pygame.Surface", workstations: list[dict]) -> None:
-    """Industrial equipment tiles: dark fill, 3D highlight, bold letter, pill label."""
-    font_letter = pygame.font.SysFont("monospace", 28, bold=True)
-    font_label  = pygame.font.SysFont("monospace", 11)
+    """Color-zoned factory tiles.
+
+    Pickup zones render as a colored 3x3 platform with a small block stockpile
+    icon (three stacked cubes). Delivery zones render as a colored open-box
+    outline. Both carry a pill label so the leader's decisions are legible.
+    """
+    font_label = pygame.font.SysFont("monospace", 11, bold=True)
+    font_count = pygame.font.SysFont("monospace", 10, bold=True)
 
     for ws in workstations:
-        x, y      = ws["pos"]
-        color     = tuple(ws["color"])
-        fill      = tuple(max(0, c - 120) for c in color)
-        border    = tuple(max(0, c - 80)  for c in color)
-        highlight = tuple(min(255, c + 60) for c in color)
+        x, y    = ws["pos"]
+        color   = tuple(int(c) for c in ws["color"][:3])
+        kind    = str(ws.get("kind", "")).lower()
+        fill    = tuple(max(0, c - 130) for c in color)
+        border  = tuple(max(0, c - 60)  for c in color)
+        light   = tuple(min(255, c + 40) for c in color)
 
-        px   = GRID_OFFSET_X + x * CELL_SIZE - CELL_SIZE
-        py   = GRID_OFFSET_Y + y * CELL_SIZE - CELL_SIZE
-        w    = CELL_SIZE * 3
-        h    = CELL_SIZE * 3
+        px = GRID_OFFSET_X + x * CELL_SIZE - CELL_SIZE
+        py = GRID_OFFSET_Y + y * CELL_SIZE - CELL_SIZE
+        w  = CELL_SIZE * 3
+        h  = CELL_SIZE * 3
         rect = pygame.Rect(px, py, w, h)
 
-        pygame.draw.rect(screen, fill,   rect, border_radius=4)
+        # Platform base shared by both kinds.
+        pygame.draw.rect(screen, fill, rect, border_radius=4)
         pygame.draw.rect(screen, border, rect, 2, border_radius=4)
 
-        hl = pygame.Surface((w - 6, 3), pygame.SRCALPHA)
-        hl.fill((*highlight, 110))
-        screen.blit(hl, (px + 3, py + 3))
+        cx, cy = px + w // 2, py + h // 2
 
-        letter = _WS_ABBREV.get(ws["name"], ws["name"][0])
-        ls = font_letter.render(letter, True, color)
-        screen.blit(ls, (px + w // 2 - ls.get_width() // 2,
-                         py + h // 2 - ls.get_height() // 2))
+        if kind == "delivery":
+            # Open-box icon: trapezoid outline with a colored interior shadow.
+            box_w = int(w * 0.7)
+            box_h = int(h * 0.55)
+            box_x = cx - box_w // 2
+            box_y = cy - box_h // 2 + 2
+            inner = pygame.Rect(box_x, box_y, box_w, box_h)
+            pygame.draw.rect(screen, _dim(border, 200), inner, border_radius=3)
+            pygame.draw.rect(screen, color, inner, 2, border_radius=3)
+            # Box "flaps" — two diagonal lines from the box top to platform top
+            pygame.draw.line(screen, light,
+                             (inner.left, inner.top), (inner.left - 5, inner.top - 6), 2)
+            pygame.draw.line(screen, light,
+                             (inner.right, inner.top), (inner.right + 5, inner.top - 6), 2)
+        else:
+            # Pickup stockpile: three stacked colored cubes.
+            cube = max(6, CELL_SIZE // 2)
+            offsets = [(-cube, 4), (cube // 2, 4), (-cube // 2, -cube + 2)]
+            for ox, oy in offsets:
+                r = pygame.Rect(cx + ox - cube // 2, cy + oy - cube // 2, cube, cube)
+                pygame.draw.rect(screen, color, r, border_radius=2)
+                pygame.draw.rect(screen, _dim(border, 220), r, 1, border_radius=2)
+                # subtle top highlight
+                pygame.draw.line(screen, light,
+                                 (r.x + 1, r.y + 1), (r.right - 2, r.y + 1), 1)
 
-        lb   = font_label.render(ws["name"].upper(), True, (220, 220, 220))
-        pw   = lb.get_width() + 10
-        ph   = lb.get_height() + 4
+        # Pill label below the platform.
+        label_text = ws["name"].upper()
+        lb = font_label.render(label_text, True, (235, 235, 240))
+        pw = lb.get_width() + 10
+        ph = lb.get_height() + 4
         pill = pygame.Rect(px + w // 2 - pw // 2, py + h + 4, pw, ph)
-        pygame.draw.rect(screen, (20, 20, 35), pill, border_radius=3)
+        pygame.draw.rect(screen, (16, 16, 28), pill, border_radius=3)
         pygame.draw.rect(screen, border, pill, 1, border_radius=3)
         screen.blit(lb, (pill.x + 5, pill.y + 2))
 

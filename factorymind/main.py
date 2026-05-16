@@ -227,13 +227,58 @@ def _reservation_table(world_state: dict, *, exclude_robot_id: int | None = None
     return {"cells": cells, "edges": edges}
 
 
+def _station_footprint_walls(
+    world_state: dict,
+    *,
+    exclude: set[tuple[int, int]] | None = None,
+) -> set[tuple[int, int]]:
+    """Return the 3x3 footprint of every workstation as wall cells.
+
+    The station's center cell stays passable (so workers can reach pickup /
+    delivery), but the 8 surrounding cells are treated as wall. Cells in
+    ``exclude`` are kept passable (used to whitelist this robot's own goal /
+    pickup / delivery so it can still enter from any side).
+    """
+    excluded = exclude or set()
+    blocked: set[tuple[int, int]] = set()
+    for ws in world_state.get("workstations", []):
+        wx, wy = ws.get("pos", [0, 0])
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                if dx == 0 and dy == 0:
+                    continue  # leave the center passable
+                cell = (wx + dx, wy + dy)
+                if cell in excluded:
+                    continue
+                if not (0 <= cell[0] < GRID_WIDTH and 0 <= cell[1] < GRID_HEIGHT):
+                    continue
+                blocked.add(cell)
+    return blocked
+
+
 def _pathfinding_walls(
     robot: dict,
     goal: list[int],
     world_state: dict,
 ) -> set[tuple[int, int]]:
-    """Walls plus other robots' tiles (fleet mode avoids head-on gridlock)."""
+    """Walls + station footprints + other robots' tiles."""
     wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    # Build a whitelist of cells this robot must reach: goal + this robot's
+    # active task pickup + delivery. Station footprints are blocked except
+    # for these so paths can still terminate at a real workstation.
+    whitelist: set[tuple[int, int]] = {tuple(goal), tuple(robot.get("pos", []))}
+    task_id = robot.get("current_task")
+    if task_id is not None:
+        for task in world_state.get("tasks", []):
+            if task.get("id") == task_id:
+                pickup = task.get("pickup")
+                delivery = task.get("delivery")
+                if pickup:
+                    whitelist.add(tuple(pickup))
+                if delivery:
+                    whitelist.add(tuple(delivery))
+                break
+    wall_set |= _station_footprint_walls(world_state, exclude=whitelist)
     if _FLEET_MASTER_ONLY:
         for other in world_state.get("robots", []):
             if other.get("id") == robot.get("id"):
@@ -271,7 +316,10 @@ _task_counter = 0
 
 
 def _cargo_deliveries_enabled() -> bool:
-    return os.getenv("FACTORYMIND_CARGO_DELIVERIES", "true").lower() in (
+    # Color-zoned demo: pickups happen at the designated stockpile zones, not
+    # at random floor cells. Cargo-scatter mode is kept available via an
+    # explicit env override for legacy testing only.
+    return os.getenv("FACTORYMIND_CARGO_DELIVERIES", "false").lower() in (
         "1",
         "true",
         "yes",
@@ -344,12 +392,21 @@ def _pick_cargo_cell(
     return [choice[0], choice[1]]
 
 
+# Color name -> saturated RGB. Used to tag block (cargo_color) and drop-zone
+# colors for NemoClaw's color-match guardrail.
+_COLOR_RGB: dict[str, list[int]] = {
+    "Red":    [232, 64,  64],
+    "Blue":   [60,  120, 240],
+    "Green":  [60,  200, 110],
+    "Yellow": [240, 200, 60],
+}
+
 _CARGO_STYLE_BY_STATION: dict[str, dict[str, object]] = {
-    # Saturated, divergent hues + shape kind for web / pygame viewers.
-    "Parts": {"color": [245, 52, 68], "kind": "parts"},
-    "Assembly": {"color": [52, 118, 255], "kind": "assembly"},
-    "QA": {"color": [48, 235, 146], "kind": "qa"},
-    "Shipping": {"color": [255, 214, 64], "kind": "shipping"},
+    # Drop-zone name -> color of the block that may be delivered there.
+    "Red-Drop":    {"color": _COLOR_RGB["Red"],    "kind": "red"},
+    "Blue-Drop":   {"color": _COLOR_RGB["Blue"],   "kind": "blue"},
+    "Green-Drop":  {"color": _COLOR_RGB["Green"],  "kind": "green"},
+    "Yellow-Drop": {"color": _COLOR_RGB["Yellow"], "kind": "yellow"},
 }
 
 
@@ -380,7 +437,11 @@ def _create_task(
     *,
     source: str,
 ) -> dict:
-    """Create a concrete pickup-to-delivery task from selected workstations."""
+    """Create a concrete pickup-to-delivery task from selected workstations.
+
+    Every task is color-tagged: ``cargo_color`` matches the pickup zone's
+    color so NemoClaw's color-match guardrail can verify on delivery.
+    """
     global _task_counter
     task = {
         "id": _task_counter,
@@ -392,7 +453,12 @@ def _create_task(
         "assigned_to": None,
         "source": source,
     }
-    if str(pickup_ws.get("name", "")) == "Cargo":
+    pickup_color = pickup_ws.get("color")
+    if isinstance(pickup_color, (list, tuple)) and len(pickup_color) >= 3:
+        task["cargo"] = True
+        task["cargo_color"] = [int(pickup_color[0]), int(pickup_color[1]), int(pickup_color[2])]
+        task["cargo_kind"] = str(pickup_ws.get("name", "")).split("-", 1)[0].lower() or "block"
+    elif str(pickup_ws.get("name", "")) == "Cargo":
         task["cargo"] = True
         _apply_cargo_task_style(task, delivery_ws)
     _task_counter += 1
@@ -569,6 +635,35 @@ def _complete_task_delivery(
     blackboard: "Blackboard",
 ) -> None:
     """Mark a task finished when the robot is already at the delivery cell."""
+    # NemoClaw color guardrail: worker must drop a block only at a matching-color zone.
+    engine = nemoclaw.get_engine()
+    if engine is not None:
+        carried = task.get("cargo_color")
+        delivery_ws = next(
+            (ws for ws in world_state.get("workstations", [])
+             if list(ws.get("pos", [])) == list(task.get("delivery", []))),
+            None,
+        )
+        delivery_color = delivery_ws.get("color") if delivery_ws else None
+        delivery_name = str(task.get("delivery_name", ""))
+        if carried is not None and delivery_color is not None:
+            decision = engine.check_delivery(
+                worker_id=int(robot.get("id", -1)),
+                carried_color=carried,
+                delivery_color=delivery_color,
+                delivery_name=delivery_name,
+            )
+            if not decision.allowed and engine.enforce:
+                # Refuse the drop: cancel this task assignment, leader will reassign.
+                blackboard.post(
+                    robot["id"], "POLICY",
+                    f"NemoClaw refused drop at {delivery_name}: color mismatch — re-route required.",
+                )
+                task["status"] = "cancelled"
+                task["assigned_to"] = None
+                robot["current_task"] = None
+                robot["path"] = []
+                return
     route_time = round(time.time() - task.get("started_at", time.time()), 2)
     task["status"] = "done"
     robot["current_task"] = None
@@ -793,12 +888,24 @@ def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> 
         if rid in denied:
             streak = int(robot.get("yield_streak", 0)) + 1
             robot["yield_streak"] = streak
-            if streak >= 4:
+            # More aggressive replan: drop threshold from 4 -> 3, and on the
+            # second consecutive replan force a hard re-A* from scratch.
+            if streak >= 3:
                 if robot.get("current_task") is not None:
+                    # Force a fresh A* by clearing the current path first so
+                    # _replenish_task_path / _planned_path_to recomputes against
+                    # the latest reservations and footprint walls.
+                    robot["path"] = []
                     _replenish_task_path(robot, world_state)
                 elif _is_workstation_cell(robot.get("pos", []), world_state):
                     _step_aside_from_workstation(robot, world_state)
                 robot["yield_streak"] = 0
+                if now - robot.get("last_replan_post", 0.0) > 2.0:
+                    blackboard.post(
+                        rid, "INTENT",
+                        f"R{rid} re-planning route after {streak} yield(s).",
+                    )
+                    robot["last_replan_post"] = now
             elif now - robot.get("last_yield_post", 0.0) > 2.5:
                 blackboard.post(
                     rid,
@@ -898,6 +1005,31 @@ def _estimate_task_cost(
         return 10**6
     route_stub = to_pickup_path + a_star(task["pickup"], task["delivery"], wall_set)
     return to_pickup + to_delivery + _traffic_penalty_for_path(robot, route_stub, world_state)
+
+
+def _stations_already_claimed(world_state: dict) -> set[str]:
+    """Names of pickup stations currently targeted by a non-idle worker.
+
+    Used for single-occupancy: the leader avoids handing two workers tasks
+    that both pick up at the same station at the same time.
+    """
+    busy: set[str] = set()
+    by_id = {r.get("id"): r for r in world_state.get("robots", [])}
+    for task in world_state.get("tasks", []):
+        if task.get("status") in ("done", "cancelled"):
+            continue
+        assignee = task.get("assigned_to")
+        if assignee is None:
+            continue
+        worker = by_id.get(assignee)
+        if worker is None or worker.get("role") != WORKER:
+            continue
+        # Only count if the worker is still heading to / sitting at the pickup.
+        if task.get("status") == "open":  # not yet picked up
+            name = str(task.get("pickup_name", ""))
+            if name:
+                busy.add(name)
+    return busy
 
 
 def _delegate_task_to_nearest_worker(
@@ -1029,7 +1161,7 @@ def _dispatch_batch_to_workers(
 # literally, an OpenClaw-based autonomous agent.
 # ---------------------------------------------------------------------------
 
-_FLEET_ROUTE_FLOW = ("Parts", "Assembly", "QA", "Shipping")
+_FLEET_ROUTE_FLOW = ("Red", "Blue", "Green", "Yellow")
 
 
 def _enqueue_fleet_tasks(
@@ -1130,37 +1262,31 @@ def _generate_fleet_routes(
 ) -> list[tuple[dict, dict]]:
     """Return a list of (pickup, delivery) routes for the leader to queue.
 
-    If both endpoints are given, every route is identical — the leader just
-    needs N workers to make that same trip. Otherwise we cycle through the
-    natural Parts->Assembly->QA->Shipping flow so all stations stay busy.
+    Color-keyed: each task pairs a pickup zone with its same-color drop zone.
+    The dispatcher rotates through the COLOR flow so all 4 zones stay busy.
     """
     stations = {ws["name"]: ws for ws in world_state.get("workstations", [])}
     if pickup_ws and delivery_ws:
         return [(pickup_ws, delivery_ws)] * max(0, count)
 
-    flow = [stations[name] for name in _FLEET_ROUTE_FLOW if name in stations]
-    if len(flow) < 2:
-        # Should never happen with the default layout, but be defensive.
-        return []
+    color_pairs: list[tuple[dict, dict]] = []
+    for color in _FLEET_ROUTE_FLOW:
+        pickup = stations.get(f"{color}-Pickup")
+        drop = stations.get(f"{color}-Drop")
+        if pickup and drop:
+            color_pairs.append((pickup, drop))
+
+    if not color_pairs:
+        # Fall back to legacy stations if a non-color layout is loaded.
+        ordered = [stations[n] for n in stations if n in stations]
+        if len(ordered) < 2:
+            return []
+        color_pairs = [(ordered[i % len(ordered)], ordered[(i + 1) % len(ordered)])
+                       for i in range(len(ordered))]
 
     routes: list[tuple[dict, dict]] = []
-    use_cargo = _cargo_deliveries_enabled()
-    stats = world_state.get("stats") or {}
-    base_salt = (
-        len(world_state.get("tasks", []))
-        + len(world_state.get("task_queue", []))
-        + int(stats.get("queued_total", 0))
-    )
-    reserved: set[tuple[int, int]] = set()
     for i in range(max(0, count)):
-        dst = flow[(i + 1) % len(flow)]
-        if use_cargo:
-            cell = _pick_cargo_cell(world_state, base_salt + i, reserved)
-            reserved.add((cell[0], cell[1]))
-            cargo_pickup = {"name": "Cargo", "pos": cell}
-            routes.append((cargo_pickup, dst))
-        else:
-            routes.append((flow[i % len(flow)], dst))
+        routes.append(color_pairs[i % len(color_pairs)])
     return routes
 
 
@@ -1221,9 +1347,21 @@ def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
 
     wall_set = {tuple(c) for c in world_state.get("wall", [])}
     dispatched = 0
-
+    busy_pickups = _stations_already_claimed(world_state)
+    # Single-occupancy: scan ahead in the queue to find a task whose pickup
+    # is not already claimed by another worker. If every queued task targets
+    # a busy pickup, fall back to the head of the queue so we don't stall.
     while queue and idle_workers:
         task = queue[0]
+        if str(task.get("pickup_name", "")) in busy_pickups:
+            free_index = next(
+                (i for i, t in enumerate(queue)
+                 if str(t.get("pickup_name", "")) not in busy_pickups),
+                None,
+            )
+            if free_index is not None and free_index > 0:
+                queue.insert(0, queue.pop(free_index))
+                task = queue[0]
         worker, cost = _fleet_pick_worker_nearest(
             task, idle_workers, wall_set, world_state,
         )
@@ -1261,6 +1399,11 @@ def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
         task["master_order"] = True
         task["estimated_route_cost"] = cost
         worker["master_assigned"] = task["id"]
+        # Reserve this pickup for the rest of this dispatch tick so the next
+        # iteration prefers a different-color zone instead of stacking workers.
+        pickup_name = str(task.get("pickup_name", ""))
+        if pickup_name:
+            busy_pickups.add(pickup_name)
 
         route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
         blackboard.post(

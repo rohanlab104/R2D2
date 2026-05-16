@@ -198,6 +198,48 @@ class PolicyEngine:
         self._record(decision)
         return decision
 
+    def check_delivery(
+        self,
+        *,
+        worker_id: int,
+        carried_color: list[int] | tuple[int, int, int] | None,
+        delivery_color: list[int] | tuple[int, int, int] | None,
+        delivery_name: str = "",
+    ) -> PolicyDecision:
+        """Enforce: a worker carrying color X may only drop at a zone of color X.
+
+        Returns a denying ``PolicyDecision`` when the worker is carrying a block
+        whose color doesn't match the destination zone's color. The simulation
+        is expected to:
+          - record the decision (already done here)
+          - if denied: refuse the drop and ask the leader to re-route the worker
+        """
+        actor = "worker"
+        action = "deliver_block"
+        target = delivery_name or "drop_zone"
+
+        if carried_color is None:
+            decision = PolicyDecision(False, "worker has no cargo to deliver", actor, action, target,
+                                      {"worker_id": worker_id})
+        elif delivery_color is None:
+            decision = PolicyDecision(False, "destination has no color metadata", actor, action, target,
+                                      {"worker_id": worker_id})
+        else:
+            ca = tuple(int(c) for c in carried_color[:3])
+            cb = tuple(int(c) for c in delivery_color[:3])
+            if ca == cb:
+                decision = PolicyDecision(True, f"color match {ca}", actor, action, target,
+                                          {"worker_id": worker_id})
+            else:
+                decision = PolicyDecision(
+                    False,
+                    f"color mismatch: carrying {ca}, drop zone is {cb}",
+                    actor, action, target,
+                    {"worker_id": worker_id, "carried": list(ca), "expected": list(cb)},
+                )
+        self._record(decision)
+        return decision
+
     def check_network(self, url: str, *, actor: str = "system") -> PolicyDecision:
         """Decide whether ``url`` is reachable per the YAML network rules."""
         host_port = _normalize_host_port(url)

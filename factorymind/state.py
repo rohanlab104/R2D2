@@ -38,14 +38,29 @@ GRID_HEIGHT = 50
 # ---------------------------------------------------------------------------
 # Workstation definitions per layout
 # ---------------------------------------------------------------------------
+# Color-keyed factory layout.
+# Pickup zones (left half) hold colored blocks; matching drop zones (right
+# half) accept them. A worker carrying color X may only deliver at the same
+# color's drop zone (enforced by NemoClaw policy in nemoclaw.py).
 _WORKSTATIONS_BASE = [
-    {"name": "Parts",    "pos": [4,  4],  "color": [220, 50,  50]},
-    {"name": "Assembly", "pos": [45, 4],  "color": [50,  80,  220]},
-    {"name": "QA",       "pos": [45, 45], "color": [50,  180, 80]},
-    {"name": "Shipping", "pos": [4,  45], "color": [220, 200, 50]},
+    # Pickup stockpiles — left column
+    {"name": "Red-Pickup",    "pos": [6,  9],  "color": [232, 64,  64],  "kind": "pickup"},
+    {"name": "Blue-Pickup",   "pos": [6,  20], "color": [60,  120, 240], "kind": "pickup"},
+    {"name": "Green-Pickup",  "pos": [6,  31], "color": [60,  200, 110], "kind": "pickup"},
+    {"name": "Yellow-Pickup", "pos": [6,  42], "color": [240, 200, 60],  "kind": "pickup"},
+    # Drop boxes — right column, color-matched to pickups
+    {"name": "Red-Drop",      "pos": [44, 9],  "color": [232, 64,  64],  "kind": "delivery"},
+    {"name": "Blue-Drop",     "pos": [44, 20], "color": [60,  120, 240], "kind": "delivery"},
+    {"name": "Green-Drop",    "pos": [44, 31], "color": [60,  200, 110], "kind": "delivery"},
+    {"name": "Yellow-Drop",   "pos": [44, 42], "color": [240, 200, 60],  "kind": "delivery"},
 ]
 
-STATION_QUOTA_NAMES: tuple[str, ...] = ("Parts", "Assembly", "QA", "Shipping")
+# Color names rotated through when generating tasks (each task is pickup of
+# color X -> drop of color X).
+COLOR_NAMES: tuple[str, ...] = ("Red", "Blue", "Green", "Yellow")
+
+# Quota tracking is keyed on the color, not the legacy station names.
+STATION_QUOTA_NAMES: tuple[str, ...] = COLOR_NAMES
 
 
 def empty_station_quotas() -> dict[str, dict[str, int]]:
@@ -58,18 +73,18 @@ _SPAWN_POSITIONS: list[list[int]] = [
     [22, 24], [23, 24], [24, 24], [25, 24],
 ]
 
-# Workers start spread across the floor (one robot per cell).
+# Workers start spread across the mid-floor (between pickup and drop columns).
 _DISPERSED_WORKER_SPAWNS: list[list[int]] = [
-    [11, 11], [17, 9], [9, 17], [14, 14],
-    [37, 11], [41, 16], [34, 9], [39, 14],
-    [37, 39], [41, 35], [34, 42], [39, 37],
-    [11, 39], [16, 41], [9, 35], [14, 37],
-    [24, 12], [24, 36], [12, 24], [38, 24],
+    [16, 10], [22, 8],  [28, 10], [34, 8],
+    [16, 18], [22, 16], [28, 18], [34, 16],
+    [16, 26], [22, 24], [28, 26], [34, 24],
+    [16, 34], [22, 32], [28, 34], [34, 32],
+    [16, 42], [22, 40], [28, 42], [34, 40],
 ]
 
-# Leaders sit off the warehouse floor visually, acting like dispatch/control agents.
+# Leader sits in a tower at bottom-center, observing the whole floor.
 _LEADER_POSITIONS: list[list[int]] = [
-    [2, 24], [2, 26],
+    [25, 47], [25, 48],
 ]
 
 
