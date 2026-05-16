@@ -1,9 +1,8 @@
 """Tiny stdlib HTTP/JSON bridge for the Three.js viewer.
 
-The simulation loop (``factorymind.web_main``) updates a shared snapshot via
-``update_state`` every tick. The browser polls ``/state.json`` and posts user
-actions (chat prompts, RESET, SPEED, DISCONNECT) to ``/action``. We read those
-actions back out of the queue inside the sim loop with ``drain_actions``.
+The headless simulation publishes snapshots to ``/state.json``. The browser
+posts UI actions to ``/action``; callers drain those actions with
+``drain_actions``.
 
 Pure stdlib — no Flask/FastAPI dependency added to the project.
 """

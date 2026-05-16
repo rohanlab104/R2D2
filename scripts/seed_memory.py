@@ -48,7 +48,7 @@ SEEDS: list[tuple[str, str, str]] = [
      "Burst response improved 22% when tasks were evenly distributed across all stations."),
 
     (OPEN_FLOOR,
-     "Re-issue strategist directives every 15 seconds during startup, then slow to 30 seconds after rate stabilizes.",
+     "Re-issue leader directives every 15 seconds during startup, then slow to 30 seconds after rate stabilizes.",
      "Startup throughput reached target 38 seconds faster while token usage stayed manageable."),
 
     (OPEN_FLOOR,
@@ -104,7 +104,7 @@ SEEDS: list[tuple[str, str, str]] = [
      "Leader over-travel fell 23%; worker utilization rose from 71% to 79%."),
 
     (OPEN_FLOOR,
-     "Post COMPLETE messages for every delivery and let the strategist react when a station receives three completions.",
+     "Post COMPLETE messages for every delivery and let the leader react when a station receives three completions.",
      "Directive quality improved in review; strategy changes aligned with real station output spikes."),
 
     (OPEN_FLOOR,
@@ -153,7 +153,7 @@ SEEDS: list[tuple[str, str, str]] = [
      "Crossing frequency halved, but handoff delay added 5 seconds to complex routes."),
 
     (BOTTLENECK_BRIDGE,
-     "Use the strategist to forecast bridge congestion and pre-route workers before queues exceed three robots.",
+     "Use the leader to forecast bridge congestion and pre-route workers before queues exceed three robots.",
      "Average crossing wait fell from 4.0 seconds to 1.5 seconds."),
 
     (BOTTLENECK_BRIDGE,
@@ -162,7 +162,7 @@ SEEDS: list[tuple[str, str, str]] = [
 
     (BOTTLENECK_BRIDGE,
      "Post a BOTTLENECK message when bridge queue length exceeds three and pause new cross-wall assignments.",
-     "Early warning let leaders redistribute same-side work within one strategist cycle."),
+     "Early warning let leaders redistribute same-side work within one leader cycle."),
 
     (BOTTLENECK_BRIDGE,
      "Promote one idle worker to temporary bridge marshal during high-load periods.",

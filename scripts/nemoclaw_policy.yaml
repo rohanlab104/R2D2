@@ -1,31 +1,54 @@
-# FactoryMind R2D2 — runtime agent policy
-# Wraps the simulation so each robot agent (and the strategist) can ONLY
-# touch the resources it actually needs. Logs every blocked attempt to
-# logs/nemoclaw.log for the demo.
+# FactoryMind autonomous factory runtime policy
+# Loaded at startup by factorymind.main and logged to logs/nemoclaw.log.
 
-name: factorymind
-description: Multi-agent factory simulation with autonomous Nemotron robots.
+name: factorymind-autonomous
+description: OpenClaw/NemoClaw policy for leader/worker package routing.
 
-# Network: agents may only reach the local NIM endpoints on the GX10.
+agents:
+  leader:
+    model: nvidia/llama-3_3-nemotron-super-49b-v1_5
+    allow:
+      - observe_floor_state
+      - post_worker_directive
+      - read_policy_log
+    deny:
+      - move_worker_directly
+      - modify_factory
+      - modify_dropbox
+      - pickup_package
+      - drop_package
+
+  worker:
+    model: nvidia/nvidia-nemotron-nano-9b-v2
+    allow:
+      - move_within_simulation_area
+      - pickup_from_conveyor_pad
+      - drop_at_matching_color_dropbox
+      - report_complete
+    deny:
+      - leave_simulation_area
+      - pickup_from_non_pad
+      - drop_at_mismatched_dropbox
+      - modify_factory
+      - modify_policy
+
 network:
   allow:
-    - "127.0.0.1:8000"   # leader / worker NIM (Nemotron Nano 9B)
-    - "127.0.0.1:8001"   # strategist NIM (Llama-3.3 Nemotron Super 49B)
+    - "127.0.0.1:8000"   # worker Nano-9B NIM
+    - "127.0.0.1:8001"   # leader Super-49B NIM
     - "localhost:8000"
     - "localhost:8001"
   deny:
-    - "*"                # every other host, including build.nvidia.com
+    - "*"
 
-# Filesystem: agents read their own code + persist memory, nothing else.
 filesystem:
   read:
     - "./factorymind/"
-    - "./scripts/"
-    - "./logs/"
+    - "./scripts/nemoclaw_policy.yaml"
     - "./.env"
   write:
+    - "./logs/nemoclaw.log"
     - "./factorymind_memory.db"
-    - "./logs/"
   deny:
     - "/etc/"
     - "/home/"
@@ -33,22 +56,9 @@ filesystem:
     - "/var/"
     - "/proc/"
 
-# Process: no spawning shells, no SSH, no curl/wget out to the world.
-process:
-  allow_exec:
-    - "python3"
-    - "python"
-  deny_exec:
-    - "/bin/sh"
-    - "/bin/bash"
-    - "ssh"
-    - "scp"
-    - "curl"
-    - "wget"
-
-# Logging: capture every policy decision for the demo
 logging:
   path: "./logs/nemoclaw.log"
   events:
     - allow
     - deny
+    - policy_loaded

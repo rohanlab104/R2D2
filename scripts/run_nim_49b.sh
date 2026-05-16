@@ -10,9 +10,9 @@ set -euo pipefail
 
 : "${NGC_API_KEY:?Set NGC_API_KEY (your build.nvidia.com / NGC API key)}"
 
-IMAGE="${NIM_STRATEGIST_IMAGE:-nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1_5:latest}"
-PORT="${NIM_STRATEGIST_PORT:-8001}"
-NAME="${NIM_STRATEGIST_NAME:-nim-super-49b}"
+IMAGE="${NIM_LEADER_IMAGE:-nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1_5:latest}"
+PORT="${NIM_LEADER_PORT:-8001}"
+NAME="${NIM_LEADER_NAME:-nim-super-49b}"
 CACHE_DIR="${NIM_CACHE_DIR:-${HOME}/.cache/nim}"
 
 mkdir -p "${CACHE_DIR}"

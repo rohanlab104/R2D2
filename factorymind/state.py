@@ -1,149 +1,220 @@
-"""Shared world_state schema, constants, and factory layout definitions.
-
-This is the SINGLE source of truth for the world_state dict structure.
-Every other module must conform to the schema returned by create_initial_state().
-"""
+"""Shared FactoryMind world-state schema for the autonomous factory demo."""
 
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Message types posted to the blackboard
-# ---------------------------------------------------------------------------
+import copy
+
+# Message / log event types
 CLAIM = "CLAIM"
 INTENT = "INTENT"
 BOTTLENECK = "BOTTLENECK"
 STRATEGY = "STRATEGY"
 COMPLETE = "COMPLETE"
 
-# ---------------------------------------------------------------------------
+# New leader thought-process event types
+OBSERVE = "OBSERVE"
+ASSIGN = "ASSIGN"
+RETHINK = "RETHINK"
+WARNING = "WARNING"
+
 # Robot roles
-# ---------------------------------------------------------------------------
 LEADER = "LEADER"
 WORKER = "WORKER"
 
-# ---------------------------------------------------------------------------
-# Layout identifiers
-# ---------------------------------------------------------------------------
+# Layout identifiers retained for compatibility with older modules/tests.
 OPEN_FLOOR = "OPEN_FLOOR"
 BOTTLENECK_BRIDGE = "BOTTLENECK_BRIDGE"
 
-# ---------------------------------------------------------------------------
-# Grid dimensions
-# ---------------------------------------------------------------------------
 GRID_WIDTH = 50
 GRID_HEIGHT = 50
 
-# ---------------------------------------------------------------------------
-# Workstation definitions per layout
-# ---------------------------------------------------------------------------
-_WORKSTATIONS_BASE = [
-    {"name": "Parts",    "pos": [4,  4],  "color": [220, 50,  50]},
-    {"name": "Assembly", "pos": [45, 4],  "color": [50,  80,  220]},
-    {"name": "QA",       "pos": [45, 45], "color": [50,  180, 80]},
-    {"name": "Shipping", "pos": [4,  45], "color": [220, 200, 50]},
+PACKAGE_COLORS: list[dict] = [
+    {"name": "Red", "rgb": [232, 72, 72]},
+    {"name": "Blue", "rgb": [68, 130, 235]},
+    {"name": "Green", "rgb": [72, 210, 118]},
+    {"name": "Yellow", "rgb": [235, 205, 70]},
+    {"name": "Magenta", "rgb": [214, 78, 235]},
+    {"name": "Cyan", "rgb": [0, 212, 255]},
 ]
 
-# 8 spawn slots arranged in a 4×2 block at grid centre (22–25, 23–24)
-_SPAWN_POSITIONS: list[list[int]] = [
-    [22, 23], [23, 23], [24, 23], [25, 23],
-    [22, 24], [23, 24], [24, 24], [25, 24],
+_INITIAL_FACTORIES = [
+    {"name": "Factory-A", "pos": [5, 5], "color": "Red"},
+    {"name": "Factory-B", "pos": [5, 21], "color": "Blue"},
+    {"name": "Factory-C", "pos": [5, 37], "color": "Green"},
 ]
 
-# Leaders sit off the warehouse floor visually, acting like dispatch/control agents.
-_LEADER_POSITIONS: list[list[int]] = [
-    [2, 24], [2, 26],
+_INITIAL_DROPBOXES = [
+    {"name": "DropBox-Red", "pos": [40, 8], "color": "Red"},
+    {"name": "DropBox-Blue", "pos": [42, 24], "color": "Blue"},
+    {"name": "DropBox-Green", "pos": [40, 40], "color": "Green"},
 ]
 
-
-def _make_workstations(layout: str) -> list[dict]:
-    """Return a fresh copy of workstations for the given layout."""
-    import copy
-    stations = copy.deepcopy(_WORKSTATIONS_BASE)
-    return stations
+_INITIAL_WORKERS = [[22, 43], [25, 43], [28, 43]]
+_LEADER_POS = [25, 47]
 
 
-def _make_wall(layout: str) -> list[list[int]]:
-    """Return a list of [x, y] grid cells that are blocked.
+def color_rgb(color_name: str) -> list[int]:
+    """Return RGB for a configured package color."""
+    for color in PACKAGE_COLORS:
+        if color["name"] == color_name:
+            return list(color["rgb"])
+    return [180, 180, 180]
 
-    For BOTTLENECK_BRIDGE the wall runs across y=25 with a gap from x=22 to x=28.
-    For OPEN_FLOOR the wall is empty.
-    """
-    if layout != BOTTLENECK_BRIDGE:
-        return []
-    wall = []
-    for x in range(GRID_WIDTH):
-        if x < 22 or x > 28:
-            wall.append([x, 25])
-    return wall
+
+def next_color_name(index: int) -> str:
+    return PACKAGE_COLORS[index % len(PACKAGE_COLORS)]["name"]
+
+
+def make_factory(
+    name: str,
+    pos: list[int],
+    color: str,
+    factory_id: int,
+    rotation_y: float = 0.0,
+) -> dict:
+    """Create a factory with a right-facing conveyor and terminal drop pad."""
+    x, y = pos
+    belt_dir = [1, 0]
+    belt_length = 5
+    belt_start = [x + 3, y + 1]
+    drop_pad = [belt_start[0] + belt_dir[0] * belt_length, belt_start[1]]
+    return {
+        "id": factory_id,
+        "name": name,
+        "pos": list(pos),
+        "size": [3, 3],
+        "color": color,
+        "color_rgb": color_rgb(color),
+        "rotation_y": rotation_y,
+        "belt_dir": belt_dir,
+        "belt_length": belt_length,
+        "belt_start": belt_start,
+        "drop_pad": drop_pad,
+        "produce_every": 2.4,
+        "produce_timer": 0.8 + (factory_id * 0.55),
+        "conveyor": [],
+        "pad_packages": [],
+    }
+
+
+def make_dropbox(
+    name: str,
+    pos: list[int],
+    color: str,
+    dropbox_id: int,
+    rotation_y: float = 0.0,
+) -> dict:
+    return {
+        "id": dropbox_id,
+        "name": name,
+        "pos": list(pos),
+        "color": color,
+        "color_rgb": color_rgb(color),
+        "rotation_y": rotation_y,
+        "delivered": 0,
+    }
+
+
+def make_worker(worker_id: int, pos: list[int]) -> dict:
+    return {
+        "id": worker_id,
+        "name": f"Worker-{worker_id}",
+        "role": WORKER,
+        "pos": list(pos),
+        "spawn_pos": list(pos),
+        "path": [],
+        "current_task": None,
+        "status": "idle",
+        "carrying": None,
+        "target_factory_id": None,
+        "target_dropbox_id": None,
+        "task_started_at": None,
+    }
+
+
+def _initial_factories() -> list[dict]:
+    return [
+        make_factory(item["name"], item["pos"], item["color"], index)
+        for index, item in enumerate(_INITIAL_FACTORIES)
+    ]
+
+
+def _initial_dropboxes() -> list[dict]:
+    return [
+        make_dropbox(item["name"], item["pos"], item["color"], index)
+        for index, item in enumerate(_INITIAL_DROPBOXES)
+    ]
 
 
 def create_initial_state(
-    layout: str,
+    layout: str = OPEN_FLOOR,
     num_leaders: int = 1,
-    num_workers: int = 4,
+    num_workers: int = 3,
 ) -> dict:
-    """Create and return a fresh world_state dict for the given layout.
+    """Create a fresh autonomous-factory world state.
 
-    Schema
-    ------
-    {
-        "robots":      [{"id": int, "role": str, "pos": [x, y],
-                         "path": [], "current_task": None}, ...],
-        "tasks":       [],
-        "workstations":[{"name": str, "pos": [x, y], "color": [r, g, b]}, ...],
-        "blackboard":  [],
-        "layout":      str,
-        "wall":        [[x, y], ...],
-        "stats":       {"completed": 0, "elapsed": 0.0, "rate": 0.0},
-        "connection_status": "online",
-        "spawn_positions": [list(sp) for sp in _SPAWN_POSITIONS[:num_leaders + num_workers]],
-        "tick":        0,
-    }
+    The single leader is stationary in a bottom-center command tower. Workers
+    move packages from factory conveyor pads to same-color drop boxes.
     """
-    robots: list[dict] = []
-    robot_id = 0
-
-    for _ in range(num_leaders):
-        sp = _LEADER_POSITIONS[robot_id % len(_LEADER_POSITIONS)]
-        robots.append({
-            "id": robot_id,
-            "role": LEADER,
-            "pos": list(sp),
-            "spawn_pos": list(sp),
-            "path": [],
-            "current_task": None,
-        })
-        robot_id += 1
-
-    for _ in range(num_workers):
-        sp = _SPAWN_POSITIONS[(robot_id - num_leaders) % len(_SPAWN_POSITIONS)]
-        robots.append({
-            "id": robot_id,
-            "role": WORKER,
-            "pos": list(sp),
-            "spawn_pos": list(sp),
-            "path": [],
-            "current_task": None,
-        })
-        robot_id += 1
-
+    factories = _initial_factories()
+    dropboxes = _initial_dropboxes()
+    workers = [
+        make_worker(index + 1, _INITIAL_WORKERS[index % len(_INITIAL_WORKERS)])
+        for index in range(num_workers)
+    ]
+    leader = {
+        "id": 0,
+        "name": "Leader",
+        "role": LEADER,
+        "pos": list(_LEADER_POS),
+        "spawn_pos": list(_LEADER_POS),
+        "path": [],
+        "current_task": None,
+        "status": "observing",
+        "thinking": False,
+    }
     return {
-        "robots": robots,
-        "tasks": [],
-        "workstations": _make_workstations(layout),
-        "blackboard": [],
         "layout": layout,
-        "wall": _make_wall(layout),
-        "stats": {"completed": 0, "elapsed": 0.0, "rate": 0.0},
+        "wall": [],
+        "leader": leader,
+        "robots": [leader] + workers,
+        "workers": workers,
+        "factories": factories,
+        "dropboxes": dropboxes,
+        # Compatibility alias for older helper code; render/main now use factories.
+        "workstations": copy.deepcopy(factories),
+        "packages": [],
+        "tasks": [],
+        "blackboard": [],
+        "thought_log": [],
+        "policy_log": [],
+        "policy_loaded": False,
+        "policy_path": "",
+        "policy_status": "not loaded",
         "connection_status": "online",
+        "running": False,
+        "speed_multiplier": 1,
         "tick": 0,
+        "next_package_id": 0,
+        "next_task_id": 0,
+        "next_factory_id": len(factories),
+        "next_dropbox_id": len(dropboxes),
+        "next_worker_id": len(workers) + 1,
+        "builder_mode": "wall",
+        "leader_thinking": False,
+        "inference_target": "",
+        "stats": {
+            "completed": 0,
+            "elapsed": 0.0,
+            "rate": 0.0,
+            "last_route_time": None,
+            "avg_route_time": None,
+        },
     }
 
 
 if __name__ == "__main__":
-    state = create_initial_state(OPEN_FLOOR)
-    print("OPEN_FLOOR state keys:", list(state.keys()))
-    print("Robots:", len(state["robots"]))
-    state2 = create_initial_state(BOTTLENECK_BRIDGE)
-    print("BOTTLENECK wall cells:", len(state2["wall"]))
-    print("state.py OK")
+    state = create_initial_state()
+    print("FactoryMind state keys:", list(state.keys()))
+    print("Factories:", len(state["factories"]))
+    print("Workers:", len(state["workers"]))

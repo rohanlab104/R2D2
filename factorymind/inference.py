@@ -20,11 +20,11 @@ NVIDIA_API_KEY          : Required for cloud mode (integrate.api.nvidia.com).
 USE_LOCAL_NIM           : "true" to use local NIM on GX10, "false" for cloud.
 GX10_IP                 : "localhost" when running on GX10 (default), or the
                           GX10 IP / SSH-tunneled host from a remote machine.
-NIM_LEADER_BASE_URL     : Override leader endpoint (default http://{GX10_IP}:8000/v1).
-NIM_STRATEGIST_BASE_URL : Override strategist endpoint (default http://{GX10_IP}:8001/v1).
+NIM_LEADER_BASE_URL     : Override leader endpoint (default http://{GX10_IP}:8001/v1).
+NIM_WORKER_BASE_URL     : Override worker endpoint (default http://{GX10_IP}:8000/v1).
 LOCAL_NIM_BASE_URL      : Shared local endpoint override for both roles.
 LEADER_MODEL            : Override leader model id.
-STRATEGIST_MODEL        : Override strategist model id.
+WORKER_MODEL            : Override worker model id.
 NEMOTRON_TIMEOUT_SECONDS: Per-call HTTP timeout (default 60s for local NIM).
 NGC_API_KEY             : For docker login / NIM image pulls (often == NVIDIA_API_KEY).
 """
@@ -45,8 +45,8 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_FAST_MODEL = "nvidia/nvidia-nemotron-nano-9b-v2"
-_STRATEGIST_FALLBACK_MODEL = "nvidia/llama-3_3-nemotron-super-49b-v1_5"
+_WORKER_MODEL = "nvidia/nvidia-nemotron-nano-9b-v2"
+_SUPER_MODEL = "nvidia/llama-3_3-nemotron-super-49b-v1_5"
 
 
 def _model_env(name: str, fallback: str) -> str:
@@ -63,10 +63,8 @@ def _model_env(name: str, fallback: str) -> str:
     return model
 
 
-LEADER_MODEL = _model_env("LEADER_MODEL", _FAST_MODEL)
-WORKER_MODEL = _model_env("WORKER_MODEL", _FAST_MODEL)
-TASK_INTERPRETER_MODEL = _model_env("TASK_INTERPRETER_MODEL", LEADER_MODEL)
-STRATEGIST_MODEL = _model_env("STRATEGIST_MODEL", _STRATEGIST_FALLBACK_MODEL)
+LEADER_MODEL = _model_env("LEADER_MODEL", _SUPER_MODEL)
+WORKER_MODEL = _model_env("WORKER_MODEL", _WORKER_MODEL)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -89,24 +87,25 @@ def _leader_base_url() -> str:
     return (
         os.getenv("NIM_LEADER_BASE_URL")
         or _SHARED_LOCAL_URL
-        or f"http://{GX10_IP}:8000/v1"
+        or f"http://{GX10_IP}:8001/v1"
     ).rstrip("/")
 
 
-def _strategist_base_url() -> str:
+def _worker_base_url() -> str:
     if not USE_LOCAL:
         return _CLOUD_URL
     return (
-        os.getenv("NIM_STRATEGIST_BASE_URL")
+        os.getenv("NIM_WORKER_BASE_URL")
         or _SHARED_LOCAL_URL
-        or f"http://{GX10_IP}:8001/v1"
+        or f"http://{GX10_IP}:8000/v1"
     ).rstrip("/")
 
 
 def _make_client(base_url: str) -> OpenAI:
     # max_retries=0 so a dead endpoint surfaces in `_TIMEOUT_SECONDS` instead
-    # of getting silently retried for ~30s while the worker thread holds the
-    # pool slot. Callers (agents.py) fall back to mock decisions on failure.
+    # of getting silently retried for ~30s while the leader's worker thread holds
+    # the pool slot. The runtime validates output and falls back to its policy
+    # planner when inference is unavailable.
     return OpenAI(
         base_url=base_url,
         api_key=_API_KEY,
@@ -116,8 +115,7 @@ def _make_client(base_url: str) -> OpenAI:
 
 
 _leader_client = _make_client(_leader_base_url())
-_worker_client = _make_client(_leader_base_url())   # same endpoint, smaller model
-_strategist_client = _make_client(_strategist_base_url())
+_worker_client = _make_client(_worker_base_url())
 
 
 # ---------------------------------------------------------------------------
@@ -133,16 +131,12 @@ def describe_endpoints() -> str:
         return (
             f"Inference target: LOCAL NIM on {location}\n"
             f"  leader     -> {_leader_base_url()}  ({LEADER_MODEL})\n"
-            f"  task parse -> {_leader_base_url()}  ({TASK_INTERPRETER_MODEL})\n"
-            f"  worker     -> {_leader_base_url()}  ({WORKER_MODEL})\n"
-            f"  strategist -> {_strategist_base_url()}  ({STRATEGIST_MODEL})"
+            f"  worker     -> {_worker_base_url()}  ({WORKER_MODEL})"
         )
     return (
         "Inference target: NVIDIA CLOUD (build.nvidia.com)\n"
         f"  leader     -> {_CLOUD_URL}  ({LEADER_MODEL})\n"
-        f"  task parse -> {_CLOUD_URL}  ({TASK_INTERPRETER_MODEL})\n"
-        f"  worker     -> {_CLOUD_URL}  ({WORKER_MODEL})\n"
-        f"  strategist -> {_CLOUD_URL}  ({STRATEGIST_MODEL})"
+        f"  worker     -> {_CLOUD_URL}  ({WORKER_MODEL})"
     )
 
 
@@ -177,7 +171,7 @@ def ask_nemotron(
 # ---------------------------------------------------------------------------
 
 def ask_leader(prompt: str) -> str:
-    """Query the fast leader model (Nemotron Nano 9B)."""
+    """Query the leader model (Nemotron Super 49B)."""
     return ask_nemotron(
         prompt,
         model=LEADER_MODEL,
@@ -193,26 +187,6 @@ def ask_worker(prompt: str) -> str:
         model=WORKER_MODEL,
         max_tokens=256,
         client=_worker_client,
-    )
-
-
-def ask_task_interpreter(prompt: str) -> str:
-    """Query the task interpreter model for structured warehouse commands."""
-    return ask_nemotron(
-        prompt,
-        model=TASK_INTERPRETER_MODEL,
-        max_tokens=384,
-        client=_leader_client,
-    )
-
-
-def ask_strategist(prompt: str) -> str:
-    """Query the strategist model (Nemotron Super 49B)."""
-    return ask_nemotron(
-        prompt,
-        model=STRATEGIST_MODEL,
-        max_tokens=512,
-        client=_strategist_client,
     )
 
 
@@ -254,8 +228,8 @@ def _check_api_key() -> bool:
     return True
 
 
-def run_smoke(*, leader: bool = True, strategist: bool = True) -> int:
-    """Verify leader and/or strategist endpoints. Returns exit code (0 = ok)."""
+def run_smoke(*, leader: bool = True, worker: bool = True) -> int:
+    """Verify leader and/or worker endpoints. Returns exit code (0 = ok)."""
     print(describe_endpoints())
     print()
 
@@ -273,12 +247,10 @@ def run_smoke(*, leader: bool = True, strategist: bool = True) -> int:
             print(f"  FAILED: {exc}", file=sys.stderr)
             errors += 1
 
-    if strategist:
-        print(f"[strategist] calling {_strategist_base_url()} ...")
+    if worker:
+        print(f"[worker] calling {_worker_base_url()} ...")
         try:
-            result = ask_strategist(
-                "Reply with one short sentence confirming you are online."
-            )
+            result = ask_worker("Reply with one short sentence confirming worker inference is online.")
             print(f"  OK: {result.strip()[:200]}")
         except Exception as exc:
             print(f"  FAILED: {exc}", file=sys.stderr)
@@ -289,7 +261,7 @@ def run_smoke(*, leader: bool = True, strategist: bool = True) -> int:
         print(f"{errors} check(s) failed.", file=sys.stderr)
         return 1
 
-    if leader and strategist:
+    if leader and worker:
         kind = "local NIM" if USE_LOCAL else "cloud inference"
         print(f"{kind} confirmed for both models")
     return 0
@@ -298,9 +270,9 @@ def run_smoke(*, leader: bool = True, strategist: bool = True) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Verify Nemotron inference endpoints.")
     parser.add_argument("--leader-only", action="store_true")
-    parser.add_argument("--strategist-only", action="store_true")
+    parser.add_argument("--worker-only", action="store_true")
     args = parser.parse_args()
 
-    run_leader = not args.strategist_only
-    run_strategist = not args.leader_only
-    raise SystemExit(run_smoke(leader=run_leader, strategist=run_strategist))
+    run_leader = not args.worker_only
+    run_worker = not args.leader_only
+    raise SystemExit(run_smoke(leader=run_leader, worker=run_worker))

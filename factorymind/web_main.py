@@ -1,172 +1,72 @@
-"""Headless web entry point — same simulation as ``factorymind.main``, but
-rendered in 3D in a browser instead of a pygame window.
-
-One command:
-
-    python -m factorymind.web_main
-
-Then open ``http://<gx10-ip>:8080`` (or ``http://localhost:8080`` if you're
-on the GX10 itself). Every helper here is reused from ``factorymind.main``;
-the only thing that changes is rendering and input.
-"""
+"""Headless web entry point for the autonomous FactoryMind 3D demo."""
 
 from __future__ import annotations
 
+import copy
 import os
-import sys
 import time
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Importing factorymind.main pulls in pygame, but we never call init_display()
-# so no window or video driver is required.
 from factorymind import main as M
-from factorymind import memory as MEM
 from factorymind import web_server
-from factorymind.agents import (
-    Blackboard,
-    leader_decide,
-    strategist_decide,
-    worker_decide,
-)
-from factorymind.state import (
-    LEADER, OPEN_FLOOR, STRATEGY, WORKER,
-)
+from factorymind.agents import Blackboard
 
-
-# ---------------------------------------------------------------------------
-# Action handlers (mirror the pygame button/event handlers in main.py)
-# ---------------------------------------------------------------------------
-
-def _handle_user_prompt(
-    text: str,
-    world_state: dict,
-    blackboard: Blackboard,
-    *,
-    now: float,
-    timers: dict,
-) -> bool:
-    """Apply a chat prompt the same way main.py does. Returns True if the
-    request started new work (so the caller can flip ``manual_control``)."""
-    user_text = text.strip()
-    if not user_text:
-        return False
-    M._sim_started = True
-    blackboard.post(-1, "USER", user_text)
-
-    if M._apply_go_to_station_and_stop(user_text, world_state, blackboard):
-        timers["last_leader_tick"] = now
-        timers["last_worker_tick"] = now
-        timers["last_strategist_tick"] = now
-        return True
-
-    if M._apply_user_task_request(user_text, world_state, blackboard):
-        timers["last_leader_tick"] = now - M.LEADER_TICK_INTERVAL
-        timers["last_worker_tick"] = now - M.WORKER_TICK_INTERVAL
-        timers["last_strategist_tick"] = now
-        return True
-
-    # Free-form prompt — kick the strategist if it's not already busy.
-    if M._pending_strategist is None:
-        try:
-            retrieved = MEM.retrieve_strategies(
-                world_state["layout"],
-                state_description=MEM.describe_world_state(world_state),
-            )
-        except Exception:
-            retrieved = []
-        M._pending_strategist = M._decision_executor.submit(
-            strategist_decide, world_state, blackboard, retrieved, user_text,
-        )
-        timers["last_strategist_tick"] = now
-    return False
-
-
-def _handle_disconnect(
-    world_state: dict,
-    blackboard: Blackboard,
-    *,
-    initial_use_local: bool,
-    initial_use_mock: bool,
-) -> None:
-    M._cancel_pending_decisions()
-    if world_state["connection_status"] == "online":
-        M._set_inference_mode(True)
-        world_state["connection_status"] = "offline"
-        local_ready = M._local_nim_available()
-        os.environ["AGENTS_USE_MOCK"] = (
-            "true" if initial_use_mock or not local_ready else "false"
-        )
-        fallback = (
-            "local endpoints are reachable."
-            if local_ready
-            else "local endpoints are down, so mock fallback is active."
-        )
-        blackboard.post(
-            -1, STRATEGY,
-            f"Cloud disconnect: forcing local DGX Spark NIM; {fallback}",
-        )
-    else:
-        M._set_inference_mode(initial_use_local)
-        os.environ["AGENTS_USE_MOCK"] = "true" if initial_use_mock else "false"
-        world_state["connection_status"] = "online"
-        blackboard.post(
-            -1, STRATEGY,
-            "Demo reconnect: inference mode restored to startup configuration.",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
 
 def run() -> None:
-    M._print_startup_banner()
-    M._auto_fallback_to_mock_if_endpoints_dead()
-
-    layout = os.getenv("LAYOUT", OPEN_FLOOR)
+    """Run the autonomous simulation and serve the browser 3D viewer."""
+    inference_target = M._print_startup_banner()
     speed_multiplier = 1
+    world_state = M._reset_demo_state(speed_multiplier, "online", inference_target)
+    blackboard = Blackboard()
+
     initial_use_local = os.getenv("USE_LOCAL_NIM", "true").lower() == "true"
-    initial_use_mock = os.getenv("AGENTS_USE_MOCK", "false").lower() == "true"
-    max_runtime = float(os.getenv("FACTORYMIND_MAX_RUNTIME", "0") or 0)
+    world_state["llm_ready"] = M._local_nim_available() if initial_use_local else True
+    if not world_state["llm_ready"]:
+        M._thought(
+            world_state,
+            M.S.WARNING,
+            "Leader",
+            "Local NIM is not reachable; deterministic policy planner is active.",
+            0.0,
+            blackboard,
+        )
+    M._thought(
+        world_state,
+        M.S.OBSERVE,
+        "Leader",
+        "FactoryMind web runtime ready. Press START to begin autonomous dispatch.",
+        0.0,
+        blackboard,
+    )
 
     host = os.getenv("FACTORYMIND_WEB_HOST", "0.0.0.0")
     port = int(os.getenv("FACTORYMIND_WEB_PORT", "8080"))
     target_fps = float(os.getenv("FACTORYMIND_WEB_FPS", "60"))
-    publish_dt = float(os.getenv("FACTORYMIND_WEB_PUBLISH_DT", "0.1"))
-
-    world_state = M._reset_demo_state(layout, speed_multiplier, "online")
-    blackboard = Blackboard()
-    blackboard.post(
-        -1, "STRATEGY",
-        "FactoryMind 3D ready — type a delivery like 'take Parts to QA' to begin.",
-    )
-    M._sim_started = False
-    manual_control = False
+    publish_dt = float(os.getenv("FACTORYMIND_WEB_PUBLISH_DT", "0.08"))
+    max_runtime = float(os.getenv("FACTORYMIND_MAX_RUNTIME", "0") or 0)
+    heartbeat_seconds = float(os.getenv("FACTORYMIND_HEARTBEAT_SECONDS", "10"))
 
     url = web_server.serve_in_background(host=host, port=port)
     print("=" * 72, flush=True)
-    print(f"[web] 3D viewer ready -> {url}", flush=True)
+    print(f"[web] FactoryMind 3D viewer ready -> {url}", flush=True)
     if host in ("0.0.0.0", "::", ""):
-        print("      (any device on this network can connect; "
-              "use the GX10's IP from your laptop)", flush=True)
+        print("[web] Use this machine's LAN IP to open it from another device.", flush=True)
     print("=" * 72, flush=True)
 
-    timers = {
-        "last_leader_tick": -M.LEADER_TICK_INTERVAL,
-        "last_worker_tick": -M.WORKER_TICK_INTERVAL,
-        "last_strategist_tick": 0.0,
-        "last_move_tick": -M.MOVE_TICK_INTERVAL,
-    }
+    web_server.update_state(world_state, _build_info(world_state))
+
     sim_elapsed = 0.0
-    run_start = time.time()
-    last_frame = run_start
-    last_heartbeat = run_start
-    heartbeat_seconds = float(os.getenv("FACTORYMIND_HEARTBEAT_SECONDS", "10"))
-    frames_since_beat = 0
+    run_started_wall = time.time()
+    last_frame = run_started_wall
     last_publish = 0.0
+    last_heartbeat = run_started_wall
+    frames_since_beat = 0
+    last_move_tick = -M.MOVE_TICK_INTERVAL
+    last_factory_tick = -M.FACTORY_TICK_INTERVAL
+    last_leader_tick = -M.LEADER_TICK_INTERVAL
     frame_dt = 1.0 / max(target_fps, 1.0)
 
     try:
@@ -174,160 +74,87 @@ def run() -> None:
             wall_now = time.time()
             real_delta = wall_now - last_frame
             last_frame = wall_now
-
-            if M._sim_started:
+            if world_state.get("running"):
                 sim_elapsed += real_delta * speed_multiplier
             now = sim_elapsed
 
-            # ---- heartbeat ------------------------------------------------
             frames_since_beat += 1
             if heartbeat_seconds > 0 and wall_now - last_heartbeat >= heartbeat_seconds:
-                in_flight = (
-                    len(M._pending_leader)
-                    + len(M._pending_worker)
-                    + (1 if M._pending_strategist else 0)
-                )
                 fps = frames_since_beat / max(wall_now - last_heartbeat, 1e-6)
                 print(
-                    f"[web] alive  fps={fps:.0f}  sim_t={sim_elapsed:.1f}s  "
-                    f"in_flight={in_flight}  "
-                    f"completed={world_state['stats'].get('completed', 0)}  "
-                    f"started={M._sim_started}",
+                    f"[web] alive fps={fps:.0f} sim_t={sim_elapsed:.1f}s "
+                    f"running={world_state.get('running')} "
+                    f"completed={world_state['stats'].get('completed', 0)}",
                     flush=True,
                 )
                 last_heartbeat = wall_now
                 frames_since_beat = 0
 
-            # ---- pull actions from the browser ----------------------------
             for action in web_server.drain_actions():
-                kind = action.get("type")
-                if kind == "user_prompt":
-                    _handle_user_prompt(
-                        str(action.get("text", "")),
-                        world_state,
-                        blackboard,
-                        now=now,
-                        timers=timers,
-                    )
-                    # Both go-to-station and task-request helpers set
-                    # world_state["manual_control"] correctly.
-                    manual_control = bool(world_state.get("manual_control", False))
-                elif kind == "reset":
-                    M._cancel_pending_decisions()
-                    world_state = M._reset_demo_state(
-                        OPEN_FLOOR, speed_multiplier, world_state["connection_status"]
-                    )
-                    blackboard.clear()
-                    blackboard.post(
-                        -1, "STRATEGY",
-                        "Simulation reset — type a delivery like 'take Parts to QA' to begin.",
-                    )
-                    M._sim_started = False
-                    manual_control = False
-                    sim_elapsed = 0.0
-                    timers["last_leader_tick"] = -M.LEADER_TICK_INTERVAL
-                    timers["last_worker_tick"] = -M.WORKER_TICK_INTERVAL
-                    timers["last_strategist_tick"] = 0.0
-                    timers["last_move_tick"] = -M.MOVE_TICK_INTERVAL
-                elif kind == "speedup":
-                    speed_multiplier = M._cycle_speed(speed_multiplier)
-                    world_state["speed_multiplier"] = speed_multiplier
-                elif kind == "disconnect":
-                    _handle_disconnect(
-                        world_state, blackboard,
-                        initial_use_local=initial_use_local,
-                        initial_use_mock=initial_use_mock,
-                    )
-                elif kind == "wall_add":
-                    cell = action.get("cell")
-                    if isinstance(cell, list) and len(cell) == 2:
-                        wall_list = world_state.get("wall", [])
-                        if cell not in wall_list:
-                            wall_list.append(cell)
-                            world_state["wall"] = wall_list
-                            world_state["layout"] = "CUSTOM"
-                elif kind == "wall_remove":
-                    cell = action.get("cell")
-                    if isinstance(cell, list) and len(cell) == 2:
-                        wall_list = list(world_state.get("wall", []))
-                        if cell in wall_list:
-                            wall_list.remove(cell)
-                            world_state["wall"] = wall_list
-                # Unknown kinds are ignored — nothing to do.
-
-            # ---- always drain in-flight LLM decisions ---------------------
-            M._drain_completed_decisions(world_state, blackboard)
-
-            # ---- only run the simulation once started ---------------------
-            if M._sim_started:
-                if not manual_control:
-                    if now - timers["last_leader_tick"] >= M.LEADER_TICK_INTERVAL:
-                        for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
-                            if leader["id"] in M._pending_leader:
-                                continue
-                            M._pending_leader[leader["id"]] = M._decision_executor.submit(
-                                leader_decide, leader, world_state, blackboard,
-                            )
-                        timers["last_leader_tick"] = now
-
-                    if now - timers["last_worker_tick"] >= M.WORKER_TICK_INTERVAL:
-                        if M._ALL_AGENTS_LLM:
-                            for worker in [r for r in world_state["robots"] if r["role"] == WORKER]:
-                                if worker["id"] in M._pending_worker:
-                                    continue
-                                if worker.get("current_task") is not None:
-                                    continue
-                                M._pending_worker[worker["id"]] = M._decision_executor.submit(
-                                    worker_decide, worker, world_state, blackboard,
-                                )
-                        else:
-                            M._assign_idle_workers(world_state, blackboard)
-                        timers["last_worker_tick"] = now
-
-                    if (
-                        now - timers["last_strategist_tick"] >= M.STRATEGIST_TICK_INTERVAL
-                        and M._pending_strategist is None
-                    ):
-                        try:
-                            retrieved = MEM.retrieve_strategies(
-                                world_state["layout"],
-                                state_description=MEM.describe_world_state(world_state),
-                            )
-                        except Exception as exc:
-                            print(f"[web] strategy retrieval failed: {exc}",
-                                  file=sys.stderr, flush=True)
-                            retrieved = []
-                        M._pending_strategist = M._decision_executor.submit(
-                            strategist_decide, world_state, blackboard, retrieved,
-                        )
-                        timers["last_strategist_tick"] = now
-
-                if now - timers["last_move_tick"] >= M.MOVE_TICK_INTERVAL:
-                    move_steps = min(int((now - timers["last_move_tick"]) // M.MOVE_TICK_INTERVAL), 4)
-                    for _ in range(max(1, move_steps)):
-                        M._advance_robots_coordinated(world_state, blackboard)
-                    timers["last_move_tick"] += max(1, move_steps) * M.MOVE_TICK_INTERVAL
-
-                world_state["stats"]["elapsed"] = round(sim_elapsed, 1)
-                completed = world_state["stats"]["completed"]
-                world_state["stats"]["rate"] = (
-                    round(completed / sim_elapsed * 60, 1) if sim_elapsed > 0 else 0.0
+                result = _handle_web_action(
+                    action,
+                    world_state,
+                    blackboard,
+                    now,
+                    speed_multiplier,
+                    initial_use_local,
+                    inference_target,
                 )
+                if result.get("reset_state") is not None:
+                    world_state = result["reset_state"]
+                    blackboard = result["blackboard"]
+                    inference_target = result["inference_target"]
+                    sim_elapsed = 0.0
+                    now = 0.0
+                    last_move_tick = -M.MOVE_TICK_INTERVAL
+                    last_factory_tick = -M.FACTORY_TICK_INTERVAL
+                    last_leader_tick = -M.LEADER_TICK_INTERVAL
+                speed_multiplier = result.get("speed_multiplier", speed_multiplier)
+                inference_target = result.get("inference_target", inference_target)
 
-            # ---- always sync metadata + publish ---------------------------
+            if M._pending_leader is not None and M._pending_leader.done():
+                future = M._pending_leader
+                M._pending_leader = None
+                try:
+                    plan = future.result()
+                except Exception as exc:
+                    plan = {
+                        "assignments": M._deterministic_assignments(copy.deepcopy(world_state)),
+                        "thought": "",
+                        "warning": f"Leader planner failed; deterministic policy planner used ({exc}).",
+                    }
+                M._apply_leader_plan(world_state, plan, blackboard, now)
+
+            if world_state.get("running"):
+                if now - last_factory_tick >= M.FACTORY_TICK_INTERVAL:
+                    steps = max(1, min(int((now - last_factory_tick) // M.FACTORY_TICK_INTERVAL), 4))
+                    for _ in range(steps):
+                        M._update_factories(world_state, M.FACTORY_TICK_INTERVAL, now, blackboard)
+                    last_factory_tick += steps * M.FACTORY_TICK_INTERVAL
+
+                if now - last_leader_tick >= M.LEADER_TICK_INTERVAL and M._pending_leader is None:
+                    snapshot = copy.deepcopy(world_state)
+                    world_state["leader_thinking"] = True
+                    world_state["leader"]["thinking"] = True
+                    M._pending_leader = M._decision_executor.submit(M._leader_decide_autonomous, snapshot)
+                    last_leader_tick = now
+
+                if now - last_move_tick >= M.MOVE_TICK_INTERVAL:
+                    steps = max(1, min(int((now - last_move_tick) // M.MOVE_TICK_INTERVAL), 4))
+                    for _ in range(steps):
+                        M._move_workers(world_state, now, blackboard)
+                    last_move_tick += steps * M.MOVE_TICK_INTERVAL
+
+            M._update_stats(world_state, now)
             world_state["blackboard"] = blackboard.to_list()
             world_state["speed_multiplier"] = speed_multiplier
             world_state["tick"] += 1
 
             if wall_now - last_publish >= publish_dt:
-                info = _build_info(manual_control)
-                web_server.update_state(world_state, info)
+                web_server.update_state(world_state, _build_info(world_state))
                 last_publish = wall_now
 
-            if max_runtime and (
-                sim_elapsed >= max_runtime
-                or wall_now - run_start >= max_runtime
-            ):
+            if max_runtime and (now >= max_runtime or wall_now - run_started_wall >= max_runtime):
                 break
 
             sleep_for = frame_dt - (time.time() - wall_now)
@@ -340,20 +167,88 @@ def run() -> None:
         M._decision_executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _build_info(manual_control: bool) -> dict:
-    """Best-effort diagnostic block for the browser HUD."""
-    info: dict = {
-        "started": M._sim_started,
-        "manual_control": manual_control,
-        "mock": os.getenv("AGENTS_USE_MOCK", "false").lower() == "true",
+def _handle_web_action(
+    action: dict,
+    world_state: dict,
+    blackboard: Blackboard,
+    now: float,
+    speed_multiplier: int,
+    initial_use_local: bool,
+    inference_target: str,
+) -> dict:
+    kind = action.get("type")
+    result = {
+        "speed_multiplier": speed_multiplier,
+        "inference_target": inference_target,
+        "reset_state": None,
+        "blackboard": blackboard,
+    }
+
+    if kind == "start":
+        world_state["running"] = True
+        M._thought(world_state, M.S.OBSERVE, "Leader", "Autonomous loop started.", now, blackboard)
+    elif kind == "stop":
+        world_state["running"] = False
+        M._cancel_pending_decisions()
+        world_state["leader_thinking"] = False
+        world_state["leader"]["thinking"] = False
+        M._thought(world_state, M.S.RETHINK, "Leader", "Simulation paused in place.", now, blackboard)
+    elif kind == "reset":
+        M._cancel_pending_decisions()
+        new_state = M._reset_demo_state(speed_multiplier, world_state["connection_status"], inference_target)
+        new_state["llm_ready"] = M._local_nim_available() if initial_use_local else True
+        new_blackboard = Blackboard()
+        M._thought(
+            new_state,
+            M.S.OBSERVE,
+            "Leader",
+            "State reset to 1 leader, 3 workers, 3 factories, 3 drop boxes.",
+            0.0,
+            new_blackboard,
+        )
+        result["reset_state"] = new_state
+        result["blackboard"] = new_blackboard
+    elif kind == "speed_toggle":
+        speed_multiplier = M._cycle_speed(speed_multiplier)
+        world_state["speed_multiplier"] = speed_multiplier
+        result["speed_multiplier"] = speed_multiplier
+    elif kind == "disconnect":
+        M._set_inference_mode(True)
+        inference_target = M._describe_inference_target()
+        world_state["inference_target"] = inference_target
+        world_state["connection_status"] = "offline"
+        world_state["llm_ready"] = M._local_nim_available()
+        M._thought(world_state, M.S.WARNING, "Leader", "Cloud disconnected; GX10 local policy path active.", now, blackboard)
+        result["inference_target"] = inference_target
+    elif kind == "reconnect":
+        M._set_inference_mode(initial_use_local)
+        inference_target = M._describe_inference_target()
+        world_state["inference_target"] = inference_target
+        world_state["connection_status"] = "online"
+        world_state["llm_ready"] = M._local_nim_available() if initial_use_local else True
+        M._thought(world_state, M.S.OBSERVE, "Leader", "Cloud/demo inference mode restored.", now, blackboard)
+        result["inference_target"] = inference_target
+    elif kind in {"mode_cursor", "mode_builder"}:
+        world_state["ui_mode"] = "builder" if kind == "mode_builder" else "cursor"
+    elif isinstance(kind, str) and kind.startswith("builder_"):
+        world_state["builder_mode"] = kind.replace("builder_", "")
+    elif kind in {"wall_add", "wall_remove", "place_factory", "place_dropbox", "place_worker"}:
+        M._handle_builder_action(world_state, action)
+
+    return result
+
+
+def _build_info(world_state: dict) -> dict:
+    info = {
+        "started": bool(world_state.get("running")),
+        "policy_status": world_state.get("policy_status", "unknown"),
+        "policy_path": world_state.get("policy_path", ""),
     }
     try:
-        from factorymind import inference  # local import: respects reloads
+        from factorymind import inference
         info["endpoints"] = inference.describe_endpoints()
-        if hasattr(inference, "circuit_status"):
-            info["circuit"] = inference.circuit_status()
     except Exception as exc:
-        info["endpoints"] = f"(unavailable: {exc})"
+        info["endpoints"] = f"Inference target unavailable: {exc}"
     return info
 
 

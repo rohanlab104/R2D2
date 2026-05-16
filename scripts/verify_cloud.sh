@@ -13,12 +13,12 @@ set -a && source .env && set +a
 
 export USE_LOCAL_NIM=false
 
-echo "=== Leader (Nano 9B) ==="
+echo "=== Leader (Super 49B) ==="
 python3 -m factorymind.inference --leader-only
 
 echo ""
-echo "=== Strategist (49B) ==="
-python3 -m factorymind.inference --strategist-only
+echo "=== Worker (Nano 9B) ==="
+python3 -m factorymind.inference --worker-only
 
 echo ""
-echo "Post in team chat: cloud inference confirmed for both models"
+echo "Cloud inference confirmed for both FactoryMind models"

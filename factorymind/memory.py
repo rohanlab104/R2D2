@@ -1,7 +1,7 @@
 """Persistent memory layer backed by SQLite.
 
-Stores factory strategies and their outcomes so the strategist can retrieve
-relevant past knowledge at decision time.
+Stores factory strategies and their outcomes so the leader can retrieve
+relevant past knowledge at dispatch time.
 """
 
 from __future__ import annotations
