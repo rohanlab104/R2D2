@@ -60,6 +60,9 @@ _mode = "cursor"
 _builder_submode = "wall"
 _builder_drag_start: Optional[tuple[int, int]] = None
 _builder_dragged_cells: set[tuple[int, int]] = set()
+# Builder placement rotation (degrees, in-plane). Press R while in
+# conveyor/dropbox sub-mode to advance by 45 deg. Wraps at 360.
+_builder_rotation: float = 0.0
 
 _BTN_DISCONNECT: Optional["pygame.Rect"] = None
 _BTN_MODE_CURSOR: Optional["pygame.Rect"] = None
@@ -174,7 +177,7 @@ def render(screen: "pygame.Surface", world_state: dict) -> None:
 
 def handle_event(event: "pygame.event.Event", world_state: dict) -> "Union[dict, str, None]":
     """Process one pygame event and return an action for main.py."""
-    global _builder_drag_start, _builder_dragged_cells
+    global _builder_drag_start, _builder_dragged_cells, _builder_rotation
 
     if event.type == pygame.MOUSEBUTTONDOWN:
         pos = event.pos
@@ -196,12 +199,14 @@ def handle_event(event: "pygame.event.Event", world_state: dict) -> "Union[dict,
                         "type": "place_factory",
                         "cell": list(cell),
                         "color": _next_factory_color(world_state),
+                        "rotation_y": math.radians(_builder_rotation),
                     }
                 if _builder_submode == "dropbox":
                     return {
                         "type": "place_dropbox",
                         "cell": list(cell),
                         "color": _next_dropbox_color(world_state),
+                        "rotation_y": math.radians(_builder_rotation),
                     }
                 if _builder_submode == "worker":
                     return {"type": "place_worker", "cell": list(cell)}
@@ -222,6 +227,12 @@ def handle_event(event: "pygame.event.Event", world_state: dict) -> "Union[dict,
                 if cell and cell not in _builder_dragged_cells:
                     _builder_dragged_cells.add(cell)
                     return {"type": "wall_add", "cell": list(cell)}
+
+    elif event.type == pygame.KEYDOWN:
+        # R while in conveyor/dropbox sub-mode rotates the placement preview
+        # 45 deg around the y axis (i.e., in the top-down XY plane).
+        if event.key == pygame.K_r and _mode == "builder" and _builder_submode in ("factory", "dropbox"):
+            _builder_rotation = (_builder_rotation + 45.0) % 360.0
 
     return None
 
@@ -424,6 +435,23 @@ def _draw_package_cube(screen: "pygame.Surface", color: tuple[int, int, int],
     pygame.draw.rect(screen, (0, 0, 0), rect, 1)
 
 
+def _rotate_points(points: list[tuple[float, float]], pivot: tuple[float, float],
+                   degrees: float) -> list[tuple[int, int]]:
+    """Rotate a polygon's points around ``pivot`` by ``degrees``."""
+    angle = math.radians(degrees)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    px, py = pivot
+    out: list[tuple[int, int]] = []
+    for x, y in points:
+        dx = x - px
+        dy = y - py
+        rx = dx * cos_a - dy * sin_a + px
+        ry = dx * sin_a + dy * cos_a + py
+        out.append((int(round(rx)), int(round(ry))))
+    return out
+
+
 def draw_builder_overlay(screen: "pygame.Surface", world_state: dict) -> None:
     if _mode != "builder":
         return
@@ -443,12 +471,120 @@ def draw_builder_overlay(screen: "pygame.Surface", world_state: dict) -> None:
         pygame.draw.rect(screen, (*C_ACCENT, 90), rect)
         pygame.draw.rect(screen, C_ACCENT, rect, 2)
     elif _builder_submode == "factory":
-        pygame.draw.rect(screen, (0, 212, 255), _cell_rect(hover, 3, 3), 2, border_radius=4)
-        pygame.draw.rect(screen, (0, 212, 255), _cell_rect((hover[0] + 3, hover[1] + 1), 5, 1), 1)
+        _draw_factory_outline(screen, hover, _builder_rotation)
+        _draw_rotation_chip(screen, hover, _builder_rotation)
     elif _builder_submode == "dropbox":
-        pygame.draw.rect(screen, (0, 212, 255), _cell_rect(hover, 3, 2), 2, border_radius=3)
+        _draw_dropbox_outline(screen, hover, _builder_rotation)
+        _draw_rotation_chip(screen, hover, _builder_rotation)
     elif _builder_submode == "worker":
         pygame.draw.circle(screen, C_WORKER, _cell_center(hover), CELL_SIZE // 2, 2)
+
+
+def _draw_factory_outline(screen: "pygame.Surface", cell: tuple[int, int],
+                          rotation_deg: float) -> None:
+    """Cyan schematic of a factory + its right-facing conveyor + drop pad."""
+    x, y = cell
+    base_px = GRID_OFFSET_X + x * CELL_SIZE
+    base_py = GRID_OFFSET_Y + y * CELL_SIZE
+    # Pivot at the factory body center (it's a 3x3 starting at the hover cell).
+    pivot = (base_px + 1.5 * CELL_SIZE, base_py + 1.5 * CELL_SIZE)
+
+    # Factory body — 3x3 box.
+    body = [
+        (base_px,                  base_py),
+        (base_px + 3 * CELL_SIZE,  base_py),
+        (base_px + 3 * CELL_SIZE,  base_py + 3 * CELL_SIZE),
+        (base_px,                  base_py + 3 * CELL_SIZE),
+    ]
+    # Conveyor belt — 5 cells extending right of the body, vertically centered.
+    belt_y0 = base_py + CELL_SIZE
+    belt = [
+        (base_px + 3 * CELL_SIZE,        belt_y0),
+        (base_px + 8 * CELL_SIZE,        belt_y0),
+        (base_px + 8 * CELL_SIZE,        belt_y0 + CELL_SIZE),
+        (base_px + 3 * CELL_SIZE,        belt_y0 + CELL_SIZE),
+    ]
+    # Drop pad — single cell at end of belt.
+    pad = [
+        (base_px + 8 * CELL_SIZE,        belt_y0),
+        (base_px + 9 * CELL_SIZE,        belt_y0),
+        (base_px + 9 * CELL_SIZE,        belt_y0 + CELL_SIZE),
+        (base_px + 8 * CELL_SIZE,        belt_y0 + CELL_SIZE),
+    ]
+    accent = (*C_ACCENT, 220)
+    accent_dim = (*C_ACCENT, 110)
+
+    # Translucent body fill for legibility.
+    body_pts = _rotate_points([(p[0], p[1]) for p in body], pivot, rotation_deg)
+    belt_pts = _rotate_points([(p[0], p[1]) for p in belt], pivot, rotation_deg)
+    pad_pts = _rotate_points([(p[0], p[1]) for p in pad], pivot, rotation_deg)
+    surf = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+    pygame.draw.polygon(surf, (*C_ACCENT, 45), body_pts)
+    pygame.draw.polygon(surf, (*C_ACCENT, 35), belt_pts)
+    pygame.draw.polygon(surf, (*C_ACCENT, 60), pad_pts)
+    pygame.draw.polygon(surf, accent, body_pts, 2)
+    pygame.draw.polygon(surf, accent_dim, belt_pts, 1)
+    pygame.draw.polygon(surf, accent, pad_pts, 2)
+    # Arrow along the conveyor direction (rotates with the belt).
+    arrow_start = (base_px + 3.4 * CELL_SIZE, belt_y0 + CELL_SIZE / 2)
+    arrow_end   = (base_px + 7.6 * CELL_SIZE, belt_y0 + CELL_SIZE / 2)
+    head_a      = (base_px + 7.0 * CELL_SIZE, belt_y0 + CELL_SIZE / 2 - 4)
+    head_b      = (base_px + 7.0 * CELL_SIZE, belt_y0 + CELL_SIZE / 2 + 4)
+    rot_pts = _rotate_points([arrow_start, arrow_end, head_a, head_b], pivot, rotation_deg)
+    pygame.draw.line(surf, accent, rot_pts[0], rot_pts[1], 2)
+    pygame.draw.line(surf, accent, rot_pts[1], rot_pts[2], 2)
+    pygame.draw.line(surf, accent, rot_pts[1], rot_pts[3], 2)
+    screen.blit(surf, (0, 0))
+
+
+def _draw_dropbox_outline(screen: "pygame.Surface", cell: tuple[int, int],
+                          rotation_deg: float) -> None:
+    """Cyan schematic of a drop box (3 wide x 2 deep) with rotation."""
+    x, y = cell
+    base_px = GRID_OFFSET_X + x * CELL_SIZE
+    base_py = GRID_OFFSET_Y + y * CELL_SIZE
+    pivot = (base_px + 1.5 * CELL_SIZE, base_py + 1.0 * CELL_SIZE)
+    # Footprint: 3x2 cells.
+    footprint = [
+        (base_px,                 base_py),
+        (base_px + 3 * CELL_SIZE, base_py),
+        (base_px + 3 * CELL_SIZE, base_py + 2 * CELL_SIZE),
+        (base_px,                 base_py + 2 * CELL_SIZE),
+    ]
+    # Trapezoidal lid mimicking the live render.
+    lid = [
+        (base_px + 4,                  base_py + 5),
+        (base_px + 3 * CELL_SIZE - 4,  base_py + 5),
+        (base_px + 3 * CELL_SIZE - 8,  base_py + 2 * CELL_SIZE - 2),
+        (base_px + 8,                  base_py + 2 * CELL_SIZE - 2),
+    ]
+    surf = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+    fp_pts  = _rotate_points([(p[0], p[1]) for p in footprint], pivot, rotation_deg)
+    lid_pts = _rotate_points([(p[0], p[1]) for p in lid], pivot, rotation_deg)
+    pygame.draw.polygon(surf, (*C_ACCENT, 35), fp_pts)
+    pygame.draw.polygon(surf, (*C_ACCENT, 55), lid_pts)
+    pygame.draw.polygon(surf, (*C_ACCENT, 220), fp_pts, 2)
+    pygame.draw.polygon(surf, (*C_ACCENT, 220), lid_pts, 2)
+    # Open-box "front lip" line.
+    lip_start = (base_px + 8,                base_py + CELL_SIZE + 3)
+    lip_end   = (base_px + 3 * CELL_SIZE - 8, base_py + CELL_SIZE + 3)
+    rot = _rotate_points([lip_start, lip_end], pivot, rotation_deg)
+    pygame.draw.line(surf, (*C_ACCENT, 220), rot[0], rot[1], 2)
+    screen.blit(surf, (0, 0))
+
+
+def _draw_rotation_chip(screen: "pygame.Surface", cell: tuple[int, int],
+                        rotation_deg: float) -> None:
+    """Small chip showing current rotation + the R hint."""
+    font = pygame.font.SysFont("monospace", 9, bold=True)
+    label = f"R={int(rotation_deg):3d} deg  (press R)"
+    text = font.render(label, True, C_ACCENT)
+    px = GRID_OFFSET_X + cell[0] * CELL_SIZE
+    py = GRID_OFFSET_Y + cell[1] * CELL_SIZE - 14
+    bg = pygame.Rect(px - 2, py - 1, text.get_width() + 8, text.get_height() + 2)
+    pygame.draw.rect(screen, (10, 16, 28), bg, border_radius=3)
+    pygame.draw.rect(screen, C_ACCENT, bg, 1, border_radius=3)
+    screen.blit(text, (px + 2, py))
 
 
 def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
