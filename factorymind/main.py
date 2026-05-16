@@ -270,6 +270,87 @@ def _planned_path_to(
 _task_counter = 0
 
 
+def _cargo_deliveries_enabled() -> bool:
+    return os.getenv("FACTORYMIND_CARGO_DELIVERIES", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _cargo_spawn_blocked(world_state: dict) -> set[tuple[int, int]]:
+    blocked: set[tuple[int, int]] = {
+        tuple(c) for c in world_state.get("wall", [])
+    }
+    for ws in world_state.get("workstations", []):
+        wx, wy = ws.get("pos", [0, 0])
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                x, y = wx + dx, wy + dy
+                if 0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT:
+                    blocked.add((x, y))
+    return blocked
+
+
+def _occupied_cargo_pickup_cells(
+    world_state: dict,
+    extra: set[tuple[int, int]] | None = None,
+) -> set[tuple[int, int]]:
+    occ: set[tuple[int, int]] = set(extra or ())
+    for t in list(world_state.get("tasks", [])) + list(
+        world_state.get("task_queue", [])
+    ):
+        if not t.get("cargo"):
+            continue
+        if str(t.get("status", "")) in ("done", "cancelled"):
+            continue
+        occ.add(tuple(t.get("pickup", [])))
+    return occ
+
+
+def _pick_cargo_cell(
+    world_state: dict,
+    salt: int,
+    extra_reserved: set[tuple[int, int]] | None = None,
+) -> list[int]:
+    """Pick a walkable floor cell for a crate, avoiding stations and other crates."""
+    blocked = _cargo_spawn_blocked(world_state)
+    mode = os.getenv("FACTORYMIND_CARGO_SPAWN", "scatter").lower()
+    cx0, cx1 = GRID_WIDTH // 2 - 8, GRID_WIDTH // 2 + 7
+    cy0, cy1 = GRID_HEIGHT // 2 - 8, GRID_HEIGHT // 2 + 7
+    occ = _occupied_cargo_pickup_cells(world_state, extra_reserved)
+    candidates: list[tuple[int, int]] = []
+    for x in range(GRID_WIDTH):
+        for y in range(GRID_HEIGHT):
+            cell = (x, y)
+            if cell in blocked or cell in occ:
+                continue
+            if mode == "center" and not (cx0 <= x <= cx1 and cy0 <= y <= cy1):
+                continue
+            candidates.append(cell)
+    if not candidates:
+        for x in range(GRID_WIDTH):
+            for y in range(GRID_HEIGHT):
+                cell = (x, y)
+                if cell in blocked:
+                    continue
+                if mode == "center" and not (cx0 <= x <= cx1 and cy0 <= y <= cy1):
+                    continue
+                candidates.append(cell)
+    if not candidates:
+        return [GRID_WIDTH // 2, GRID_HEIGHT // 2]
+    idx = (salt * 1103515245 + 12345) & 0x7FFFFFFF
+    choice = candidates[idx % len(candidates)]
+    return [choice[0], choice[1]]
+
+
+def _cargo_color_for_delivery(delivery_ws: dict) -> list[int]:
+    c = delivery_ws.get("color")
+    if isinstance(c, list) and len(c) >= 3:
+        return [int(c[0]), int(c[1]), int(c[2])]
+    return [180, 140, 90]
+
+
 def _create_task(
     world_state: dict,
     pickup_ws: dict,
@@ -289,6 +370,9 @@ def _create_task(
         "assigned_to": None,
         "source": source,
     }
+    if str(pickup_ws.get("name", "")) == "Cargo":
+        task["cargo"] = True
+        task["cargo_color"] = _cargo_color_for_delivery(delivery_ws)
     _task_counter += 1
     return task
 
@@ -481,6 +565,12 @@ def _complete_task_delivery(
         f"task-{task['id']} {task.get('pickup_name','?')}→{task.get('delivery_name','?')} done",
         route_time=route_time,
     )
+
+    if task.get("cargo"):
+        dn = str(task.get("delivery_name", ""))
+        quotas = world_state.get("station_quotas") or {}
+        if dn in quotas:
+            quotas[dn]["completed"] = quotas[dn].get("completed", 0) + 1
 
     robot["path"] = []
     robot["yield_streak"] = 0
@@ -1032,10 +1122,23 @@ def _generate_fleet_routes(
         return []
 
     routes: list[tuple[dict, dict]] = []
+    use_cargo = _cargo_deliveries_enabled()
+    stats = world_state.get("stats") or {}
+    base_salt = (
+        len(world_state.get("tasks", []))
+        + len(world_state.get("task_queue", []))
+        + int(stats.get("queued_total", 0))
+    )
+    reserved: set[tuple[int, int]] = set()
     for i in range(max(0, count)):
-        src = flow[i % len(flow)]
         dst = flow[(i + 1) % len(flow)]
-        routes.append((src, dst))
+        if use_cargo:
+            cell = _pick_cargo_cell(world_state, base_salt + i, reserved)
+            reserved.add((cell[0], cell[1]))
+            cargo_pickup = {"name": "Cargo", "pos": cell}
+            routes.append((cargo_pickup, dst))
+        else:
+            routes.append((flow[i % len(flow)], dst))
     return routes
 
 

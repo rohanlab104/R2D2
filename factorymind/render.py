@@ -205,6 +205,7 @@ def render(screen: "pygame.Surface", world_state: dict) -> None:
     draw_builder_overlay(screen, world_state)        # preview sits above walls, below robots
     draw_spawn_points(screen, world_state)
     draw_workstations(screen, world_state.get("workstations", []))
+    draw_cargo_pickups(screen, world_state)
     draw_robots(screen, world_state.get("robots", []))
     draw_sidepanel(screen, world_state)
 
@@ -778,6 +779,38 @@ def draw_spawn_points(screen: "pygame.Surface", world_state: dict) -> None:
 
 
 _WS_ABBREV = {"Parts": "P", "Assembly": "A", "QA": "Q", "Shipping": "S"}
+
+
+def draw_cargo_pickups(screen: "pygame.Surface", world_state: dict) -> None:
+    """Draw floor crates for autonomous cargo tasks while the load is still on the floor."""
+    tasks = list(world_state.get("tasks", [])) + list(
+        world_state.get("task_queue", [])
+    )
+    for t in tasks:
+        if not t.get("cargo"):
+            continue
+        if str(t.get("status", "")) in ("done", "cancelled", "in_transit"):
+            continue
+        pickup = t.get("pickup") or []
+        if len(pickup) < 2:
+            continue
+        gx, gy = int(pickup[0]), int(pickup[1])
+        sx = GRID_OFFSET_X + gx * CELL_SIZE
+        sy = GRID_OFFSET_Y + gy * CELL_SIZE
+        col = t.get("cargo_color")
+        if isinstance(col, (list, tuple)) and len(col) >= 3:
+            band = (int(col[0]), int(col[1]), int(col[2]))
+        else:
+            band = (160, 110, 70)
+        rect = pygame.Rect(sx + 3, sy + 3, CELL_SIZE - 6, CELL_SIZE - 6)
+        pygame.draw.rect(screen, (90, 70, 45), rect)
+        pygame.draw.rect(
+            screen,
+            band,
+            pygame.Rect(rect.x + 2, rect.y + 2, rect.width - 4, rect.height // 2),
+        )
+        pygame.draw.rect(screen, C_GRID_MAJOR, rect, 1)
+
 
 def draw_workstations(screen: "pygame.Surface", workstations: list[dict]) -> None:
     """Industrial equipment tiles: dark fill, 3D highlight, bold letter, pill label."""

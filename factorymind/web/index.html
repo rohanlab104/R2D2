@@ -357,7 +357,6 @@ const matHazard = new THREE.MeshStandardMaterial({
 const matTruss = new THREE.MeshStandardMaterial({
   color: 0x3a3a55, roughness: 0.5, metalness: 0.7,
 });
-const matLightStrip = new THREE.MeshBasicMaterial({ color: 0xfff4d8 });
 const matCrateRed = new THREE.MeshStandardMaterial({
   color: 0x9a3030, roughness: 0.85, metalness: 0.05,
 });
@@ -553,14 +552,8 @@ function makeTruck(x, z, rotY = 0) {
   scene.add(makeCornerPillar(-PERIM_OFFSET,        GRID + PERIM_OFFSET));
   scene.add(makeCornerPillar(GRID + PERIM_OFFSET,  GRID + PERIM_OFFSET));
 
-  // Open ceiling (no indoor roof) — perimeter wall lights only.
+  // Open ceiling — soft wash lights only (no horizontal strip meshes).
   for (let z = 8; z < GRID; z += 12) {
-    const strip = new THREE.Mesh(
-      new THREE.BoxGeometry(GRID + 2, 0.08, 0.28),
-      matLightStrip,
-    );
-    strip.position.set(GRID / 2, WALL_H + 0.6, z);
-    scene.add(strip);
     const bulb = new THREE.PointLight(0xfff0d0, 0.45, 22);
     bulb.position.set(GRID / 2, WALL_H + 0.8, z);
     scene.add(bulb);
@@ -1570,12 +1563,15 @@ function syncTasks(world) {
     if (t.status === "done" || t.status === "cancelled") continue;
     seen.add(t.id);
     let g = taskMeshes.get(t.id);
+    const wantCargo = !!t.cargo;
     if (!g) {
       g = new THREE.Group();
       const pickupMat = new THREE.MeshStandardMaterial({
         color: 0xff5a5a, emissive: 0xff5a5a, emissiveIntensity: 0.8,
       });
-      const pickup = new THREE.Mesh(new THREE.OctahedronGeometry(0.4), pickupMat);
+      const pickup = wantCargo
+        ? new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.42, 0.55), pickupMat)
+        : new THREE.Mesh(new THREE.OctahedronGeometry(0.4), pickupMat);
 
       const lineGeo = new THREE.BufferGeometry();
       lineGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
@@ -1588,14 +1584,25 @@ function syncTasks(world) {
       );
 
       g.add(pickup); g.add(line);
-      g.userData = { pickup, line };
+      g.userData = { pickup, line, isCargo: wantCargo };
       scene.add(g);
       taskMeshes.set(t.id, g);
     }
     const p = gridToWorld(t.pickup[0], t.pickup[1]);
     const d = gridToWorld(t.delivery[0], t.delivery[1]);
-    g.userData.pickup.position.set(p.x, 1.6, p.z);
-    const claimedColor = (t.assigned_to !== null && t.assigned_to !== undefined) ? 0x55dd77 : 0xff5a5a;
+    const yLift = wantCargo ? 0.31 : 1.6;
+    g.userData.pickup.position.set(p.x, yLift, p.z);
+    const assigned = t.assigned_to !== null && t.assigned_to !== undefined;
+    let claimedColor = assigned ? 0x55dd77 : 0xff5a5a;
+    if (
+      wantCargo
+      && !assigned
+      && t.cargo_color
+      && t.cargo_color.length >= 3
+    ) {
+      const [cr, cg, cb] = t.cargo_color;
+      claimedColor = (cr << 16) | (cg << 8) | cb;
+    }
     g.userData.pickup.material.color.setHex(claimedColor);
     g.userData.pickup.material.emissive.setHex(claimedColor);
     const positions = g.userData.line.geometry.attributes.position.array;

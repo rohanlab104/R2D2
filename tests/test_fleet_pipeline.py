@@ -237,3 +237,23 @@ def test_fleet_dispatch_records_claim_and_intent_messages(world):
         kw in m["content"].lower() for m in claims for kw in ("delegating", "master ->")
     ), claims
     assert any("accepting" in m["content"].lower() for m in intents), intents
+
+
+def test_fleet_routes_spawn_cargo_on_floor_by_default(world):
+    world_state, _ = world
+    routes = M._generate_fleet_routes(world_state, 10)
+    assert len(routes) == 10
+    for pickup, delivery in routes:
+        assert pickup["name"] == "Cargo"
+        assert delivery["name"] in ("Parts", "Assembly", "QA", "Shipping")
+        assert len(pickup["pos"]) == 2
+
+
+def test_fleet_routes_station_pickup_when_cargo_disabled(world, monkeypatch):
+    monkeypatch.setenv("FACTORYMIND_CARGO_DELIVERIES", "false")
+    world_state, _ = world
+    routes = M._generate_fleet_routes(world_state, 4)
+    assert len(routes) == 4
+    for pickup, delivery in routes:
+        assert pickup["name"] in ("Parts", "Assembly", "QA", "Shipping")
+        assert delivery["name"] in ("Parts", "Assembly", "QA", "Shipping")
