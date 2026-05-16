@@ -29,6 +29,13 @@
     overflow: hidden;
   }
   #stage { position: absolute; inset: 0 380px 0 0; }
+  #stage::after {
+    content: "";
+    pointer-events: none;
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse 80% 70% at 50% 42%, transparent 30%, rgba(0, 4, 12, 0.72) 100%);
+  }
+  #stage canvas { display: block; width: 100%; height: 100%; }
   #panel {
     position: absolute; right: 0; top: 0; bottom: 0; width: 380px;
     background: var(--panel);
@@ -237,68 +244,98 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
+renderer.toneMappingExposure = 1.18;
+renderer.physicallyCorrectLights = true;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 stage.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x06060e);
-scene.fog = new THREE.Fog(0x06060e, GRID * 1.6, GRID * 4.0);
+scene.background = new THREE.Color(0x05060f);
+scene.fog = new THREE.FogExp2(0x0a0e1c, 0.011);
 
-const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
-camera.position.set(GRID * 1.05, GRID * 1.1, GRID * 1.6);
+const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 1200);
+camera.position.set(GRID * 1.35, GRID * 1.05, GRID * 1.95);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(GRID / 2, 0, GRID / 2);
+controls.target.set(GRID / 2, 2, GRID / 2);
 controls.enableDamping = true;
-controls.dampingFactor = 0.08;
-controls.minDistance = 12;
-controls.maxDistance = 220;
-controls.maxPolarAngle = Math.PI * 0.49;
+controls.dampingFactor = 0.07;
+controls.minDistance = 10;
+controls.maxDistance = 300;
+controls.maxPolarAngle = Math.PI * 0.48;
 
-// Lights
-scene.add(new THREE.AmbientLight(0x404060, 1.1));
-const sun = new THREE.DirectionalLight(0xfff4e0, 1.6);
-sun.position.set(60, 90, 40);
+// Lights — industrial night-shift + sun shafts
+scene.add(new THREE.HemisphereLight(0x6a7ab8, 0x151018, 0.5));
+scene.add(new THREE.AmbientLight(0x2a2a48, 0.55));
+const sun = new THREE.DirectionalLight(0xffeed8, 2.0);
+sun.position.set(70, 110, 35);
 sun.castShadow = true;
 sun.shadow.mapSize.width = 2048;
 sun.shadow.mapSize.height = 2048;
-sun.shadow.camera.left   = -GRID;
-sun.shadow.camera.right  =  GRID * 1.5;
-sun.shadow.camera.top    =  GRID * 1.5;
-sun.shadow.camera.bottom = -GRID;
+sun.shadow.camera.left   = -GRID * 1.2;
+sun.shadow.camera.right  =  GRID * 1.8;
+sun.shadow.camera.top    =  GRID * 1.8;
+sun.shadow.camera.bottom = -GRID * 1.2;
 sun.shadow.camera.near = 1;
-sun.shadow.camera.far  = 220;
+sun.shadow.camera.far  = 280;
+sun.shadow.bias = -0.00015;
 scene.add(sun);
 
-const rim = new THREE.DirectionalLight(0x4488ff, 0.45);
-rim.position.set(-30, 60, -40);
+const rim = new THREE.DirectionalLight(0x3399ff, 0.55);
+rim.position.set(-45, 55, -55);
 scene.add(rim);
+
+const fill = new THREE.DirectionalLight(0xff8844, 0.25);
+fill.position.set(20, 40, 80);
+scene.add(fill);
+
+const floorGlow = new THREE.PointLight(0x00d4ff, 0.45, GRID * 2.2);
+floorGlow.position.set(GRID / 2, 6, GRID / 2);
+scene.add(floorGlow);
+
+const vfxMeshes = [];
+const beaconLights = [];
 
 // ---------------------------------------------------------------------------
 // Factory environment — built once at startup. Everything outside the playable
 // 0..GRID area is purely decorative and never affects pathfinding.
 // ---------------------------------------------------------------------------
-const PAD = 14;                 // outer concrete apron beyond playable area
-const WALL_H = 4.0;             // perimeter wall height
+const PAD = 32;                 // outer concrete apron beyond playable area
+const WALL_H = 9.0;             // perimeter wall height
+const ROOF_H = 13.5;            // overhead truss height
 const PERIM_OFFSET = 1.5;       // perimeter wall sits just outside the floor
 
-// Polished factory floor (slightly lighter, glossy concrete).
+// Polished factory floor — glossy epoxy with subtle wear marks.
 {
-  const geo = new THREE.PlaneGeometry(GRID, GRID, 1, 1);
+  const geo = new THREE.PlaneGeometry(GRID, GRID, 24, 24);
   geo.rotateX(-Math.PI / 2);
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x1a1a30, metalness: 0.2, roughness: 0.75,
+    color: 0x1c1c38, metalness: 0.42, roughness: 0.22,
   });
   const floor = new THREE.Mesh(geo, mat);
   floor.position.set(GRID / 2, 0, GRID / 2);
   floor.receiveShadow = true;
   scene.add(floor);
 
-  const grid = new THREE.GridHelper(GRID, 50, 0x2a2a52, 0x18182e);
-  grid.position.set(GRID / 2, 0.02, GRID / 2);
+  const grid = new THREE.GridHelper(GRID, 50, 0x3a4a88, 0x141428);
+  grid.position.set(GRID / 2, 0.03, GRID / 2);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.55;
   scene.add(grid);
+
+  // Painted center cross (forklift lanes) — brighter than zone overlays.
+  const laneMat = new THREE.MeshBasicMaterial({
+    color: 0xffd54a, transparent: true, opacity: 0.22, depthWrite: false,
+  });
+  const vLane = new THREE.Mesh(new THREE.PlaneGeometry(0.35, GRID), laneMat);
+  vLane.rotation.x = -Math.PI / 2;
+  vLane.position.set(GRID / 2 + 0.5, 0.04, GRID / 2);
+  scene.add(vLane);
+  const hLane = new THREE.Mesh(new THREE.PlaneGeometry(GRID, 0.35), laneMat);
+  hLane.rotation.x = -Math.PI / 2;
+  hLane.position.set(GRID / 2, 0.04, GRID / 2 + 0.5);
+  scene.add(hLane);
 }
 
 // Outer concrete apron (the area the buildings sit on).
@@ -536,22 +573,43 @@ function makeTruck(x, z, rotY = 0) {
   scene.add(makeCornerPillar(-PERIM_OFFSET,        GRID + PERIM_OFFSET));
   scene.add(makeCornerPillar(GRID + PERIM_OFFSET,  GRID + PERIM_OFFSET));
 
-  // Overhead trusses with light strips spanning the bay.
-  for (let z = 6; z < GRID; z += 12) {
+  // Cathedral roof — trusses + hanging high-bay lights.
+  for (let z = 6; z < GRID; z += 10) {
     const truss = new THREE.Mesh(
-      new THREE.BoxGeometry(GRID + 4, 0.22, 0.5),
+      new THREE.BoxGeometry(GRID + 6, 0.35, 0.65),
       matTruss,
     );
-    truss.position.set(GRID / 2, WALL_H + 0.6, z);
-    truss.castShadow = false;
+    truss.position.set(GRID / 2, ROOF_H - 1.2, z);
     scene.add(truss);
 
     const strip = new THREE.Mesh(
-      new THREE.BoxGeometry(GRID, 0.05, 0.18),
+      new THREE.BoxGeometry(GRID + 2, 0.08, 0.28),
       matLightStrip,
     );
-    strip.position.set(GRID / 2, WALL_H + 0.45, z);
+    strip.position.set(GRID / 2, ROOF_H - 1.45, z);
     scene.add(strip);
+
+    for (let lx = 8; lx < GRID; lx += 14) {
+      const housing = new THREE.Mesh(
+        new THREE.BoxGeometry(1.8, 0.35, 0.9),
+        new THREE.MeshStandardMaterial({ color: 0x2a2a40, metalness: 0.6, roughness: 0.4 }),
+      );
+      housing.position.set(lx, ROOF_H - 2.0, z);
+      scene.add(housing);
+      const bulb = new THREE.PointLight(0xfff0d0, 0.35, 16);
+      bulb.position.set(lx, ROOF_H - 2.2, z);
+      scene.add(bulb);
+    }
+  }
+
+  // Roof spine beams along X.
+  for (let x = 5; x < GRID; x += 12) {
+    const spine = new THREE.Mesh(
+      new THREE.BoxGeometry(0.45, ROOF_H, GRID + 4),
+      matPillar,
+    );
+    spine.position.set(x, ROOF_H / 2, GRID / 2);
+    scene.add(spine);
   }
 
   // Decorative props scattered OUTSIDE the playable area only — never in 0..GRID.
@@ -606,6 +664,171 @@ function makeTruck(x, z, rotY = 0) {
   const van = makeTruck(-8, -6, -Math.PI * 0.85);
   van.scale.set(0.78, 0.85, 0.85);
   scene.add(van);
+}
+
+// ---------------------------------------------------------------------------
+// Mega factory campus — huge exterior shells, silos, smoke stacks, roof sign
+// (purely visual; outside pathfinding grid).
+// ---------------------------------------------------------------------------
+{
+  function makeSmokeStack(x, z, h = 16) {
+    const g = new THREE.Group();
+    const stack = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.4, 2.0, h, 18),
+      new THREE.MeshStandardMaterial({ color: 0x3d3d52, metalness: 0.75, roughness: 0.35 }),
+    );
+    stack.position.y = h / 2;
+    stack.castShadow = true;
+    g.add(stack);
+    const band = new THREE.Mesh(
+      new THREE.CylinderGeometry(2.05, 2.05, 0.5, 18),
+      new THREE.MeshStandardMaterial({
+        color: 0xff6622, emissive: 0xff4400, emissiveIntensity: 0.85,
+      }),
+    );
+    band.position.y = h + 0.2;
+    g.add(band);
+    for (let i = 0; i < 5; i++) {
+      const sm = new THREE.Mesh(
+        new THREE.SphereGeometry(1.8 + i * 0.65, 14, 10),
+        new THREE.MeshBasicMaterial({
+          color: 0xaabbcc, transparent: true, opacity: 0.14 - i * 0.022,
+        }),
+      );
+      sm.position.y = h + 2.5 + i * 2.0;
+      sm.userData = { smoke: true, phase: i * 1.3, baseY: h + 2.5 + i * 2.0 };
+      g.add(sm);
+      vfxMeshes.push(sm);
+    }
+    g.position.set(x, 0, z);
+    return g;
+  }
+
+  function addMegaFacade(cx, cz, w, d, h, rotY, winColor = 0x00d4ff) {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(w, h, d),
+      new THREE.MeshStandardMaterial({
+        color: 0x18182c, metalness: 0.5, roughness: 0.48,
+      }),
+    );
+    body.position.y = h / 2;
+    body.castShadow = true;
+    body.receiveShadow = true;
+    g.add(body);
+    const ribs = Math.max(4, Math.floor(w / 2.5));
+    for (let i = 0; i < ribs; i++) {
+      const rib = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, h * 0.94, d * 1.02),
+        matWallPanel,
+      );
+      rib.position.set(-w / 2 + 1.2 + i * (w / ribs), h / 2, 0);
+      g.add(rib);
+    }
+    const win = new THREE.Mesh(
+      new THREE.BoxGeometry(w * 0.75, h * 0.22, 0.25),
+      new THREE.MeshStandardMaterial({
+        color: winColor, emissive: winColor, emissiveIntensity: 0.65,
+        transparent: true, opacity: 0.9,
+      }),
+    );
+    win.position.set(0, h * 0.68, d / 2 + 0.12);
+    g.add(win);
+    const dock = new THREE.Mesh(
+      new THREE.BoxGeometry(w * 0.35, h * 0.55, 1.2),
+      new THREE.MeshStandardMaterial({ color: 0x0e0e18, roughness: 0.85 }),
+    );
+    dock.position.set(0, h * 0.28, d / 2 + 0.7);
+    g.add(dock);
+    g.position.set(cx, 0, cz);
+    g.rotation.y = rotY;
+    scene.add(g);
+    return g;
+  }
+
+  function addSilo(x, z, h = 12) {
+    const silo = new THREE.Mesh(
+      new THREE.CylinderGeometry(2.2, 2.6, h, 20),
+      new THREE.MeshStandardMaterial({ color: 0x4a4a62, metalness: 0.65, roughness: 0.4 }),
+    );
+    silo.position.set(x, h / 2, z);
+    silo.castShadow = true;
+    scene.add(silo);
+    const cap = new THREE.Mesh(
+      new THREE.ConeGeometry(2.5, 1.8, 20),
+      new THREE.MeshStandardMaterial({ color: 0x5a5a78, metalness: 0.7, roughness: 0.35 }),
+    );
+    cap.position.set(x, h + 0.9, z);
+    scene.add(cap);
+  }
+
+  const cx = GRID / 2;
+  const cz = GRID / 2;
+  const ext = PAD + 8;
+
+  // North / south megahalls (deep warehouses behind the floor).
+  addMegaFacade(cx, -ext - 6, GRID + 24, 10, 18, 0, 0x00d4ff);
+  addMegaFacade(cx, GRID + ext + 6, GRID + 24, 10, 16, Math.PI, 0xffcc44);
+
+  // East / west wings.
+  addMegaFacade(-ext - 8, cz, 10, GRID + 20, 15, Math.PI / 2, 0xff5050);
+  addMegaFacade(GRID + ext + 8, cz, 10, GRID + 20, 15, -Math.PI / 2, 0x5080ff);
+
+  // Corner smoke stacks + silos.
+  scene.add(makeSmokeStack(-12, -10, 18));
+  scene.add(makeSmokeStack(GRID + 12, -8, 20));
+  scene.add(makeSmokeStack(GRID + 14, GRID + 10, 17));
+  scene.add(makeSmokeStack(-10, GRID + 12, 19));
+  addSilo(-16, cz - 12, 14);
+  addSilo(GRID + 16, cz + 10, 13);
+  addSilo(cx - 18, -14, 11);
+
+  // Giant roof sign over the plant.
+  const sign = makeFloorLabel("FACTORYMIND", "#00e8ff", 14);
+  sign.position.set(cx, ROOF_H + 0.5, cz - 8);
+  sign.rotation.x = -Math.PI / 2;
+  sign.rotation.z = 0.02;
+  scene.add(sign);
+
+  // Perimeter beacon towers (rotating emissive caps).
+  for (const [bx, bz] of [
+    [2, 2], [GRID - 2, 2], [GRID - 2, GRID - 2], [2, GRID - 2],
+    [cx, -3], [cx, GRID + 3],
+  ]) {
+    const tower = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.25, 0.35, ROOF_H + 2, 10),
+      matPillar,
+    );
+    tower.position.set(bx, (ROOF_H + 2) / 2, bz);
+    scene.add(tower);
+    const beacon = new THREE.Mesh(
+      new THREE.SphereGeometry(0.55, 12, 10),
+      new THREE.MeshStandardMaterial({
+        color: 0x00ffff, emissive: 0x00d4ff, emissiveIntensity: 1.2,
+      }),
+    );
+    beacon.position.set(bx, ROOF_H + 1.5, bz);
+    beacon.userData = { beacon: true, phase: bx * 0.7 + bz * 0.5 };
+    scene.add(beacon);
+    vfxMeshes.push(beacon);
+    const bl = new THREE.PointLight(0x00d4ff, 0.25, 14);
+    bl.position.set(bx, ROOF_H + 1.2, bz);
+    beaconLights.push(bl);
+    scene.add(bl);
+  }
+
+  // Asphalt yard ring (parking / truck loop).
+  const yardGeo = new THREE.RingGeometry(GRID * 0.55, GRID * 0.78, 48);
+  yardGeo.rotateX(-Math.PI / 2);
+  const yard = new THREE.Mesh(
+    yardGeo,
+    new THREE.MeshStandardMaterial({
+      color: 0x12121c, metalness: 0.15, roughness: 0.92,
+    }),
+  );
+  yard.position.set(cx, -0.08, cz);
+  yard.receiveShadow = true;
+  scene.add(yard);
 }
 
 // ---------------------------------------------------------------------------
@@ -833,13 +1056,14 @@ function syncWalls(world) {
     const key = wx + "," + wy;
     seen.add(key);
     if (!wallMeshes.has(key)) {
-      const geo = new THREE.BoxGeometry(1, 1.4, 1);
+      const geo = new THREE.BoxGeometry(1, 2.4, 1);
       const mat = new THREE.MeshStandardMaterial({
-        color: 0x3a3a66, roughness: 0.55, metalness: 0.25,
+        color: 0x4a4a72, roughness: 0.45, metalness: 0.35,
+        emissive: 0x222244, emissiveIntensity: 0.15,
       });
       const m = new THREE.Mesh(geo, mat);
       const w = gridToWorld(wx, wy);
-      m.position.set(w.x, 0.7, w.z);
+      m.position.set(w.x, 1.2, w.z);
       m.castShadow = true; m.receiveShadow = true;
       scene.add(m);
       wallMeshes.set(key, m);
@@ -1191,6 +1415,7 @@ function syncWorkstations(world) {
 
     const w = gridToWorld(ws.pos[0], ws.pos[1]);
     group.position.set(w.x, 0, w.z);
+    group.scale.setScalar(1.18);
     scene.add(group);
     wsMeshes.set(ws.name, group);
   }
@@ -1342,8 +1567,8 @@ function syncRobots(world) {
       const body = new THREE.Mesh(
         new THREE.SphereGeometry(radius, 28, 18),
         new THREE.MeshStandardMaterial({
-          color, emissive: color, emissiveIntensity: 0.55,
-          roughness: 0.25, metalness: 0.5,
+          color, emissive: color, emissiveIntensity: 0.85,
+          roughness: 0.18, metalness: 0.55,
         }),
       );
       body.castShadow = true;
@@ -1597,6 +1822,7 @@ const clock = new THREE.Clock();
 function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
+  const t = clock.elapsedTime;
   const lerp = 1 - Math.exp(-dt * 9);
   for (const [id, g] of robotMeshes) {
     const v = robotVisualPos.get(id);
@@ -1606,10 +1832,29 @@ function animate() {
     g.position.x = v.x;
     g.position.z = v.z;
     if (g.userData.ring) g.userData.ring.rotation.y += dt * 0.7;
+    const bob = Math.sin(t * 3 + id) * 0.04;
+    g.position.y = bob;
   }
   for (const [, g] of taskMeshes) {
-    if (g.userData.pickup) g.userData.pickup.rotation.y += dt * 1.4;
+    if (g.userData.pickup) {
+      g.userData.pickup.rotation.y += dt * 1.4;
+      g.userData.pickup.position.y = 1.6 + Math.sin(t * 2.5) * 0.12;
+    }
   }
+  for (const m of vfxMeshes) {
+    if (m.userData.smoke) {
+      const ph = m.userData.phase + t * 0.55;
+      m.position.y = m.userData.baseY + ((t * 0.45 + m.userData.phase) % 5.5);
+      m.scale.setScalar(1 + Math.sin(ph * 1.3) * 0.12);
+      m.material.opacity = 0.08 + (Math.sin(ph * 0.9) + 1) * 0.04;
+    }
+    if (m.userData.beacon) {
+      const pulse = 0.65 + 0.35 * Math.sin(t * 4 + m.userData.phase);
+      m.material.emissiveIntensity = pulse * 1.4;
+      m.scale.setScalar(0.85 + pulse * 0.25);
+    }
+  }
+  floorGlow.intensity = 0.38 + Math.sin(t * 0.8) * 0.08;
   controls.update();
   renderer.render(scene, camera);
 }
