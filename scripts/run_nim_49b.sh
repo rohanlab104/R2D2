@@ -8,7 +8,23 @@
 
 set -euo pipefail
 
-: "${NGC_API_KEY:?Set NGC_API_KEY (your build.nvidia.com / NGC API key)}"
+_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${_repo_root}/.env" ]]; then
+  set -a && source "${_repo_root}/.env" && set +a
+else
+  echo "No ${_repo_root}/.env — create it (cp .env.example .env) or export NGC_API_KEY." >&2
+fi
+
+if [[ -z "${NGC_API_KEY:-}" && -n "${NVIDIA_API_KEY:-}" ]]; then
+  NGC_API_KEY="${NVIDIA_API_KEY}"
+fi
+
+if [[ -z "${NGC_API_KEY:-}" ]]; then
+  echo "NGC_API_KEY is still empty after loading ${_repo_root}/.env" >&2
+  echo "Fix: set NGC_API_KEY=... in .env, or paste the same value as NVIDIA_API_KEY." >&2
+  echo "Check for typos (NGC_API_KEY), spaces around =, or editing .env.example instead of .env." >&2
+  exit 1
+fi
 
 IMAGE="${NIM_STRATEGIST_IMAGE:-nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1_5:latest}"
 PORT="${NIM_STRATEGIST_PORT:-8001}"

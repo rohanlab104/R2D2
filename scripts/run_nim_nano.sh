@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run Nemotron-Nano-9B NIM on the DGX Spark GX10 (host port 8000).
+# Name is run_nim_nano.sh (nim, not num). Loads ../.env; NGC uses NVIDIA_API_KEY if unset.
 # Run ON the GX10, in its own terminal. Leave it foregrounded.
 #
 # Verify the exact image tag for DGX Spark on build.nvidia.com → Deploy.
@@ -7,7 +8,24 @@
 
 set -euo pipefail
 
-: "${NGC_API_KEY:?Set NGC_API_KEY (your build.nvidia.com / NGC API key)}"
+_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${_repo_root}/.env" ]]; then
+  set -a && source "${_repo_root}/.env" && set +a
+else
+  echo "No ${_repo_root}/.env — create it (cp .env.example .env) or export NGC_API_KEY." >&2
+fi
+
+# nvcr.io login uses NGC_API_KEY; it is usually identical to NVIDIA_API_KEY.
+if [[ -z "${NGC_API_KEY:-}" && -n "${NVIDIA_API_KEY:-}" ]]; then
+  NGC_API_KEY="${NVIDIA_API_KEY}"
+fi
+
+if [[ -z "${NGC_API_KEY:-}" ]]; then
+  echo "NGC_API_KEY is still empty after loading ${_repo_root}/.env" >&2
+  echo "Fix: set NGC_API_KEY=... in .env, or paste the same value as NVIDIA_API_KEY." >&2
+  echo "Check for typos (NGC_API_KEY), spaces around =, or editing .env.example instead of .env." >&2
+  exit 1
+fi
 
 IMAGE="${NIM_LEADER_IMAGE:-nvcr.io/nim/nvidia/nemotron-nano-9b-v2:latest}"
 PORT="${NIM_LEADER_PORT:-8000}"
