@@ -23,11 +23,95 @@ export const TILE_COLORS = {
 
 const OBJECT_TILES = new Set(Object.keys(TILE_COLORS).filter((tile) => tile !== "floor"));
 
+function luminance(r, g, b) {
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+function sortedLuminancesFromImageData(data) {
+  const arr = [];
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 32) continue;
+    arr.push(luminance(data[i], data[i + 1], data[i + 2]));
+  }
+  arr.sort((a, b) => a - b);
+  return arr;
+}
+
+function percentile(sorted, p) {
+  if (!sorted.length) return 128;
+  const idx = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.floor((sorted.length - 1) * p)),
+  );
+  return sorted[idx];
+}
+
+/** Skip color-matching on large flat blueprint paper / grid tint regions. */
+function isLikelyBlueprintBackground(r, g, b, a) {
+  if (a < 32) return true;
+  const L = luminance(r, g, b);
+  if (L >= 198) return true;
+  const maxc = Math.max(r, g, b);
+  const minc = Math.min(r, g, b);
+  if (maxc - minc < 28 && L > 100) return true;
+  // Cyan / blue sheet (dark or light)
+  if (b >= r - 6 && b >= g - 6 && L > 88 && L < 218) return true;
+  return false;
+}
+
+/**
+ * Blueprint / line-art maps: infer wall vs walkable from ink vs paper, while
+ * still picking up crisp colored regions (legend colors) as equipment tiles.
+ */
+function classifyBlueprintCell(r, g, b, a, lumas, tolerance, lineFold) {
+  if (a < 32) return "floor";
+
+  const maxc = Math.max(r, g, b);
+  const minc = Math.min(r, g, b);
+  const chroma = maxc - minc;
+  const boostedTol = Number(tolerance) + 32;
+  const useColor = chroma >= 44 && !isLikelyBlueprintBackground(r, g, b, a);
+
+  if (useColor) {
+    const tile = nearestTile([r, g, b], boostedTol);
+    if (tile !== "floor") return tile;
+  }
+
+  const L = luminance(r, g, b);
+  const p10 = percentile(lumas, 0.1);
+  const p50 = percentile(lumas, 0.5);
+  const p90 = percentile(lumas, 0.9);
+  const sens = Math.min(0.62, Math.max(0.28, lineFold));
+  // ink darker than paper
+  if (p50 > 118) {
+    const cut = p10 + (p50 - p10) * sens;
+    return L <= cut ? "wall" : "floor";
+  }
+  // light strokes on dark / blue stock
+  const cut = p90 - (p90 - p50) * sens;
+  return L >= cut ? "wall" : "floor";
+}
+
+/** Map 0–100 UI “wall strength” to internal line fold (0.28–0.62). */
+function optionsBlueprintLineFold(options) {
+  const v = Number(options?.blueprintLineSensitivity ?? 45);
+  if (!Number.isFinite(v)) return 0.45;
+  const t = Math.min(100, Math.max(0, v));
+  return 0.28 + (t / 100) * 0.34;
+}
+
 export async function parseLayoutImageFile(file, options = {}) {
+  const mode = options.mode === "blueprint" ? "blueprint" : "colormap";
+  const image = await createImageBitmap(file);
+  const baseName = file.name.replace(/\.[^.]+$/, "") || "Uploaded Layout";
+  return parseLayoutFromImageBitmap(image, file.name, baseName, options, mode);
+}
+
+function parseLayoutFromImageBitmap(image, fileName, layoutName, options, mode) {
   const gridWidth = Number(options.gridWidth || 50);
   const gridHeight = Number(options.gridHeight || 50);
   const tolerance = Number(options.tolerance || 54);
-  const image = await createImageBitmap(file);
+  const lineFold = optionsBlueprintLineFold(options);
   const canvas = document.createElement("canvas");
   canvas.width = gridWidth;
   canvas.height = gridHeight;
@@ -36,36 +120,55 @@ export async function parseLayoutImageFile(file, options = {}) {
   ctx.clearRect(0, 0, gridWidth, gridHeight);
   ctx.drawImage(image, 0, 0, gridWidth, gridHeight);
   const { data } = ctx.getImageData(0, 0, gridWidth, gridHeight);
-  const grid = [];
+  const lumas =
+    mode === "blueprint" ? sortedLuminancesFromImageData(data) : null;
 
+  const grid = [];
   for (let y = 0; y < gridHeight; y += 1) {
     const row = [];
     for (let x = 0; x < gridWidth; x += 1) {
       const index = (y * gridWidth + x) * 4;
+      const red = data[index];
+      const green = data[index + 1];
+      const blue = data[index + 2];
       const alpha = data[index + 3];
-      if (alpha < 32) {
-        row.push("floor");
+      let tile;
+      if (mode === "blueprint") {
+        tile = classifyBlueprintCell(
+          red,
+          green,
+          blue,
+          alpha,
+          lumas,
+          tolerance,
+          lineFold,
+        );
+      } else if (alpha < 32) {
+        tile = "floor";
       } else {
-        row.push(nearestTile([data[index], data[index + 1], data[index + 2]], tolerance));
+        tile = nearestTile([red, green, blue], tolerance);
       }
+      row.push(tile);
     }
     grid.push(row);
   }
 
   return {
     id: `layout-${Date.now()}`,
-    name: file.name.replace(/\.[^.]+$/, "") || "Uploaded Layout",
+    name: layoutName,
     width: gridWidth,
     height: gridHeight,
     grid,
     layout: extractObjects(grid),
     source: {
-      fileName: file.name,
+      fileName,
       imageWidth: image.width,
       imageHeight: image.height,
       gridWidth,
       gridHeight,
       tolerance,
+      scanMode: mode,
+      blueprintWallStrength: Number(options?.blueprintLineSensitivity ?? 45),
     },
   };
 }

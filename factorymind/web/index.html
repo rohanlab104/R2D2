@@ -154,12 +154,12 @@
     <div>
       <div class="brand">FACTORYMIND</div>
       <div class="sub">Autonomous warehouse operations monitor</div>
-    </div>
+</div>
     <div class="tabs">
       <button class="active" id="tab-ops">OPERATIONS</button>
       <button id="tab-build">BUILD MODE</button>
       <button id="tab-twin">DIGITAL TWIN</button>
-    </div>
+</div>
     <div class="tab-panel active" id="ops-panel">
       <div class="metrics">
         <div class="metric"><div class="k">Dropped off</div><div class="v good" id="m-dropped">0</div></div>
@@ -168,7 +168,7 @@
         <div class="metric"><div class="k">Active bots</div><div class="v" id="m-active">0</div></div>
         <div class="metric"><div class="k">Avg task</div><div class="v" id="m-avg">--</div></div>
         <div class="metric"><div class="k">Conveyors</div><div class="v" id="m-conveyors">0</div></div>
-      </div>
+  </div>
       <div class="controls">
         <button class="good" id="start">START</button>
         <button class="warn" id="stop">PAUSE</button>
@@ -176,14 +176,14 @@
         <button id="speed">SPEED 1x</button>
         <button id="spike">ORDER SPIKE</button>
         <button id="disable">DISABLE BOT</button>
-      </div>
+    </div>
       <div class="rule"></div>
       <div class="section"><span>ROBOT FLEET</span><span id="status">STOPPED</span></div>
       <div id="workers"></div>
       <div class="section"><span>AGENT EVENT LOG</span></div>
       <div id="log"></div>
       <div id="endpoints"></div>
-    </div>
+  </div>
     <div class="tab-panel" id="build-panel">
       <div class="build-card">
         <div class="section"><span>PLACE ASSET</span><span id="build-status">CAMERA</span></div>
@@ -194,7 +194,7 @@
           <button id="add-worker">WORKER</button>
           <button id="camera-mode">CAMERA</button>
           <button id="remove-shelf">REMOVE SHELF</button>
-        </div>
+  </div>
         <label class="field">Package type
           <select id="build-color">
             <option>Red</option>
@@ -212,11 +212,11 @@
           <br><br>
           Typed conveyors: Red #7F1D1D, Blue #1E3A8A, Green #14532D, Yellow #713F12, Magenta #581C87, Cyan #164E63.
           Typed bins: Red #FCA5A5, Blue #93C5FD, Green #86EFAC, Yellow #FEF08A, Magenta #F0ABFC, Cyan #A5F3FC.
-        </div>
+  </div>
         <div class="build-note">
           Shelves become blocked route cells. Conveyors create intake factories for the selected package type. Drop bins accept that same type, and workers will choose the reachable matching bin with the shortest route.
-        </div>
-      </div>
+  </div>
+</div>
       <div class="section"><span>BUILD SUMMARY</span></div>
       <div class="metrics">
         <div class="metric"><div class="k">Shelves</div><div class="v" id="b-shelves">0</div></div>
@@ -226,19 +226,32 @@
     </div>
     <div class="tab-panel" id="twin-panel">
       <div class="build-card">
-        <div class="section"><span>LAYOUT UPLOAD</span><span>PNG COLOR MAP</span></div>
-        <label class="field">Upload controlled PNG
-          <input type="file" id="layout-file" accept="image/png">
+        <div class="section"><span>LAYOUT UPLOAD</span><span>PNG / JPG / WEBP</span></div>
+        <label class="field">Upload layout image
+          <input type="file" id="layout-file" accept="image/png,image/jpeg,image/jpg,image/webp,image/gif">
         </label>
+        <label class="field">Scan mode
+          <select id="layout-scan-mode">
+            <option value="colormap">Color map (palette pixels)</option>
+            <option value="blueprint">Blueprint (walls + colored areas)</option>
+          </select>
+        </label>
+        <div class="field" id="layout-blueprint-row" style="display: none;">
+          <label>Blueprint wall strength <span id="layout-blueprint-wall-value">45</span>
+            <input type="range" id="layout-blueprint-wall" min="10" max="90" value="45">
+          </label>
+          <div class="build-note" style="margin-top:6px;">Higher picks up more line ink as walls. Use color map mode for pixel-perfect PNG grids.</div>
+        </div>
         <canvas id="layout-preview" width="320" height="220"></canvas>
-        <div id="layout-status">Upload a PNG using the warehouse color map.</div>
+        <div id="layout-status">Upload an image (color map or blueprint), or load layout JSON.</div>
         <div class="build-note">
-          Recommended PNG size: 50x50 pixels. Larger PNGs work, but they are sampled down to a 50x50 grid, so use crisp block colors with no antialiasing.
+          Recommended image size: 50×50 pixels (or larger; sampled to the grid). Use crisp lines and solid fills.
           <br><br>
-          Base legend: white floor, black wall, #2563EB shelf, #16A34A generic conveyor, #F97316 generic bin, #9333EA charger, #DC2626 restricted, #EAB308 worker spawn.
+          <strong>Color map</strong> — match the legend (white floor, black wall, shelf/conveyor/bin colors, etc.).
           <br><br>
-          Typed conveyors: Red #7F1D1D, Blue #1E3A8A, Green #14532D, Yellow #713F12, Magenta #581C87, Cyan #164E63.
-          Typed bins: Red #FCA5A5, Blue #93C5FD, Green #86EFAC, Yellow #FEF08A, Magenta #F0ABFC, Cyan #A5F3FC.
+          <strong>Blueprint</strong> — dark lines on light paper (or light lines on blue stock) become walls; walkable areas become floor; any region that closely matches the palette becomes shelves, conveyors, bins, etc. Export multi-page PDFs to PNG first.
+          <br><br>
+          Legend reminder: white floor, black wall, #2563EB shelf, #16A34A conveyor, #F97316 bin, #9333EA charger, #DC2626 restricted, #EAB308 spawn; typed conveyor/bin hues as in the builder tab.
         </div>
         <div class="twin-grid">
           <label class="field">Workers <span id="worker-count-value">3</span>
@@ -321,12 +334,12 @@ const floor = new THREE.Mesh(
   new THREE.MeshStandardMaterial({ color: 0x222831, roughness: 0.92, metalness: 0.08 }),
 );
 floor.geometry.rotateX(-Math.PI / 2);
-floor.position.set(GRID / 2, 0, GRID / 2);
-floor.receiveShadow = true;
-scene.add(floor);
+  floor.position.set(GRID / 2, 0, GRID / 2);
+  floor.receiveShadow = true;
+  scene.add(floor);
 const grid = new THREE.GridHelper(GRID, 50, 0x394554, 0x2b333e);
 grid.position.set(GRID / 2, 0.018, GRID / 2);
-scene.add(grid);
+  scene.add(grid);
 
 const shelves = new THREE.Group();
 scene.add(shelves);
@@ -340,6 +353,7 @@ let buildMode = "camera";
 let activeTab = "ops";
 let uploadedLayout = null;
 let uploadedValidation = null;
+let lastLayoutImageFile = null;
 let scenarios = [];
 const buildRotation = { dropbox: 0 };
 const raycaster = new THREE.Raycaster();
@@ -401,7 +415,7 @@ function makeShelfObstacle() {
 }
 
 function makeLeaderTower() {
-  const group = new THREE.Group();
+    const group = new THREE.Group();
   const steel = new THREE.MeshStandardMaterial({ color: 0x4a5662, roughness: 0.44, metalness: 0.62 });
   const dark = new THREE.MeshStandardMaterial({ color: 0x111820, roughness: 0.68, metalness: 0.2 });
   const glass = new THREE.MeshStandardMaterial({ color: 0x16323a, emissive: 0x6de7ff, emissiveIntensity: 0.16, roughness: 0.22, metalness: 0.18, transparent: true, opacity: 0.74 });
@@ -733,19 +747,48 @@ function workerStatus(w, world) {
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
+function currentLayoutParseOptions() {
+  const modeEl = document.getElementById("layout-scan-mode");
+  const wallEl = document.getElementById("layout-blueprint-wall");
+  const mode = modeEl?.value === "blueprint" ? "blueprint" : "colormap";
+  const blueprintLineSensitivity = Number(wallEl?.value ?? 45);
+  return {
+    gridWidth: GRID,
+    gridHeight: GRID,
+    tolerance: 54,
+    mode,
+    blueprintLineSensitivity: Number.isFinite(blueprintLineSensitivity) ? blueprintLineSensitivity : 45,
+  };
+}
+
+function syncBlueprintControlsVisibility() {
+  const row = document.getElementById("layout-blueprint-row");
+  const modeEl = document.getElementById("layout-scan-mode");
+  if (!row || !modeEl) return;
+  row.style.display = modeEl.value === "blueprint" ? "" : "none";
+}
+
+async function applyLayoutFileFromInput(file) {
+  uploadedLayout = await parseLayoutImageFile(file, currentLayoutParseOptions());
+  uploadedValidation = validateLayout(uploadedLayout);
+  drawLayoutPreview(document.getElementById("layout-preview"), uploadedLayout);
+  updateLayoutStatus();
+}
+
 function updateLayoutStatus() {
   const box = document.getElementById("layout-status");
   if (!uploadedLayout) {
-    box.textContent = "Upload a PNG using the warehouse color map.";
+    box.textContent = "Upload an image (color map or blueprint), or load layout JSON.";
     return;
   }
   const layout = uploadedLayout.layout || {};
   const counts = uploadedValidation?.counts || {};
   const errors = uploadedValidation?.errors || [];
   const warnings = uploadedValidation?.warnings || [];
+  const scan = uploadedLayout.source?.scanMode === "blueprint" ? "blueprint scan" : "color map";
   box.innerHTML = `
     <strong>${escapeHtml(uploadedLayout.name)}</strong><br>
-    ${uploadedLayout.width}x${uploadedLayout.height} grid ·
+    ${uploadedLayout.width}x${uploadedLayout.height} grid · ${scan} ·
     ${layout.conveyors?.length || 0} conveyors ·
     ${layout.bins?.length || 0} bins ·
     ${layout.workerSpawns?.length || 0} worker spawns ·
@@ -962,20 +1005,43 @@ document.getElementById("build-color").onchange = () => {
 document.getElementById("layout-file").onchange = async (event) => {
   const file = event.target.files?.[0];
   if (!file) return;
+  lastLayoutImageFile = file;
   try {
-    uploadedLayout = await parseLayoutImageFile(file, { gridWidth: GRID, gridHeight: GRID, tolerance: 54 });
-    uploadedValidation = validateLayout(uploadedLayout);
-    drawLayoutPreview(document.getElementById("layout-preview"), uploadedLayout);
-    updateLayoutStatus();
+    await applyLayoutFileFromInput(file);
   } catch (error) {
     uploadedLayout = null;
-    uploadedValidation = { valid: false, errors: [`Could not parse PNG: ${error.message || error}`], warnings: [] };
+    uploadedValidation = { valid: false, errors: [`Could not parse image: ${error.message || error}`], warnings: [] };
     updateLayoutStatus();
   }
 };
+document.getElementById("layout-scan-mode")?.addEventListener("change", async () => {
+  syncBlueprintControlsVisibility();
+  if (!lastLayoutImageFile) return;
+  try {
+    await applyLayoutFileFromInput(lastLayoutImageFile);
+  } catch (error) {
+    uploadedLayout = null;
+    uploadedValidation = { valid: false, errors: [`Could not parse image: ${error.message || error}`], warnings: [] };
+    updateLayoutStatus();
+  }
+});
+document.getElementById("layout-blueprint-wall")?.addEventListener("change", async () => {
+  if (!lastLayoutImageFile || document.getElementById("layout-scan-mode")?.value !== "blueprint") return;
+  try {
+    await applyLayoutFileFromInput(lastLayoutImageFile);
+  } catch (error) {
+    uploadedLayout = null;
+    uploadedValidation = { valid: false, errors: [`Could not parse image: ${error.message || error}`], warnings: [] };
+    updateLayoutStatus();
+  }
+});
+document.getElementById("layout-blueprint-wall")?.addEventListener("input", (e) => {
+  const v = document.getElementById("layout-blueprint-wall-value");
+  if (v) v.textContent = e.target.value;
+});
 document.getElementById("apply-layout").onclick = () => {
   if (!uploadedLayout) {
-    uploadedValidation = { valid: false, errors: ["Upload a PNG or load layout JSON first."], warnings: [] };
+    uploadedValidation = { valid: false, errors: ["Upload an image or load layout JSON first."], warnings: [] };
     updateLayoutStatus();
     return;
   }
@@ -996,6 +1062,7 @@ document.getElementById("layout-json-file").onchange = async (event) => {
   try {
     uploadedLayout = await readJsonFile(file);
     uploadedValidation = validateLayout(uploadedLayout);
+    lastLayoutImageFile = null;
     drawLayoutPreview(document.getElementById("layout-preview"), uploadedLayout);
     updateLayoutStatus();
   } catch (error) {
@@ -1054,6 +1121,7 @@ renderer.domElement.addEventListener("pointerup", e => {
 });
 setBuildMode("camera");
 setTab("ops");
+syncBlueprintControlsVisibility();
 updateLayoutStatus();
 renderScenarioTable();
 

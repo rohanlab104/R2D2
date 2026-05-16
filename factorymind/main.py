@@ -106,7 +106,7 @@ def _endpoint_accepts_tcp(url: str, timeout: float) -> bool:
         return False
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True
+    return True
     except OSError:
         return False
 
@@ -132,12 +132,12 @@ def _print_startup_banner() -> str:
     print("FactoryMind 3D - autonomous master/slave factory simulation", flush=True)
     desc = _describe_inference_target()
     print(desc, flush=True)
-    print(
+        print(
         f"  USE_LOCAL_NIM={os.getenv('USE_LOCAL_NIM', 'true')}  "
         f"GX10_IP={os.getenv('GX10_IP', 'localhost')}  "
         f"policy={POLICY_PATH}",
-        flush=True,
-    )
+            flush=True,
+        )
     print("=" * 72, flush=True)
     return desc
 
@@ -332,7 +332,7 @@ def _leader_decide_autonomous(world_state: dict) -> dict:
 
 def _validate_llm_assignments(world_state: dict, proposed: object) -> list[dict]:
     if not isinstance(proposed, list):
-        return []
+    return []
     idle_ids = {
         w["id"] for w in world_state.get("workers", [])
         if w.get("status") == "idle" and not w.get("path") and not w.get("carrying")
@@ -394,7 +394,7 @@ def _deterministic_assignments(world_state: dict) -> list[dict]:
         best_cost = 10**9
         for factory, package, dropbox in available:
             if package["id"] in used_packages:
-                continue
+            continue
             to_pickup = _route_len(worker["pos"], factory["drop_pad"], wall_set)
             to_drop = _route_len(factory["drop_pad"], dropbox["pos"], wall_set)
             cost = to_pickup + to_drop
@@ -576,7 +576,7 @@ def _replan_worker(
             worker["path"] = a_star(worker["pos"], target, base_wall_set)
             if worker["pos"] == target or worker["path"]:
                 _thought(world_state, S.WARNING, worker["name"], "Traffic route boxed in; waiting for aisle to clear.", elapsed, blackboard)
-                return False
+        return False
 
     if worker.get("carrying"):
         _thought(world_state, S.WARNING, worker["name"], "Route blocked while carrying; holding package.", elapsed, blackboard)
@@ -589,7 +589,7 @@ def _replan_worker(
                 package["reserved_by"] = None
                 break
     task = _task_by_id(world_state, worker.get("current_task"))
-    if task:
+        if task:
         task["status"] = "blocked"
     worker["current_task"] = None
     worker["target_factory_id"] = None
@@ -614,8 +614,8 @@ def _pickup_package(world_state: dict, worker: dict, factory: dict,
                     elapsed: float, blackboard: Blackboard) -> None:
     package = next(
         (p for p in factory.get("pad_packages", []) if p.get("reserved_by") == worker["id"]),
-        None,
-    )
+            None,
+        )
     if not package:
         worker["status"] = "idle"
         worker["current_task"] = None
@@ -635,7 +635,7 @@ def _pickup_package(world_state: dict, worker: dict, factory: dict,
             package["status"] = "pad"
             package["reserved_by"] = None
             task = _task_by_id(world_state, worker.get("current_task"))
-            if task:
+        if task:
                 task["status"] = "blocked"
             worker["carrying"] = None
             worker["current_task"] = None
@@ -979,7 +979,7 @@ def run_pygame() -> None:
             _pending_leader = None
             try:
                 plan = future.result()
-            except Exception as exc:
+                    except Exception as exc:
                 plan = {
                     "assignments": _deterministic_assignments(copy.deepcopy(world_state)),
                     "thought": "",
