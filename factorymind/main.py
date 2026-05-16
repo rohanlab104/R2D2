@@ -84,7 +84,7 @@ _decision_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="agen
 _pending_leader: dict[int, Future] = {}
 _pending_worker: dict[int, Future] = {}
 _pending_strategist: Optional[Future] = None
-_sim_started: bool = False  # True once user sends first chat prompt
+_sim_started: bool = False  # set True on bootstrap; sim runs continuously when auto-start is on
 
 # ---------------------------------------------------------------------------
 # A* pathfinding
@@ -329,9 +329,11 @@ def _robot_blocks_traffic(robot: dict) -> bool:
 
 
 def _relocate_off_station_immediate(robot: dict, world_state: dict) -> bool:
-    """Teleport one cell off a station tile (no path) so dispatch/movement cannot stall."""
+    """Step off a station tile via a one-cell path (no position snap / teleport)."""
     pos = list(robot.get("pos", []))
     if not _is_workstation_cell(pos, world_state):
+        return False
+    if robot.get("path"):
         return False
     wall_set = {tuple(c) for c in world_state.get("wall", [])}
     spawn = tuple(robot.get("spawn_pos", pos))
@@ -355,10 +357,23 @@ def _relocate_off_station_immediate(robot: dict, world_state: dict) -> bool:
     if not candidates:
         return False
     candidates.sort(key=lambda item: item[0])
-    robot["pos"] = candidates[0][1]
-    robot["path"] = []
+    robot["path"] = [candidates[0][1]]
     robot["yield_streak"] = 0
     return True
+
+
+def _fleet_unstick_worker(robot: dict, world_state: dict) -> None:
+    """Re-plan or walk toward spawn — never snap position (avoids visual teleports)."""
+    robot["stall_ticks"] = 0
+    robot["path"] = []
+    _replenish_task_path(robot, world_state)
+    if robot.get("path"):
+        return
+    spawn = robot.get("spawn_pos")
+    if spawn and list(robot.get("pos", [])) != list(spawn):
+        robot["path"] = _planned_path_to(
+            robot, list(spawn), world_state, ignore_reservations=True,
+        )
 
 
 def _step_aside_from_workstation(robot: dict, world_state: dict) -> bool:
@@ -569,13 +584,8 @@ def _advance_robots_fleet(world_state: dict, blackboard: "Blackboard") -> None:
         cur = tuple(robot["pos"])
         if nxt != cur and nxt in occupied:
             robot["stall_ticks"] = int(robot.get("stall_ticks", 0)) + 1
-            if robot["stall_ticks"] >= 12:
-                spawn = robot.get("spawn_pos")
-                if spawn and list(robot["pos"]) != list(spawn):
-                    robot["pos"] = list(spawn)
-                robot["path"] = []
-                robot["stall_ticks"] = 0
-                _replenish_task_path(robot, world_state)
+            if robot["stall_ticks"] >= 24:
+                _fleet_unstick_worker(robot, world_state)
             continue
         occupied.discard(cur)
         before = tuple(robot["pos"])
@@ -583,6 +593,8 @@ def _advance_robots_fleet(world_state: dict, blackboard: "Blackboard") -> None:
         after = tuple(robot["pos"])
         if before == after:
             robot["stall_ticks"] = int(robot.get("stall_ticks", 0)) + 1
+            if robot["stall_ticks"] >= 24:
+                _fleet_unstick_worker(robot, world_state)
         else:
             robot["stall_ticks"] = 0
         occupied.add(after)
@@ -914,6 +926,7 @@ def _enqueue_fleet_tasks(
     routes: list[tuple[dict, dict]],
     *,
     source: str = "user",
+    announce: bool = True,
 ) -> int:
     """Append `routes` to the leader's task queue; returns count enqueued."""
     if not routes:
@@ -927,13 +940,37 @@ def _enqueue_fleet_tasks(
     stats = world_state.setdefault("stats", {})
     stats["queued_total"] = stats.get("queued_total", 0) + len(routes)
     world_state["fleet_mode"] = True
-    blackboard.post(
-        -1,
-        "STRATEGY",
-        f"OpenClaw leader queued {len(routes)} task(s); fleet dispatch active "
-        f"(queue={len(queue)}, completed={stats.get('completed', 0)}).",
-    )
+    if announce:
+        blackboard.post(
+            -1,
+            "STRATEGY",
+            f"OpenClaw leader queued {len(routes)} task(s); fleet dispatch active "
+            f"(queue={len(queue)}, completed={stats.get('completed', 0)}).",
+        )
     return len(routes)
+
+
+def _top_up_fleet_queue(world_state: dict, blackboard: Blackboard) -> None:
+    """Keep the task queue above a low-water mark so the factory never idles."""
+    if world_state.get("manual_control"):
+        return
+    queue = world_state.setdefault("task_queue", [])
+    num_workers = max(
+        1,
+        sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER),
+    )
+    low_water = int(
+        os.getenv("FACTORYMIND_FLEET_LOW_WATER", str(max(num_workers * 3, 24)))
+    )
+    batch = int(
+        os.getenv("FACTORYMIND_FLEET_REFILL_BATCH", str(max(num_workers * 4, 32)))
+    )
+    if len(queue) >= low_water:
+        return
+    routes = _generate_fleet_routes(world_state, batch)
+    if not routes:
+        return
+    _enqueue_fleet_tasks(world_state, blackboard, routes, source="auto", announce=False)
 
 
 def _interleave_station_route_groups(
@@ -1840,41 +1877,31 @@ def _reset_demo_state(layout: str, speed_multiplier: int, connection_status: str
     return world_state
 
 
-def _seed_startup_fleet(world_state: dict, blackboard: Blackboard) -> int:
-    """Queue and dispatch initial delivery tasks so workers spread out immediately."""
-    if os.getenv("FACTORYMIND_AUTO_START", "false").lower() not in ("true", "1", "yes"):
-        return 0
-
-    num_workers = sum(
-        1 for r in world_state.get("robots", []) if r.get("role") == WORKER
+def _bootstrap_demo_run(world_state: dict, blackboard: Blackboard) -> None:
+    """Start the sim and keep a backlog of cycle tasks (optional AUTO_START off)."""
+    global _sim_started
+    _sim_started = True
+    world_state["fleet_mode"] = True
+    if os.getenv("FACTORYMIND_AUTO_START", "true").lower() in ("false", "0", "no"):
+        blackboard.post(
+            -1,
+            "STRATEGY",
+            "Autonomous fleet off (FACTORYMIND_AUTO_START=false). Toggle env to run.",
+        )
+        return
+    _top_up_fleet_queue(world_state, blackboard)
+    num_workers = max(
+        1,
+        sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER),
     )
-    if num_workers == 0:
-        return 0
-
-    default_tasks = max(num_workers * 2, 20)
-    task_count = int(os.getenv("FACTORYMIND_STARTUP_TASKS", str(default_tasks)))
-    routes = _generate_fleet_routes(world_state, task_count)
-    world_state["fleet_dispatch_cursor"] = 0
-    enqueued = _enqueue_fleet_tasks(world_state, blackboard, routes, source="startup")
-
-    # Assign one task per idle worker right away (repeat until queue or workers exhausted).
     for _ in range(num_workers + 4):
         if _fleet_dispatch_step(world_state, blackboard) == 0:
             break
-
     blackboard.post(
         -1,
         "STRATEGY",
-        f"Fleet live: {num_workers} workers dispersed, {enqueued} deliveries queued.",
+        "Autonomous fleet running — use Builder to add/remove walls anytime.",
     )
-    return enqueued
-
-
-def _bootstrap_demo_run(world_state: dict, blackboard: Blackboard) -> None:
-    """Auto-start movement and fleet tasks when the demo loads or resets."""
-    global _sim_started
-    if _seed_startup_fleet(world_state, blackboard) > 0:
-        _sim_started = True
 
 
 def _cycle_speed(speed_multiplier: int) -> int:
@@ -2402,8 +2429,8 @@ def main() -> None:
     blackboard.post(
         -1,
         "STRATEGY",
-        "FactoryMind ready — MASTER dispatches from chat (e.g. 'do 5 tasks for Parts'). "
-        "Workers follow orders exactly; set FACTORYMIND_AUTO_START=true to queue on load.",
+        "FactoryMind ready — autonomous fleet runs continuously. "
+        "Use Builder to add walls; set FACTORYMIND_AUTO_START=false to pause.",
     )
     _bootstrap_demo_run(world_state, blackboard)
     manual_control = False
@@ -2527,36 +2554,6 @@ def main() -> None:
                     if cell in wall_list:
                         wall_list.remove(cell)
                         world_state["wall"] = wall_list
-                elif action_type == "user_prompt":
-                    user_text = result["text"]
-                    _sim_started = True
-                    blackboard.post(-1, "USER", user_text)
-                    if _apply_go_to_station_and_stop(user_text, world_state, blackboard):
-                        manual_control = True
-                        last_leader_tick = now
-                        last_worker_tick = now
-                        last_strategist_tick = now
-                        continue
-                    if _apply_user_task_request(user_text, world_state, blackboard):
-                        manual_control = False
-                        last_leader_tick = now - LEADER_TICK_INTERVAL
-                        last_worker_tick = now - WORKER_TICK_INTERVAL
-                        last_strategist_tick = now
-                        continue
-                    manual_control = False
-                    # Trigger immediate strategist response to user command
-                    if _pending_strategist is None:
-                        try:
-                            retrieved = M.retrieve_strategies(
-                                world_state["layout"],
-                                state_description=M.describe_world_state(world_state),
-                            )
-                        except Exception:
-                            retrieved = []
-                        _pending_strategist = _decision_executor.submit(
-                            strategist_decide, world_state, blackboard, retrieved, user_text,
-                        )
-                        last_strategist_tick = now
 
         # --- Drain completed LLM futures (always, to flush startup strategist) ---
         _drain_completed_decisions(world_state, blackboard)
@@ -2613,6 +2610,10 @@ def main() -> None:
             # --- Master fleet dispatch (deterministic; runs every tick while queued) ---
             if world_state.get("task_queue"):
                 _fleet_dispatch_step(world_state, blackboard)
+
+            # Keep backlog full while building / playing (not in manual go-to-station mode).
+            if not manual_control:
+                _top_up_fleet_queue(world_state, blackboard)
 
             # --- Movement tick ---
             if now - last_move_tick >= MOVE_TICK_INTERVAL:

@@ -41,49 +41,6 @@ from factorymind.state import (
 # Action handlers (mirror the pygame button/event handlers in main.py)
 # ---------------------------------------------------------------------------
 
-def _handle_user_prompt(
-    text: str,
-    world_state: dict,
-    blackboard: Blackboard,
-    *,
-    now: float,
-    timers: dict,
-) -> bool:
-    """Apply a chat prompt the same way main.py does. Returns True if the
-    request started new work (so the caller can flip ``manual_control``)."""
-    user_text = text.strip()
-    if not user_text:
-        return False
-    M._sim_started = True
-    blackboard.post(-1, "USER", user_text)
-
-    if M._apply_go_to_station_and_stop(user_text, world_state, blackboard):
-        timers["last_leader_tick"] = now
-        timers["last_worker_tick"] = now
-        timers["last_strategist_tick"] = now
-        return True
-
-    if M._apply_user_task_request(user_text, world_state, blackboard):
-        timers["last_leader_tick"] = now - M.LEADER_TICK_INTERVAL
-        timers["last_worker_tick"] = now - M.WORKER_TICK_INTERVAL
-        timers["last_strategist_tick"] = now
-        return True
-
-    # Free-form prompt — kick the strategist if it's not already busy.
-    if M._pending_strategist is None:
-        try:
-            retrieved = MEM.retrieve_strategies(
-                world_state["layout"],
-                state_description=MEM.describe_world_state(world_state),
-            )
-        except Exception:
-            retrieved = []
-        M._pending_strategist = M._decision_executor.submit(
-            strategist_decide, world_state, blackboard, retrieved, user_text,
-        )
-        timers["last_strategist_tick"] = now
-    return False
-
 
 def _handle_disconnect(
     world_state: dict,
@@ -136,7 +93,9 @@ def run() -> None:
     host = os.getenv("FACTORYMIND_WEB_HOST", "0.0.0.0")
     port = int(os.getenv("FACTORYMIND_WEB_PORT", "8080"))
     target_fps = float(os.getenv("FACTORYMIND_WEB_FPS", "60"))
-    publish_dt = float(os.getenv("FACTORYMIND_WEB_PUBLISH_DT", "0.1"))
+    # Slow poll when idle; faster when sim runs so spheres track grid steps (~60 Hz).
+    publish_dt_idle = float(os.getenv("FACTORYMIND_WEB_PUBLISH_DT", "0.12"))
+    publish_dt_active = float(os.getenv("FACTORYMIND_WEB_PUBLISH_DT_ACTIVE", "0.016"))
 
     world_state = M._reset_demo_state(layout, speed_multiplier, "online")
     blackboard = Blackboard()
@@ -144,7 +103,7 @@ def run() -> None:
     blackboard.post(-1, "POLICY", f"OpenClaw runtime active: {engine.describe()}")
     blackboard.post(
         -1, "STRATEGY",
-        "FactoryMind 3D — MASTER dispatches from chat; workers execute assigned routes only.",
+        "FactoryMind 3D — autonomous fleet; use Builder while robots keep working.",
     )
     M._bootstrap_demo_run(world_state, blackboard)
     manual_control = False
@@ -204,18 +163,7 @@ def run() -> None:
             # ---- pull actions from the browser ----------------------------
             for action in web_server.drain_actions():
                 kind = action.get("type")
-                if kind == "user_prompt":
-                    _handle_user_prompt(
-                        str(action.get("text", "")),
-                        world_state,
-                        blackboard,
-                        now=now,
-                        timers=timers,
-                    )
-                    # Both go-to-station and task-request helpers set
-                    # world_state["manual_control"] correctly.
-                    manual_control = bool(world_state.get("manual_control", False))
-                elif kind == "reset":
+                if kind == "reset":
                     M._cancel_pending_decisions()
                     world_state = M._reset_demo_state(
                         OPEN_FLOOR, speed_multiplier, world_state["connection_status"]
@@ -309,6 +257,9 @@ def run() -> None:
                 if world_state.get("task_queue"):
                     M._fleet_dispatch_step(world_state, blackboard)
 
+                if not manual_control:
+                    M._top_up_fleet_queue(world_state, blackboard)
+
                 if now - timers["last_move_tick"] >= M.MOVE_TICK_INTERVAL:
                     move_steps = min(int((now - timers["last_move_tick"]) // M.MOVE_TICK_INTERVAL), 4)
                     for _ in range(max(1, move_steps)):
@@ -328,7 +279,8 @@ def run() -> None:
             world_state["speed_multiplier"] = speed_multiplier
             world_state["tick"] += 1
 
-            if wall_now - last_publish >= publish_dt:
+            pub_dt = publish_dt_active if M._sim_started else publish_dt_idle
+            if wall_now - last_publish >= pub_dt:
                 info = _build_info(manual_control)
                 web_server.update_state(world_state, info)
                 last_publish = wall_now

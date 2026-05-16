@@ -1,17 +1,8 @@
-"""Pygame renderer for FactoryMind R2D2 — interactive command console v3.
+"""Pygame renderer for FactoryMind R2D2 — interactive ops dashboard.
 
-Person B owns this file.
-
-v3 changes vs v2:
-- Side panel is now an interactive command console
-- Chat input dispatches task prompts to agents
+- Side panel: stats, mode toggle (CURSOR / BUILDER), agent log, controls
 - Builder mode: click/drag to draw walls, right-click to erase
-- 4-tile stats bar adds LAST ROUTE TIME
-- Log feed has per-entry opacity decay (newest = full, older = faded)
-- CUSTOM layout button (auto-selected when player draws walls)
-- Mode toggle: CURSOR / BUILDER
-- Primary API is now handle_event(event, world_state) — returns str, dict, or None
-- get_button_click() kept for backward compatibility with Person D's main.py
+- Primary API: handle_event(event, world_state) — returns str, dict, or None
 """
 
 from __future__ import annotations
@@ -40,17 +31,17 @@ WINDOW_H      = 900
 # ---------------------------------------------------------------------------
 # Colour palette
 # ---------------------------------------------------------------------------
-C_BG          = (10,  10,  20)
-C_GRID_FAINT  = (26,  26,  42)
-C_GRID_MAJOR  = (37,  37,  64)
+C_BG          = (22,  24,  38)
+C_GRID_FAINT  = (42,  44,  62)
+C_GRID_MAJOR  = (58,  62,  88)
 C_ACCENT      = (0,   212, 255)
-C_TEXT        = (224, 224, 224)
-C_DIM         = (100, 100, 130)
+C_TEXT        = (235, 235, 242)
+C_DIM         = (130, 132, 160)
 C_LEADER      = (0,   212, 255)
 C_WORKER      = (255, 140, 0)
-C_WALL        = (55,  55,  85)
-C_PANEL_BG    = (12,  12,  24)
-C_PANEL_EDGE  = (28,  28,  55)
+C_WALL        = (78,  80,  108)
+C_PANEL_BG    = (24,  26,  42)
+C_PANEL_EDGE  = (48,  52,  78)
 C_WHITE       = (255, 255, 255)
 C_FLASH       = (200, 0,   0)
 C_BADGE_OK    = (10,  80,  30)
@@ -97,19 +88,12 @@ _builder_hover_cell:    Optional[tuple[int, int]] = None
 _builder_drag_start:    Optional[tuple[int, int]] = None
 _builder_dragged_cells: set                       = set()
 
-# Chat input state
-_chat_text:    str  = ""
-_chat_focused: bool = False
-_CHAT_MAX_CHARS = 320
-
 # Button rects — updated every frame by draw_sidepanel
 _BTN_DISCONNECT:   Optional["pygame.Rect"] = None
 _BTN_MODE_CURSOR:  Optional["pygame.Rect"] = None
 _BTN_MODE_BUILDER: Optional["pygame.Rect"] = None
 _BTN_RESET:        Optional["pygame.Rect"] = None
 _BTN_SPEED:        Optional["pygame.Rect"] = None
-_BTN_SEND:         Optional["pygame.Rect"] = None
-_BTN_CHAT_INPUT:   Optional["pygame.Rect"] = None
 
 
 def _ensure_pygame() -> None:
@@ -247,28 +231,17 @@ def handle_event(
     -------------
     str  : "disconnect", "layout_open", "layout_bottleneck", "layout_custom",
            "mode_cursor", "mode_builder", "reset", "speedup"
-    dict : {"type": "user_prompt", "text": str}
-           {"type": "wall_add",    "cell": [x, y]}
+    dict : {"type": "wall_add",    "cell": [x, y]}
            {"type": "wall_remove", "cell": [x, y]}
     None : no action this event
     """
     global _builder_drag_start, _builder_dragged_cells, _builder_hover_cell
-    global _chat_focused
 
     if event.type == pygame.MOUSEBUTTONDOWN:
         pos    = event.pos
         button = event.button
 
         if button == 1:
-            # Chat input focus management
-            if _BTN_CHAT_INPUT and _BTN_CHAT_INPUT.collidepoint(pos):
-                _chat_focused = True
-                return None
-            if _BTN_SEND and _BTN_SEND.collidepoint(pos):
-                return _send_chat()
-            # Clicking anywhere else loses chat focus
-            _chat_focused = False
-
             # Panel buttons
             action = _check_panel_buttons(pos)
             if action is not None:
@@ -303,10 +276,6 @@ def handle_event(
                     _builder_dragged_cells.add(cell)
                     return {"type": "wall_add", "cell": list(cell)}
 
-    elif event.type == pygame.KEYDOWN:
-        if _chat_focused:
-            return _handle_chat_keydown(event)
-
     return None
 
 
@@ -314,7 +283,7 @@ def get_button_click(pos: tuple[int, int]) -> Optional[str]:
     """Backward-compatible mouse handler — returns a string action or None.
 
     Prefer handle_event() for new code; this does not handle keyboard,
-    builder drag, or chat input.
+    builder drag, or wall painting.
     """
     return _check_panel_buttons(pos)
 
@@ -342,28 +311,6 @@ def _check_panel_buttons(pos: tuple[int, int]) -> Optional[str]:
     return None
 
 
-def _handle_chat_keydown(event: "pygame.event.Event") -> Optional[dict]:
-    """Process a KEYDOWN while the chat box is focused."""
-    global _chat_text, _chat_focused
-    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-        return _send_chat()
-    elif event.key == pygame.K_BACKSPACE:
-        _chat_text = _chat_text[:-1]
-    elif event.key == pygame.K_ESCAPE:
-        _chat_focused = False
-    elif event.unicode and len(_chat_text) < _CHAT_MAX_CHARS:
-        _chat_text += event.unicode
-    return None
-
-
-def _send_chat() -> Optional[dict]:
-    """Package current chat text as a user_prompt event and clear the input."""
-    global _chat_text, _chat_focused
-    text          = _chat_text.strip()
-    _chat_text    = ""
-    _chat_focused = False
-    if text:
-        return {"type": "user_prompt", "text": text}
     return None
 
 
@@ -923,10 +870,10 @@ def draw_robots(screen: "pygame.Surface", robots: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
-    """Interactive ops-dashboard: stats, mode/layout controls, agent log, chat."""
+    """Interactive ops-dashboard: stats, mode/layout controls, agent log."""
     global _BTN_DISCONNECT
     global _BTN_MODE_CURSOR, _BTN_MODE_BUILDER
-    global _BTN_RESET, _BTN_SPEED, _BTN_SEND, _BTN_CHAT_INPUT
+    global _BTN_RESET, _BTN_SPEED
 
     W   = screen.get_width() - PANEL_X
     H   = screen.get_height()
@@ -947,7 +894,6 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     f_big   = pygame.font.SysFont("monospace", 19, bold=True)
     f_small = pygame.font.SysFont("monospace", 10)
     f_btn   = pygame.font.SysFont("monospace", 11, bold=True)
-    f_chat  = pygame.font.SysFont("monospace", 12)
 
     y = 14
 
@@ -1046,7 +992,7 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
 
     # ── Log feed (newest first, opacity decay) ─────────────────────────────
     feed_top    = y
-    feed_bottom = H - 188   # leave room for 3 badges + chat + controls + disconnect
+    feed_bottom = H - 118
     line_h      = 14
 
     from factorymind.state import LEADER as _LEADER
@@ -1123,38 +1069,6 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     nv = f_small.render("Powered by NVIDIA NIM  |  ASUS Ascent GX10", True, (65, 65, 95))
     screen.blit(nv, (x0, y))
     y += nv.get_height() + 7
-
-    # Chat input row
-    send_w        = 48
-    chat_w        = W - PAD * 2 - send_w - 4
-    _BTN_CHAT_INPUT = pygame.Rect(x0,                 y, chat_w, 38)
-    _BTN_SEND       = pygame.Rect(x0 + chat_w + 4,   y, send_w, 38)
-
-    bdr = C_ACCENT if _chat_focused else (50, 50, 80)
-    pygame.draw.rect(screen, (16, 16, 32), _BTN_CHAT_INPUT, border_radius=4)
-    pygame.draw.rect(screen, bdr, _BTN_CHAT_INPUT, 2 if _chat_focused else 1, border_radius=4)
-
-    if _chat_text:
-        disp = _chat_text[-44:]
-        ct   = f_chat.render(disp, True, C_TEXT)
-    else:
-        ct   = f_chat.render("Give the agents a task...", True, C_DIM)
-    screen.blit(ct, (_BTN_CHAT_INPUT.x + 6, _BTN_CHAT_INPUT.y + 11))
-
-    if _chat_focused:
-        blink_on = (pygame.time.get_ticks() // 530) % 2 == 0
-        if blink_on:
-            cursor_x = _BTN_CHAT_INPUT.x + 6 + (ct.get_width() if _chat_text else 0) + 1
-            pygame.draw.line(screen, C_ACCENT,
-                             (cursor_x, _BTN_CHAT_INPUT.y + 7),
-                             (cursor_x, _BTN_CHAT_INPUT.y + 31), 2)
-
-    pygame.draw.rect(screen, (20, 20, 50),  _BTN_SEND, border_radius=4)
-    pygame.draw.rect(screen, (60, 60, 100), _BTN_SEND, 1, border_radius=4)
-    sl = f_caps.render("SEND", True, C_DIM)
-    screen.blit(sl, (_BTN_SEND.x + _BTN_SEND.w // 2 - sl.get_width() // 2,
-                     _BTN_SEND.y + _BTN_SEND.h // 2 - sl.get_height() // 2))
-    y += 38 + 5
 
     # RESET | SPEED row
     cbw        = (W - PAD * 2 - 8) // 2
@@ -1273,14 +1187,7 @@ if __name__ == "__main__":
                 print("→ CURSOR mode")
             elif isinstance(result, dict):
                 t = result["type"]
-                if t == "user_prompt":
-                    print(f'User: "{result["text"]}"')
-                    fake_state["blackboard"].append({
-                        "from": 0, "type": "USER",
-                        "content": result["text"],
-                        "timestamp": time.time(),
-                    })
-                elif t == "wall_add":
+                if t == "wall_add":
                     cell = result["cell"]
                     if cell not in fake_state["wall"]:
                         fake_state["wall"].append(cell)

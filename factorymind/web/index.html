@@ -6,10 +6,10 @@
 <title>FactoryMind R2D2 — 3D viewer</title>
 <style>
   :root {
-    --bg: #08080f;
-    --panel: #0c0c18;
-    --edge: #1c1c38;
-    --text: #e0e0e0;
+    --bg: #12141f;
+    --panel: #161722;
+    --edge: #2a2c42;
+    --text: #ececf2;
     --dim: #6a6a8a;
     --accent: #00d4ff;
     --leader: #00d4ff;
@@ -33,7 +33,7 @@
     content: "";
     pointer-events: none;
     position: absolute; inset: 0;
-    background: radial-gradient(ellipse 80% 70% at 50% 42%, transparent 30%, rgba(0, 4, 12, 0.72) 100%);
+    background: radial-gradient(ellipse 80% 70% at 50% 42%, transparent 35%, rgba(8, 12, 24, 0.45) 100%);
   }
   #stage canvas { display: block; width: 100%; height: 100%; }
   #panel {
@@ -84,7 +84,7 @@
   #log .row { display: block; padding: 1px 0; opacity: 1; }
   #log .ts   { color: var(--dim); }
   #log .src  { color: var(--dim); margin-right: 4px; }
-  #log .msg  { color: #c8c8d8; }
+  #log .msg  { color: #d6d6e4; }
   .type-CLAIM      { color: var(--accent); }
   .type-STRATEGY   { color: var(--strategy); }
   .type-BOTTLENECK { color: var(--error); }
@@ -94,21 +94,6 @@
   .type-ERROR      { color: var(--error); }
   .type-USER       { color: #fff; font-weight: 700; }
   .type-POLICY     { color: #00ffc8; font-weight: 600; }
-  #chat-row { display: flex; gap: 6px; }
-  #chat-input {
-    flex: 1;
-    background: #10101e; border: 1px solid #2a2a55; border-radius: 4px;
-    color: var(--text); padding: 8px 10px;
-    font-family: inherit; font-size: 12px;
-  }
-  #chat-input:focus { outline: none; border-color: var(--accent); }
-  #send-btn {
-    background: #0a1428; border: 1px solid #284060;
-    color: var(--accent); padding: 8px 16px; border-radius: 4px;
-    font-family: inherit; font-size: 11px; letter-spacing: 0.1em;
-    cursor: pointer;
-  }
-  #send-btn:hover { background: #112038; border-color: var(--accent); }
   #endpoints { color: var(--dim); font-size: 10px; white-space: pre-wrap; }
   #endpoints b { color: #b8b8c8; font-weight: 600; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 9px; letter-spacing: 0.08em; }
@@ -164,7 +149,7 @@
 <div id="panel">
   <div>
     <div id="title">FACTORYMIND <span style="font-weight:400;color:var(--dim);">3D</span></div>
-    <div class="subtitle">Nemotron + DGX Spark GX10</div>
+    <div class="subtitle">Autonomous fleet · build while it runs</div>
   </div>
   <hr class="rule" />
 
@@ -215,11 +200,6 @@
   <hr class="rule" />
   <div style="color: var(--accent); font-size: 11px; letter-spacing: 0.08em;">AGENT REASONING</div>
   <div id="log"></div>
-
-  <div id="chat-row">
-    <input id="chat-input" placeholder="e.g. 'do 5 tasks for Parts and 2 for Assembly'…" autocomplete="off" />
-    <button id="send-btn">SEND</button>
-  </div>
 </div>
 
 <script type="module">
@@ -244,15 +224,15 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.18;
+renderer.toneMappingExposure = 1.42;
 renderer.physicallyCorrectLights = true;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 stage.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x05060f);
-scene.fog = new THREE.FogExp2(0x0a0e1c, 0.011);
+scene.background = new THREE.Color(0x1a1e2c);
+scene.fog = new THREE.FogExp2(0x1c2335, 0.0082);
 
 const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 1200);
 camera.position.set(GRID * 1.35, GRID * 1.05, GRID * 1.95);
@@ -266,9 +246,9 @@ controls.maxDistance = 300;
 controls.maxPolarAngle = Math.PI * 0.48;
 
 // Lights — industrial night-shift + sun shafts
-scene.add(new THREE.HemisphereLight(0x6a7ab8, 0x151018, 0.5));
-scene.add(new THREE.AmbientLight(0x2a2a48, 0.55));
-const sun = new THREE.DirectionalLight(0xffeed8, 2.0);
+scene.add(new THREE.HemisphereLight(0x9aacd8, 0x2a2835, 0.62));
+scene.add(new THREE.AmbientLight(0x404868, 0.72));
+const sun = new THREE.DirectionalLight(0xfff5e8, 2.65);
 sun.position.set(70, 110, 35);
 sun.castShadow = true;
 sun.shadow.mapSize.width = 2048;
@@ -282,15 +262,15 @@ sun.shadow.camera.far  = 280;
 sun.shadow.bias = -0.00015;
 scene.add(sun);
 
-const rim = new THREE.DirectionalLight(0x3399ff, 0.55);
+const rim = new THREE.DirectionalLight(0x77b8ff, 0.75);
 rim.position.set(-45, 55, -55);
 scene.add(rim);
 
-const fill = new THREE.DirectionalLight(0xff8844, 0.25);
+const fill = new THREE.DirectionalLight(0xffaa77, 0.42);
 fill.position.set(20, 40, 80);
 scene.add(fill);
 
-const floorGlow = new THREE.PointLight(0x00d4ff, 0.45, GRID * 2.2);
+const floorGlow = new THREE.PointLight(0x88e8ff, 0.68, GRID * 2.2);
 floorGlow.position.set(GRID / 2, 6, GRID / 2);
 scene.add(floorGlow);
 
@@ -311,7 +291,7 @@ const PERIM_OFFSET = 1.5;       // perimeter wall sits just outside the floor
   const geo = new THREE.PlaneGeometry(GRID, GRID, 24, 24);
   geo.rotateX(-Math.PI / 2);
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x1c1c38, metalness: 0.42, roughness: 0.22,
+    color: 0x2a2e48, metalness: 0.38, roughness: 0.20,
   });
   const floor = new THREE.Mesh(geo, mat);
   floor.position.set(GRID / 2, 0, GRID / 2);
@@ -343,7 +323,7 @@ const PERIM_OFFSET = 1.5;       // perimeter wall sits just outside the floor
   const geo = new THREE.PlaneGeometry(GRID + PAD * 2, GRID + PAD * 2);
   geo.rotateX(-Math.PI / 2);
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x0c0c16, metalness: 0.05, roughness: 0.95,
+    color: 0x181c30, metalness: 0.06, roughness: 0.92,
   });
   const apron = new THREE.Mesh(geo, mat);
   apron.position.set(GRID / 2, -0.12, GRID / 2);
@@ -1786,7 +1766,8 @@ async function pollState() {
     updateHUD(world, data.info ?? {});
   } catch (e) { /* server down briefly; just try again */ }
 }
-setInterval(pollState, 100);
+const POLL_MS = 32;
+setInterval(pollState, POLL_MS);
 pollState();
 
 // ---------------------------------------------------------------------------
@@ -1797,7 +1778,7 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
   const t = clock.elapsedTime;
-  const lerp = 1 - Math.exp(-dt * 9);
+  const lerp = 1 - Math.exp(-dt * 16);
   for (const [id, g] of robotMeshes) {
     const v = robotVisualPos.get(id);
     if (!v || !v.target) continue;
@@ -1806,7 +1787,7 @@ function animate() {
     g.position.x = v.x;
     g.position.z = v.z;
     if (g.userData.ring) g.userData.ring.rotation.y += dt * 0.7;
-    const bob = Math.sin(t * 3 + id) * 0.04;
+    const bob = Math.sin(t * 2.2 + id) * 0.018;
     g.position.y = bob;
   }
   for (const [, g] of taskMeshes) {
@@ -1847,7 +1828,7 @@ new ResizeObserver(resize).observe(stage);
 resize();
 
 // ---------------------------------------------------------------------------
-// Actions: chat + buttons
+// Actions: panel buttons
 // ---------------------------------------------------------------------------
 async function sendAction(payload) {
   try {
@@ -1858,16 +1839,6 @@ async function sendAction(payload) {
     });
   } catch (e) { console.warn("action failed", e); }
 }
-
-const chat = document.getElementById("chat-input");
-const send = () => {
-  const text = chat.value.trim();
-  if (!text) return;
-  sendAction({ type: "user_prompt", text });
-  chat.value = "";
-};
-document.getElementById("send-btn").addEventListener("click", send);
-chat.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 
 document.getElementById("btn-reset").addEventListener("click",      () => sendAction({ type: "reset" }));
 document.getElementById("btn-speed").addEventListener("click",      () => sendAction({ type: "speedup" }));
