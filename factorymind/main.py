@@ -229,6 +229,21 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
     robot["path"] = a_star(robot["pos"], task["pickup"], wall_set)
 
 
+def _route_cost(start: list[int], goal: list[int], wall_set: set) -> int:
+    """Return shortest-path cell count, or a large cost if unreachable."""
+    if start == goal:
+        return 0
+    path = a_star(start, goal, wall_set)
+    return len(path) if path else 10**6
+
+
+def _estimate_task_cost(robot: dict, task: dict, wall_set: set) -> int:
+    """Estimate total route length: robot -> pickup -> delivery."""
+    to_pickup = _route_cost(robot["pos"], task["pickup"], wall_set)
+    to_delivery = _route_cost(task["pickup"], task["delivery"], wall_set)
+    return to_pickup + to_delivery
+
+
 def _delegate_task_to_nearest_worker(
     leader: dict,
     task: dict,
@@ -245,19 +260,16 @@ def _delegate_task_to_nearest_worker(
 
     worker = min(
         idle_workers,
-        key=lambda r: (
-            abs(r["pos"][0] - task["pickup"][0]) + abs(r["pos"][1] - task["pickup"][1]),
-            r["id"],
-        ),
+        key=lambda r: (_estimate_task_cost(r, task, {tuple(c) for c in world_state.get("wall", [])}), r["id"]),
     )
     _assign_task_to_robot(worker, task, world_state)
     task["delegated_by"] = leader["id"]
     route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
-    distance = abs(worker["pos"][0] - task["pickup"][0]) + abs(worker["pos"][1] - task["pickup"][1])
+    distance = _estimate_task_cost(worker, task, {tuple(c) for c in world_state.get("wall", [])})
     blackboard.post(
         leader["id"],
         "INTENT",
-        f"Delegating {route} task {task['id']} to W{worker['id']}; worker is {distance} cells from pickup.",
+        f"Delegating {route} task {task['id']} to W{worker['id']}; estimated route cost {distance} steps.",
     )
     print(
         f"[leader {leader['id']}] delegated task {task['id']} ({route}) to worker {worker['id']}",
@@ -280,27 +292,61 @@ def _dispatch_batch_to_workers(
     if not leaders or not idle_workers:
         return 0
 
-    dispatched = 0
-    for task in tasks:
-        if not idle_workers:
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    assignments: list[tuple[dict, dict, int]] = []
+    remaining_tasks = list(tasks)
+    remaining_workers = list(idle_workers)
+
+    while remaining_tasks and remaining_workers:
+        best_pair: tuple[dict, dict, int] | None = None
+        for task in remaining_tasks:
+            for worker in remaining_workers:
+                cost = _estimate_task_cost(worker, task, wall_set)
+                if cost >= 10**6:
+                    continue
+                if best_pair is None or (cost, worker["id"], task["id"]) < (
+                    best_pair[2],
+                    best_pair[1]["id"],
+                    best_pair[0]["id"],
+                ):
+                    best_pair = (task, worker, cost)
+        if best_pair is None:
             break
+        task, worker, cost = best_pair
+        assignments.append(best_pair)
+        remaining_tasks.remove(task)
+        remaining_workers.remove(worker)
+
+    if not assignments:
+        return 0
+
+    avg_cost = round(sum(cost for _, _, cost in assignments) / len(assignments), 1)
+    blackboard.post(
+        -1,
+        "STRATEGY",
+        f"Planner precomputed {len(assignments)} worker route(s); average estimated completion cost {avg_cost} steps.",
+    )
+    print(
+        f"[planner] precomputed {len(assignments)} assignment(s), avg estimated cost={avg_cost} steps",
+        flush=True,
+    )
+
+    dispatched = 0
+    for task, worker, cost in assignments:
         leader = leaders[dispatched % len(leaders)]
-        worker = min(
-            idle_workers,
-            key=lambda r: (
-                abs(r["pos"][0] - task["pickup"][0]) + abs(r["pos"][1] - task["pickup"][1]),
-                r["id"],
-            ),
-        )
-        idle_workers.remove(worker)
         _assign_task_to_robot(worker, task, world_state)
         task["delegated_by"] = leader["id"]
+        task["estimated_route_cost"] = cost
         route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
-        distance = abs(worker["pos"][0] - task["pickup"][0]) + abs(worker["pos"][1] - task["pickup"][1])
+        blackboard.post(
+            worker["id"],
+            "INTENT",
+            f"W{worker['id']} bid {cost} steps for {route} task {task['id']}; accepting assignment.",
+        )
         blackboard.post(
             leader["id"],
             "CLAIM",
-            f"Batch dispatch: {route} task {task['id']} assigned to W{worker['id']} ({distance} cells to pickup).",
+            f"Batch dispatch: {route} task {task['id']} assigned to W{worker['id']} by lowest route cost ({cost} steps).",
         )
         print(
             f"[leader {leader['id']}] batch dispatch task {task['id']} ({route}) to worker {worker['id']}",

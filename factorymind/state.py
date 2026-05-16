@@ -75,7 +75,7 @@ def _make_wall(layout: str) -> list[list[int]]:
 def create_initial_state(
     layout: str,
     num_leaders: int = 2,
-    num_workers: int = 3,
+    num_workers: int = 4,
 ) -> dict:
     """Create and return a fresh world_state dict for the given layout.
 
