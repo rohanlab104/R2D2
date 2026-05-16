@@ -474,10 +474,6 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     if _is_go_and_stop_command(text):
         return []
 
-    interpreted = _interpret_user_task_requests(text, world_state)
-    if interpreted:
-        return interpreted
-
     requests: list[tuple[dict, dict, int]] = []
     clauses = [
         clause.strip()
@@ -493,7 +489,15 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
         return requests
 
     parsed = _parse_user_task_request(text, world_state)
-    return [parsed] if parsed is not None else []
+    if parsed is not None:
+        return [parsed]
+
+    if os.getenv("USE_LLM_TASK_INTERPRETER", "false").lower() == "true":
+        interpreted = _interpret_user_task_requests(text, world_state)
+        if interpreted:
+            return interpreted
+
+    return []
 
 
 def _interpret_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, dict, int]]:
