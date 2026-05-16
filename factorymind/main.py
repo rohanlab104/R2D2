@@ -54,6 +54,8 @@ WORKER_TICK_INTERVAL = 2.5  # workers think slightly less often than leaders
 STRATEGIST_TICK_INTERVAL = 20.0
 MOVE_TICK_INTERVAL = 0.05  # how often robots advance one step
 SPEED_OPTIONS = (1, 2, 3, 4)
+_UNREACHABLE_COST = 10**6
+_TRACE_LIMIT = 6
 
 # Defaults favor the full agentic demo: every idle worker gets its own model
 # decision, while path execution stays deterministic and locally verifiable.
@@ -306,6 +308,7 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
             f"task-{task['id']} {task.get('pickup_name','?')}→{task.get('delivery_name','?')} done",
             route_time=route_time,
         )
+        _maybe_post_batch_measurement(world_state, blackboard)
 
         robot["path"] = []
 
@@ -459,6 +462,179 @@ def _estimate_task_cost(
     return to_pickup + to_delivery + _traffic_penalty_for_path(robot, route_stub, world_state)
 
 
+def _ensure_autonomy_state(world_state: dict) -> dict:
+    """Return the mutable autonomy block, adding missing keys for older snapshots."""
+    autonomy = world_state.setdefault("autonomy", {})
+    autonomy.setdefault("trace", [])
+    autonomy.setdefault("eta", {})
+    autonomy.setdefault("batch_complete_posted", False)
+    return autonomy
+
+
+def _reset_autonomy_run(world_state: dict) -> None:
+    """Clear the visible autonomy story when a new user mission starts."""
+    world_state["autonomy"] = {
+        "trace": [],
+        "eta": {
+            "solo_steps": None,
+            "team_steps": None,
+            "speedup": None,
+            "workers": 0,
+            "tasks": 0,
+            "summary": "",
+        },
+        "batch_complete_posted": False,
+    }
+    stats = world_state.setdefault("stats", {})
+    stats["eta_solo_steps"] = None
+    stats["eta_team_steps"] = None
+    stats["eta_speedup"] = None
+
+
+def _post_autonomy_trace(
+    world_state: dict,
+    stage: str,
+    detail: str,
+    blackboard: Blackboard | None = None,
+    *,
+    from_id: int = -1,
+    msg_type: str = "TRACE",
+) -> None:
+    """Append a compact, judge-visible decision trace entry."""
+    autonomy = _ensure_autonomy_state(world_state)
+    entry = {
+        "stage": stage.upper(),
+        "detail": detail[:180],
+        "timestamp": time.time(),
+        "from": from_id,
+        "type": msg_type,
+    }
+    trace = autonomy["trace"]
+    trace.append(entry)
+    del trace[:-_TRACE_LIMIT]
+    if blackboard is not None:
+        blackboard.post(from_id, msg_type, f"{entry['stage']}: {entry['detail']}")
+
+
+def _travel_cost_from(position: list[int], task: dict, wall_set: set) -> int:
+    """Estimate one robot doing pickup and delivery from a given position."""
+    to_pickup = _route_cost(position, task["pickup"], wall_set)
+    to_delivery = _route_cost(task["pickup"], task["delivery"], wall_set)
+    if to_pickup >= _UNREACHABLE_COST or to_delivery >= _UNREACHABLE_COST:
+        return _UNREACHABLE_COST
+    return to_pickup + to_delivery
+
+
+def _estimate_solo_batch_steps(tasks: list[dict], workers: list[dict], wall_set: set) -> int | None:
+    """Estimate the best single-worker completion time for the whole batch."""
+    if not tasks or not workers:
+        return None
+
+    best = _UNREACHABLE_COST
+    for worker in workers:
+        remaining = list(tasks)
+        pos = list(worker["pos"])
+        total = 0
+        while remaining:
+            task = min(
+                remaining,
+                key=lambda t: (_travel_cost_from(pos, t, wall_set), t["id"]),
+            )
+            cost = _travel_cost_from(pos, task, wall_set)
+            if cost >= _UNREACHABLE_COST:
+                total = _UNREACHABLE_COST
+                break
+            total += cost
+            pos = list(task["delivery"])
+            remaining.remove(task)
+        best = min(best, total)
+
+    return None if best >= _UNREACHABLE_COST else best
+
+
+def _estimate_team_batch_steps(tasks: list[dict], workers: list[dict], wall_set: set) -> int | None:
+    """Estimate multi-worker makespan by greedily assigning work to free robots."""
+    if not tasks or not workers:
+        return None
+
+    loads = [
+        {"id": worker["id"], "pos": list(worker["pos"]), "steps": 0}
+        for worker in workers
+    ]
+    for task in sorted(tasks, key=lambda t: (t.get("priority", 0), -t["id"]), reverse=True):
+        best_load = None
+        best_finish = _UNREACHABLE_COST
+        for load in loads:
+            cost = _travel_cost_from(load["pos"], task, wall_set)
+            finish = load["steps"] + cost
+            if finish < best_finish:
+                best_finish = finish
+                best_load = load
+        if best_load is None or best_finish >= _UNREACHABLE_COST:
+            return None
+        best_load["steps"] = best_finish
+        best_load["pos"] = list(task["delivery"])
+
+    return max(load["steps"] for load in loads)
+
+
+def _batch_eta_metrics(tasks: list[dict], workers: list[dict], wall_set: set) -> dict:
+    """Compare one-robot work against the current multi-agent plan."""
+    solo_steps = _estimate_solo_batch_steps(tasks, workers, wall_set)
+    team_steps = _estimate_team_batch_steps(tasks, workers, wall_set)
+    speedup = (
+        round(solo_steps / team_steps, 2)
+        if solo_steps and team_steps and team_steps > 0
+        else None
+    )
+    return {
+        "solo_steps": solo_steps,
+        "team_steps": team_steps,
+        "speedup": speedup,
+        "workers": min(len(workers), len(tasks)) if tasks else 0,
+        "tasks": len(tasks),
+        "summary": (
+            f"solo {solo_steps} steps vs team {team_steps} steps"
+            if solo_steps and team_steps
+            else "ETA unavailable"
+        ),
+    }
+
+
+def _update_autonomy_eta(world_state: dict, metrics: dict) -> None:
+    """Publish ETA metrics to both the autonomy block and stats tiles."""
+    autonomy = _ensure_autonomy_state(world_state)
+    autonomy["eta"] = metrics
+    stats = world_state.setdefault("stats", {})
+    stats["eta_solo_steps"] = metrics.get("solo_steps")
+    stats["eta_team_steps"] = metrics.get("team_steps")
+    stats["eta_speedup"] = metrics.get("speedup")
+
+
+def _maybe_post_batch_measurement(world_state: dict, blackboard: Blackboard) -> None:
+    """When a user batch finishes, close the autonomy loop with a measurement."""
+    autonomy = _ensure_autonomy_state(world_state)
+    if autonomy.get("batch_complete_posted"):
+        return
+
+    user_tasks = [
+        task for task in world_state.get("tasks", [])
+        if task.get("source") == "user" and task.get("status") != "cancelled"
+    ]
+    if not user_tasks or any(task.get("status") != "done" for task in user_tasks):
+        return
+
+    eta = autonomy.get("eta", {})
+    avg = world_state.get("stats", {}).get("avg_route_time")
+    avg_text = f"{avg:.2f}s" if isinstance(avg, (int, float)) else "unknown"
+    detail = (
+        f"Batch complete: {len(user_tasks)} deliveries finished; "
+        f"avg route {avg_text}; planned {eta.get('summary', 'ETA unavailable')}."
+    )
+    _post_autonomy_trace(world_state, "MEASURE", detail, blackboard)
+    autonomy["batch_complete_posted"] = True
+
+
 def _delegate_task_to_nearest_worker(
     leader: dict,
     task: dict,
@@ -512,10 +688,27 @@ def _dispatch_batch_to_workers(
         r for r in world_state.get("robots", [])
         if r.get("role") == WORKER and r.get("current_task") is None and not r.get("path")
     ]
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    metrics = _batch_eta_metrics(tasks, idle_workers, wall_set)
+    _update_autonomy_eta(world_state, metrics)
+    _post_autonomy_trace(
+        world_state,
+        "OBSERVE",
+        (
+            f"Live floor has {len(tasks)} new delivery task(s), "
+            f"{len(idle_workers)} idle worker agent(s), layout={world_state.get('layout')}."
+        ),
+        blackboard,
+    )
     if not leaders or not idle_workers:
+        _post_autonomy_trace(
+            world_state,
+            "WAIT",
+            "No leader or idle worker capacity is available, so work stays queued.",
+            blackboard,
+        )
         return 0
 
-    wall_set = {tuple(c) for c in world_state.get("wall", [])}
     assignments: list[tuple[dict, dict, int]] = []
     remaining_tasks = list(tasks)
     remaining_workers = list(idle_workers)
@@ -541,9 +734,41 @@ def _dispatch_batch_to_workers(
         remaining_workers.remove(worker)
 
     if not assignments:
+        _post_autonomy_trace(
+            world_state,
+            "PLAN",
+            "Route-cost tool found no reachable worker-task pair.",
+            blackboard,
+        )
         return 0
 
     avg_cost = round(sum(cost for _, _, cost in assignments) / len(assignments), 1)
+    blackboard.post(
+        -1,
+        "TOOL",
+        (
+            f"route_cost evaluated {len(tasks) * len(idle_workers)} bid(s); "
+            f"{metrics.get('summary', 'ETA unavailable')}."
+        ),
+    )
+    if metrics.get("speedup"):
+        blackboard.post(
+            -1,
+            "FOUND",
+            (
+                f"Multi-agent dispatch is {metrics['speedup']:.2f}x faster "
+                f"for this batch ETA."
+            ),
+        )
+    _post_autonomy_trace(
+        world_state,
+        "PLAN",
+        (
+            f"Compared bids and selected {len(assignments)} worker route(s); "
+            f"average first-wave cost {avg_cost} steps."
+        ),
+        blackboard,
+    )
     blackboard.post(
         -1,
         "STRATEGY",
@@ -940,6 +1165,7 @@ def _apply_user_task_request(
             task["status"] = "cancelled"
             task["assigned_to"] = None
 
+    _reset_autonomy_run(world_state)
     new_tasks: list[dict] = []
     route_summaries: list[str] = []
     for pickup_ws, delivery_ws, count in requests:
@@ -950,9 +1176,24 @@ def _apply_user_task_request(
         route_summaries.append(f"{count}x {pickup_ws['name']}->{delivery_ws['name']}")
 
     world_state["tasks"].extend(new_tasks)
-    dispatched = _dispatch_batch_to_workers(new_tasks, world_state, blackboard)
-    world_state["manual_control"] = False
     summary = "; ".join(route_summaries)
+    _post_autonomy_trace(
+        world_state,
+        "OBSERVE",
+        f"Interpreted command as {summary}; creating executable warehouse tasks.",
+        blackboard,
+    )
+    dispatched = _dispatch_batch_to_workers(new_tasks, world_state, blackboard)
+    _post_autonomy_trace(
+        world_state,
+        "ACT",
+        (
+            f"{dispatched} worker agent(s) accepted assignments; "
+            "leaders and strategist will keep adapting as live state changes."
+        ),
+        blackboard,
+    )
+    world_state["manual_control"] = False
     blackboard.post(
         -1,
         "STRATEGY",
@@ -1343,6 +1584,12 @@ def _apply_strategist_decision(
         world_state["layout"],
         directive,
         _strategy_outcome_summary(world_state, str(decision.get("reasoning", ""))),
+    )
+    _post_autonomy_trace(
+        world_state,
+        "ADAPT",
+        f"Strategist posted a {msg_type.lower()} directive and persisted it to memory.",
+        blackboard,
     )
 
 

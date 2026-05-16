@@ -6,7 +6,7 @@ v3 changes vs v2:
 - Side panel is now an interactive command console
 - Chat input dispatches task prompts to agents
 - Builder mode: click/drag to draw walls, right-click to erase
-- 4-tile stats bar adds LAST ROUTE TIME
+- 4-tile stats bar highlights ETA SPEEDUP
 - Log feed has per-entry opacity decay (newest = full, older = faded)
 - CUSTOM layout button (auto-selected when player draws walls)
 - Mode toggle: CURSOR / BUILDER
@@ -66,6 +66,8 @@ C_MSG: dict[str, tuple[int, int, int]] = {
     # New agent reasoning types
     "REASONING":  (220, 0,   255),   # magenta
     "FOUND":      (0,   212, 255),   # cyan
+    "TRACE":      (0,   212, 255),   # cyan
+    "TOOL":       (120, 180, 255),   # blue
     "ERROR":      (255, 200, 0),     # yellow
     "RETRY":      (255, 140, 0),     # orange
     "USER":       (255, 255, 255),   # white
@@ -586,12 +588,21 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     avg_rt    = stats.get("avg_route_time",  None)
     last_str  = f"{last_rt:.2f}s" if last_rt is not None else "--"
     avg_str   = f"avg {avg_rt:.1f}s" if avg_rt is not None else ""
+    eta_speed = stats.get("eta_speedup")
+    eta_team  = stats.get("eta_team_steps")
+    eta_solo  = stats.get("eta_solo_steps")
+    speed_str = f"{eta_speed:.1f}x" if isinstance(eta_speed, (int, float)) else "--"
+    eta_sub   = (
+        f"{eta_solo}->{eta_team} steps"
+        if eta_solo is not None and eta_team is not None
+        else (avg_str or last_str)
+    )
 
     tiles = [
         ("COMPLETED",   str(stats.get("completed", 0)), ""),
         ("TIME",        f"{int(elapsed)//60:02d}:{int(elapsed)%60:02d}", ""),
         ("RATE/MIN",    f"{stats.get('rate', 0.0):.1f}", ""),
-        ("LAST ROUTE",  last_str, avg_str),
+        ("SPEEDUP",     speed_str, eta_sub),
     ]
     tw = (W - PAD * 2 - 12) // 4
     th = 52
@@ -632,12 +643,34 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     screen.blit(ls_pill, (x0, y + 4))
     y += ls_pill.get_height() + 10
 
+    # -- Autonomy trace ------------------------------------------------------
+    trace_items = world_state.get("autonomy", {}).get("trace", [])[-4:]
+    ah = 72
+    pygame.draw.rect(screen, (10, 10, 22), (x0, y, W - PAD * 2, ah), border_radius=4)
+    pygame.draw.rect(screen, (35, 35, 65), (x0, y, W - PAD * 2, ah), 1, border_radius=4)
+    at = f_caps.render("AUTONOMY TRACE", True, C_ACCENT)
+    screen.blit(at, (x0 + 7, y + 6))
+    ty = y + 22
+    if trace_items:
+        for item in trace_items:
+            stage = str(item.get("stage", "?"))[:8]
+            detail = str(item.get("detail", ""))[:46]
+            stage_s = f_small.render(stage, True, C_ACCENT)
+            detail_s = f_small.render(detail, True, (190, 190, 210))
+            screen.blit(stage_s, (x0 + 7, ty))
+            screen.blit(detail_s, (x0 + 68, ty))
+            ty += 11
+    else:
+        empty = f_small.render("Waiting for a mission...", True, C_DIM)
+        screen.blit(empty, (x0 + 7, ty + 4))
+    y += ah + 8
+
     # ── Divider ───────────────────────────────────────────────────────────
     pygame.draw.line(screen, C_PANEL_EDGE, (x0, y), (PANEL_X + W - PAD, y))
     y += 8
 
     # ── AGENT REASONING header ─────────────────────────────────────────────
-    ar = f_body.render("AGENT REASONING", True, C_ACCENT)
+    ar = f_body.render("DECISION RATIONALE", True, C_ACCENT)
     screen.blit(ar, (x0, y))
     tk = f_small.render(f"tick {world_state.get('tick', 0)}  {speed}x", True, C_DIM)
     screen.blit(tk, (PANEL_X + W - PAD - tk.get_width(), y + 2))

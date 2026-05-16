@@ -2,6 +2,30 @@
 
 Multi-agent factory simulation where autonomous robots coordinate through a shared blackboard, powered by NVIDIA Nemotron models running on an ASUS Ascent GX10.
 
+## Demo Story
+
+FactoryMind is designed to show agent autonomy through action, not static chat.
+Give it a command like:
+
+```bash
+deliver 6 Parts to QA as fast as possible
+```
+
+The system interprets the mission, creates executable delivery tasks, runs
+route-cost tools against the live factory state, compares single-robot ETA
+against multi-agent ETA, assigns worker robots, posts each agent's decision
+rationale, adapts with a strategist directive, and records the observed
+strategy in SQLite memory for future runs.
+
+The side panel makes this visible:
+
+| Signal | What judges should see |
+|--------|-------------------------|
+| `SPEEDUP` | Estimated solo ETA vs team ETA, e.g. `96->31 steps` and `3.1x` |
+| `AUTONOMY TRACE` | Observe, plan, act, adapt, and measure stages |
+| `DECISION RATIONALE` | Leader, worker, strategist, tool, and memory evidence |
+| `Powered by NVIDIA NIM` | Nemotron-Nano workers/leaders and Nemotron-Super strategist |
+
 ## Team Roles
 
 | Person | File(s) | Responsibility |
@@ -133,6 +157,20 @@ USE_LOCAL_NIM=true GX10_IP=localhost ./scripts/verify_local.sh
 ./scripts/reset_demo.sh              # undo + stop NIM containers
 ```
 
+**NemoClaw / runtime policy demo**
+
+```bash
+./scripts/run_with_nemoclaw.sh
+```
+
+This wrapper looks for `nemoclaw` first, then falls back to `firejail`, then a
+plain run with policy logging. The policy in `scripts/nemoclaw_policy.yaml`
+restricts agent network access to local NIM ports `8000` and `8001`, limits
+filesystem writes to the memory DB and logs, and records policy evidence in
+`logs/nemoclaw.log`. For judging, use this as the safety/governance artifact:
+the agents can act, but only through the approved local model endpoints and
+project resources.
+
 SSH note: `gx10-d8fb` is a short hostname that won't resolve outside the lab's DNS. Use the GX10's **IP** from event organizers.
 
 ---
@@ -179,6 +217,23 @@ SSH note: `gx10-d8fb` is a short hostname that won't resolve outside the lab's D
         "completed": int,
         "elapsed": float,   # seconds
         "rate": float,      # tasks per minute
+        "eta_solo_steps": int | None,
+        "eta_team_steps": int | None,
+        "eta_speedup": float | None,
+    },
+    "autonomy": {
+        "trace": [
+            {"stage": str, "detail": str, "timestamp": float},
+            ...
+        ],
+        "eta": {
+            "solo_steps": int | None,
+            "team_steps": int | None,
+            "speedup": float | None,
+            "workers": int,
+            "tasks": int,
+            "summary": str,
+        },
     },
     "connection_status": str,  # "online" | "offline"
     "tick": int,

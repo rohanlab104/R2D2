@@ -84,8 +84,20 @@
   .type-COMPLETE   { color: var(--ok); }
   .type-INTENT     { color: #b0b0c0; }
   .type-REASONING  { color: var(--strategy); }
+  .type-TRACE      { color: var(--accent); }
+  .type-TOOL       { color: #78b4ff; }
+  .type-FOUND      { color: var(--accent); }
   .type-ERROR      { color: var(--error); }
   .type-USER       { color: #fff; font-weight: 700; }
+  #trace {
+    background: #0a0a18;
+    border: 1px solid var(--edge); border-radius: 4px;
+    padding: 7px; min-height: 82px;
+    font-size: 10px; line-height: 1.35;
+  }
+  #trace .trace-row { display: grid; grid-template-columns: 62px 1fr; gap: 6px; padding: 1px 0; }
+  #trace .stage { color: var(--accent); font-weight: 700; }
+  #trace .detail { color: #c8c8d8; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   #chat-row { display: flex; gap: 6px; }
   #chat-input {
     flex: 1;
@@ -153,9 +165,9 @@
     <div class="tile"><div class="label">TIME</div>     <div class="value" id="s-time">00:00</div></div>
     <div class="tile"><div class="label">RATE/MIN</div> <div class="value" id="s-rate">0.0</div></div>
     <div class="tile">
-      <div class="label">LAST ROUTE</div>
-      <div class="value" id="s-last">--</div>
-      <div class="sub" id="s-avg"></div>
+      <div class="label">SPEEDUP</div>
+      <div class="value" id="s-speedup">--</div>
+      <div class="sub" id="s-eta"></div>
     </div>
   </div>
 
@@ -173,7 +185,11 @@
   <div id="endpoints">connecting…</div>
 
   <hr class="rule" />
-  <div style="color: var(--accent); font-size: 11px; letter-spacing: 0.08em;">AGENT REASONING</div>
+  <div style="color: var(--accent); font-size: 11px; letter-spacing: 0.08em;">AUTONOMY TRACE</div>
+  <div id="trace"></div>
+
+  <hr class="rule" />
+  <div style="color: var(--accent); font-size: 11px; letter-spacing: 0.08em;">DECISION RATIONALE</div>
   <div id="log"></div>
 
   <div id="chat-row">
@@ -528,10 +544,12 @@ function updateHUD(world, info) {
   document.getElementById("s-completed").textContent = stats.completed ?? 0;
   document.getElementById("s-time").textContent      = fmtTime(stats.elapsed ?? 0);
   document.getElementById("s-rate").textContent      = (stats.rate ?? 0).toFixed(1);
-  document.getElementById("s-last").textContent      =
-    stats.last_route_time != null ? `${stats.last_route_time.toFixed(2)}s` : "--";
-  document.getElementById("s-avg").textContent       =
-    stats.avg_route_time != null ? `avg ${stats.avg_route_time.toFixed(1)}s` : "";
+  document.getElementById("s-speedup").textContent   =
+    stats.eta_speedup != null ? `${Number(stats.eta_speedup).toFixed(1)}x` : "--";
+  document.getElementById("s-eta").textContent       =
+    stats.eta_solo_steps != null && stats.eta_team_steps != null
+      ? `${stats.eta_solo_steps}->${stats.eta_team_steps} steps`
+      : "";
 
   const speed = world.speed_multiplier ?? 1;
   document.getElementById("btn-speed").textContent = `SPEED ${speed}x →`;
@@ -557,6 +575,29 @@ function updateHUD(world, info) {
 
   if (info && info.endpoints) {
     document.getElementById("endpoints").textContent = info.endpoints;
+  }
+
+  const trace = document.getElementById("trace");
+  const traceItems = ((world.autonomy ?? {}).trace ?? []).slice(-4);
+  const traceSig = traceItems.length + ":" + (traceItems[traceItems.length - 1]?.timestamp ?? 0);
+  if (trace.dataset.sig !== traceSig) {
+    trace.dataset.sig = traceSig;
+    trace.innerHTML = "";
+    if (!traceItems.length) {
+      const row = document.createElement("div");
+      row.className = "trace-row";
+      row.innerHTML = `<span class="stage">IDLE</span><span class="detail">Waiting for a mission...</span>`;
+      trace.appendChild(row);
+    } else {
+      for (const item of traceItems) {
+        const row = document.createElement("div");
+        row.className = "trace-row";
+        row.innerHTML =
+          `<span class="stage">${escapeHtml(String(item.stage || "?").slice(0, 8))}</span>` +
+          `<span class="detail">${escapeHtml(String(item.detail || "").slice(0, 110))}</span>`;
+        trace.appendChild(row);
+      }
+    }
   }
 
   const log = document.getElementById("log");

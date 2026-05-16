@@ -14,6 +14,8 @@ INTENT = "INTENT"
 BOTTLENECK = "BOTTLENECK"
 STRATEGY = "STRATEGY"
 COMPLETE = "COMPLETE"
+TRACE = "TRACE"
+TOOL = "TOOL"
 
 # ---------------------------------------------------------------------------
 # Robot roles
@@ -95,6 +97,7 @@ def create_initial_state(
         "layout":      str,
         "wall":        [[x, y], ...],
         "stats":       {"completed": 0, "elapsed": 0.0, "rate": 0.0},
+        "autonomy":    {"trace": [], "eta": {}},
         "connection_status": "online",
         "spawn_positions": [list(sp) for sp in _SPAWN_POSITIONS[:num_leaders + num_workers]],
         "tick":        0,
@@ -134,7 +137,26 @@ def create_initial_state(
         "blackboard": [],
         "layout": layout,
         "wall": _make_wall(layout),
-        "stats": {"completed": 0, "elapsed": 0.0, "rate": 0.0},
+        "stats": {
+            "completed": 0,
+            "elapsed": 0.0,
+            "rate": 0.0,
+            "eta_solo_steps": None,
+            "eta_team_steps": None,
+            "eta_speedup": None,
+        },
+        "autonomy": {
+            "trace": [],
+            "eta": {
+                "solo_steps": None,
+                "team_steps": None,
+                "speedup": None,
+                "workers": 0,
+                "tasks": 0,
+                "summary": "",
+            },
+            "batch_complete_posted": False,
+        },
         "connection_status": "online",
         "tick": 0,
     }
