@@ -21,7 +21,7 @@ from factorymind.agents import Blackboard
 from factorymind.state import GRID_HEIGHT, GRID_WIDTH, OPEN_FLOOR
 
 FPS = 60
-MOVE_TICK_INTERVAL = 0.18
+MOVE_TICK_INTERVAL = 0.12
 LEADER_TICK_INTERVAL = 1.25
 FACTORY_TICK_INTERVAL = 0.05
 CONVEYOR_SPEED = 0.45
@@ -848,6 +848,99 @@ def _place_worker(world_state: dict, cell: list[int]) -> None:
     world_state["robots"].append(worker)
 
 
+def _remove_asset(world_state: dict, cell: list[int]) -> None:
+    worker = next((w for w in world_state.get("workers", []) if w.get("pos") == cell), None)
+    if worker:
+        _release_removed_worker(world_state, worker, return_package=True)
+        world_state["workers"] = [w for w in world_state.get("workers", []) if w.get("id") != worker.get("id")]
+        world_state["robots"] = [world_state.get("leader")] + world_state["workers"]
+        return
+
+    factory = _factory_at_cell(world_state, cell)
+    if factory:
+        _remove_factory(world_state, factory)
+        return
+
+    dropbox = _dropbox_at_cell(world_state, cell)
+    if dropbox:
+        _remove_dropbox(world_state, dropbox)
+        return
+
+    if cell in world_state.get("wall", []):
+        world_state["wall"].remove(cell)
+
+
+def _factory_at_cell(world_state: dict, cell: list[int]) -> dict | None:
+    x, y = cell
+    for factory in world_state.get("factories", []):
+        fx, fy = factory.get("pos", [0, 0])
+        width = 3 + int(factory.get("belt_length", 5))
+        if fx <= x < fx + width and fy <= y < fy + 3:
+            return factory
+    return None
+
+
+def _dropbox_at_cell(world_state: dict, cell: list[int]) -> dict | None:
+    x, y = cell
+    for dropbox in world_state.get("dropboxes", []):
+        bx, by = dropbox.get("pos", [0, 0])
+        width, height = _rotated_footprint(3, 2, float(dropbox.get("rotation_y") or 0.0))
+        if bx <= x < bx + width and by <= y < by + height:
+            return dropbox
+    return None
+
+
+def _remove_factory(world_state: dict, factory: dict) -> None:
+    factory_id = factory.get("id")
+    for worker in world_state.get("workers", []):
+        if worker.get("target_factory_id") == factory_id or (worker.get("carrying") or {}).get("factory_id") == factory_id:
+            _release_removed_worker(world_state, worker, return_package=False)
+    for task in world_state.get("tasks", []):
+        if task.get("factory_id") == factory_id and task.get("status") not in {"done", "blocked"}:
+            task["status"] = "blocked"
+    world_state["packages"] = [
+        package for package in world_state.get("packages", [])
+        if package.get("factory_id") != factory_id
+    ]
+    world_state["factories"] = [f for f in world_state.get("factories", []) if f.get("id") != factory_id]
+    world_state["workstations"] = copy.deepcopy(world_state["factories"])
+
+
+def _remove_dropbox(world_state: dict, dropbox: dict) -> None:
+    dropbox_id = dropbox.get("id")
+    for worker in world_state.get("workers", []):
+        if worker.get("target_dropbox_id") == dropbox_id:
+            _release_removed_worker(world_state, worker, return_package=True)
+    for task in world_state.get("tasks", []):
+        if task.get("dropbox_id") == dropbox_id and task.get("status") not in {"done", "blocked"}:
+            task["status"] = "blocked"
+    world_state["dropboxes"] = [b for b in world_state.get("dropboxes", []) if b.get("id") != dropbox_id]
+
+
+def _release_removed_worker(world_state: dict, worker: dict, return_package: bool) -> None:
+    carrying = worker.get("carrying")
+    if carrying and return_package:
+        factory = _factory_by_id(world_state, carrying.get("factory_id"))
+        if factory:
+            carrying["status"] = "pad"
+            carrying["reserved_by"] = None
+            factory.setdefault("pad_packages", []).append(carrying)
+    for factory in world_state.get("factories", []):
+        for package in factory.get("pad_packages", []):
+            if package.get("reserved_by") == worker.get("id"):
+                package["reserved_by"] = None
+    task = _task_by_id(world_state, worker.get("current_task"))
+    if task and task.get("status") not in {"done", "blocked"}:
+        task["status"] = "blocked"
+    worker["carrying"] = None
+    worker["current_task"] = None
+    worker["target_factory_id"] = None
+    worker["target_dropbox_id"] = None
+    worker["task_started_at"] = None
+    worker["status"] = "idle"
+    worker["path"] = []
+
+
 def _handle_builder_action(world_state: dict, action: dict) -> None:
     action_type = action.get("type")
     if action_type == "wall_add":
@@ -866,6 +959,8 @@ def _handle_builder_action(world_state: dict, action: dict) -> None:
         _place_dropbox(world_state, action["cell"], color, _rotation_y_from_action(action))
     elif action_type == "place_worker":
         _place_worker(world_state, action["cell"])
+    elif action_type == "remove_asset":
+        _remove_asset(world_state, action["cell"])
 
 
 def _next_dropbox_color(world_state: dict) -> str:

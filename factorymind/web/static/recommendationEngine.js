@@ -18,7 +18,7 @@ export function buildRecommendations(metrics, world) {
       : "Widen the busiest aisle or move shelves away from the main route.");
   }
   if (average >= 12) {
-    recommendations.push("Move at least one drop bin closer to the intake conveyors to reduce average delivery time.");
+    recommendations.push("Move at least one drop box closer to the intake conveyors to reduce average delivery time.");
   }
   if ((world.chargers || []).length === 0 && (world.workers || []).length > 6) {
     recommendations.push("Add or mark charger zones for larger fleets so the demo can show resilience planning.");

@@ -232,7 +232,7 @@ def _handle_web_action(
         world_state["ui_mode"] = "builder" if kind == "mode_builder" else "cursor"
     elif isinstance(kind, str) and kind.startswith("builder_"):
         world_state["builder_mode"] = kind.replace("builder_", "")
-    elif kind in {"wall_add", "wall_remove", "place_factory", "place_dropbox", "place_worker"}:
+    elif kind in {"wall_add", "wall_remove", "place_factory", "place_dropbox", "place_worker", "remove_asset"}:
         M._handle_builder_action(world_state, action)
     elif kind == "apply_layout":
         new_state = _state_from_uploaded_layout(
@@ -334,7 +334,7 @@ def _state_from_uploaded_layout(
                 if used_ref:
                     unused_conveyor_refs.remove(used_ref)
         pos = _clamp_dropbox_pos([int(bin_obj.get("x", 40)), int(bin_obj.get("y", 8))])
-        box = M.S.make_dropbox(f"DropBin-{index + 1}-{color}", pos, color, index)
+        box = M.S.make_dropbox(f"DropBox-{index + 1}-{color}", pos, color, index)
         world_state["dropboxes"].append(box)
         _clear_asset_cells(world_state["wall"], pos, 3, 2)
 
@@ -343,7 +343,7 @@ def _state_from_uploaded_layout(
         factory["produce_every"] = _produce_every_for_volume(order_volume)
         world_state["factories"].append(factory)
     if not world_state["dropboxes"]:
-        world_state["dropboxes"].append(M.S.make_dropbox("DropBin-1-Red", [40, 8], colors[0], 0))
+        world_state["dropboxes"].append(M.S.make_dropbox("DropBox-1-Red", [40, 8], colors[0], 0))
 
     spawn_cells = _component_cells(worker_spawns) or [[M.GRID_WIDTH // 2, M.GRID_HEIGHT - 7]]
     workers = []

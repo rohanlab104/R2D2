@@ -83,6 +83,27 @@ def test_builder_stores_rotated_dropbox() -> None:
     assert math.isclose(world_state["dropboxes"][-1]["rotation_y"], math.pi / 2)
 
 
+def test_builder_remove_asset_removes_sim_objects() -> None:
+    world_state = create_initial_state()
+
+    shelf_cell = list(world_state["wall"][0])
+    _handle_builder_action(world_state, {"type": "remove_asset", "cell": shelf_cell})
+    assert shelf_cell not in world_state["wall"]
+
+    worker = world_state["workers"][0]
+    _handle_builder_action(world_state, {"type": "remove_asset", "cell": list(worker["pos"])})
+    assert all(item["id"] != worker["id"] for item in world_state["workers"])
+    assert all(item["id"] != worker["id"] for item in world_state["robots"] if item.get("role") == "WORKER")
+
+    factory = world_state["factories"][0]
+    _handle_builder_action(world_state, {"type": "remove_asset", "cell": list(factory["pos"])})
+    assert all(item["id"] != factory["id"] for item in world_state["factories"])
+
+    dropbox = world_state["dropboxes"][0]
+    _handle_builder_action(world_state, {"type": "remove_asset", "cell": list(dropbox["pos"])})
+    assert all(item["id"] != dropbox["id"] for item in world_state["dropboxes"])
+
+
 def test_uploaded_generic_bins_match_nearest_conveyor_color() -> None:
     action = {
         "type": "apply_layout",
