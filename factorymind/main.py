@@ -26,7 +26,13 @@ import pygame
 from factorymind import state as S
 from factorymind import render as R
 from factorymind import memory as M
-from factorymind.agents import Blackboard, leader_decide, strategist_decide, worker_step
+from factorymind.agents import (
+    Blackboard,
+    choose_worker_task,
+    leader_decide,
+    strategist_decide,
+    worker_step,
+)
 from factorymind.state import (
     LEADER, WORKER, OPEN_FLOOR, BOTTLENECK_BRIDGE,
     GRID_WIDTH, GRID_HEIGHT,
@@ -158,6 +164,15 @@ def _advance_robot(robot: dict, world_state: dict) -> None:
 
 def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
     """Assign a task to a robot and compute its initial path to the pickup."""
+    previous_assignee = task.get("assigned_to")
+    if previous_assignee is not None and previous_assignee != robot["id"]:
+        previous_robot = next(
+            (r for r in world_state["robots"] if r["id"] == previous_assignee),
+            None,
+        )
+        if previous_robot and previous_robot.get("current_task") == task["id"]:
+            previous_robot["current_task"] = None
+            previous_robot["path"] = []
     task["status"] = "open"  # will become claimed
     task["assigned_to"] = robot["id"]
     robot["current_task"] = task["id"]
@@ -238,17 +253,21 @@ def main() -> None:
                     from factorymind.state import CLAIM
                     blackboard.post(leader["id"], CLAIM, msg)
 
-                # Also assign idle workers to open tasks
-                open_tasks = [
-                    t for t in world_state["tasks"]
-                    if t["status"] == "open" and t.get("assigned_to") is None
-                ]
                 idle_workers = [
                     r for r in world_state["robots"]
                     if r["role"] == WORKER and r.get("current_task") is None and not r.get("path")
                 ]
-                for worker, task in zip(idle_workers, open_tasks):
-                    _assign_task_to_robot(worker, task, world_state)
+                for worker in idle_workers:
+                    task_id = choose_worker_task(worker, world_state, blackboard)
+                    if task_id is None:
+                        continue
+                    task = next(
+                        (t for t in world_state["tasks"]
+                         if t["id"] == task_id and t["status"] == "open"),
+                        None,
+                    )
+                    if task:
+                        _assign_task_to_robot(worker, task, world_state)
 
             last_leader_tick = now
 
@@ -257,13 +276,19 @@ def main() -> None:
             retrieved = M.retrieve_strategies(world_state["layout"])
             decision = strategist_decide(world_state, blackboard, retrieved)
             if decision.get("should_post"):
-                from factorymind.state import STRATEGY
-                blackboard.post(-1, STRATEGY, decision.get("directive", ""))
+                from factorymind.state import BOTTLENECK, STRATEGY
+                directive = decision.get("directive", "")
+                msg_type = BOTTLENECK if "bottleneck" in directive.lower() else STRATEGY
+                blackboard.post(-1, msg_type, directive)
             last_strategist_tick = now
 
         # --- Movement tick ---
         if now - last_move_tick >= MOVE_TICK_INTERVAL:
             for robot in world_state["robots"]:
+                if robot["role"] == WORKER:
+                    next_pos = worker_step(robot, world_state, blackboard)
+                    if robot.get("path") and next_pos != robot["path"][0]:
+                        robot["path"].insert(0, next_pos)
                 _advance_robot(robot, world_state)
             last_move_tick = now
 

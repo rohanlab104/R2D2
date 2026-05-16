@@ -22,6 +22,9 @@ GX10_IP                 : "localhost" when running on GX10 (default), or the
                           GX10 IP / SSH-tunneled host from a remote machine.
 NIM_LEADER_BASE_URL     : Override leader endpoint (default http://{GX10_IP}:8000/v1).
 NIM_STRATEGIST_BASE_URL : Override strategist endpoint (default http://{GX10_IP}:8001/v1).
+LOCAL_NIM_BASE_URL      : Shared local endpoint override for both roles.
+LEADER_MODEL            : Override leader model id.
+STRATEGIST_MODEL        : Override strategist model id.
 NGC_API_KEY             : For docker login / NIM image pulls (often == NVIDIA_API_KEY).
 """
 
@@ -41,30 +44,43 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-LEADER_MODEL = "nvidia/nvidia-nemotron-nano-9b-v2"
-STRATEGIST_MODEL = "nvidia/llama-3_3-nemotron-super-49b-v1_5"
+LEADER_MODEL = os.getenv("LEADER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
+STRATEGIST_MODEL = os.getenv(
+    "STRATEGIST_MODEL",
+    "nvidia/llama-3_3-nemotron-super-49b-v1_5",
+)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 USE_LOCAL = os.getenv("USE_LOCAL_NIM", "false").lower() == "true"
 GX10_IP = os.getenv("GX10_IP", "localhost").strip() or "localhost"
-_CLOUD_URL = "https://integrate.api.nvidia.com/v1"
+_CLOUD_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
+_SHARED_LOCAL_URL = (
+    os.getenv("LOCAL_NIM_BASE_URL")
+    or os.getenv("NIM_BASE_URL")
+    or ""
+).rstrip("/")
 _API_KEY = os.getenv("NVIDIA_API_KEY") or "no-key-needed-for-local"
 
 
 def _leader_base_url() -> str:
     if not USE_LOCAL:
         return _CLOUD_URL
-    return os.getenv("NIM_LEADER_BASE_URL", f"http://{GX10_IP}:8000/v1").rstrip("/")
+    return (
+        os.getenv("NIM_LEADER_BASE_URL")
+        or _SHARED_LOCAL_URL
+        or f"http://{GX10_IP}:8000/v1"
+    ).rstrip("/")
 
 
 def _strategist_base_url() -> str:
     if not USE_LOCAL:
         return _CLOUD_URL
-    return os.getenv(
-        "NIM_STRATEGIST_BASE_URL",
-        f"http://{GX10_IP}:8001/v1",
+    return (
+        os.getenv("NIM_STRATEGIST_BASE_URL")
+        or _SHARED_LOCAL_URL
+        or f"http://{GX10_IP}:8001/v1"
     ).rstrip("/")
 
 
