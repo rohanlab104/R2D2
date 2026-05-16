@@ -165,6 +165,9 @@ def make_worker(worker_id: int, pos: list[int]) -> dict:
         "target_factory_id": None,
         "target_dropbox_id": None,
         "task_started_at": None,
+        "last_llm_intent": None,
+        "last_llm_reason": None,
+        "llm_decisions": 0,
     }
 
 

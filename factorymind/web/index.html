@@ -822,6 +822,8 @@ function updatePanel(world, info) {
   updateRecommendations(world);
 }
 function workerStatus(w, world) {
+  if (w.llm_pending) return `worker LLM: ${w.llm_pending}`;
+  if (w.last_llm_intent) return `${w.last_llm_intent}: ${w.last_llm_reason || "local worker model"}`;
   if (w.status === "to_pickup") return `to ${(world.factories || []).find(f => f.id === w.target_factory_id)?.name || "intake"}`;
   if (w.status === "to_dropbox") return `delivering to ${(world.dropboxes || []).find(b => b.id === w.target_dropbox_id)?.name || "dock"}`;
   if (w.status === "disabled") return "faulted / removed";

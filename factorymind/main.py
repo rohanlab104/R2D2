@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import heapq
+import json
 import os
 import socket
 import sys
@@ -32,6 +33,7 @@ TRAFFIC_REPLAN_TICKS = 8
 
 _decision_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="openclaw")
 _pending_leader: Future | None = None
+_pending_worker_llm: dict[tuple[int, str, int], Future] = {}
 _task_counter = 0
 
 POLICY_PATH = Path("scripts/nemoclaw_policy.yaml")
@@ -330,6 +332,125 @@ def _leader_decide_autonomous(world_state: dict) -> dict:
     return {"assignments": assignments, "thought": thought, "warning": ""}
 
 
+def _worker_llm_enabled(world_state: dict) -> bool:
+    return (
+        bool(world_state.get("llm_ready"))
+        and os.getenv("FACTORYMIND_DISABLE_LLM", "false").lower() != "true"
+        and os.getenv("FACTORYMIND_DISABLE_WORKER_LLM", "false").lower() != "true"
+    )
+
+
+def _worker_llm_prompt(snapshot: dict) -> str:
+    return f"""You are an autonomous warehouse worker bot running on the local GX10 worker model.
+Choose a safe high-level intent for your next action. Deterministic pathfinding and NemoClaw policy execute the actual movement.
+
+Guardrails:
+- Never request direct coordinate teleporting.
+- Never pick up except at your assigned conveyor pad.
+- Never deliver except to your assigned same-color drop bin.
+- If blocked, choose wait or reroute only.
+- Return compact JSON only.
+
+Worker decision context:
+{json.dumps(snapshot, sort_keys=True)}
+
+Return JSON only:
+{{"intent":"accept_task|reroute|wait|deliver|complete","reason":"short operational reason","confidence":0.0}}
+"""
+
+
+def _worker_decide_llm(snapshot: dict) -> dict:
+    from factorymind import inference
+
+    raw = inference.ask_worker(_worker_llm_prompt(snapshot))
+    parsed = inference.safe_parse_json(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("worker LLM did not return a JSON object")
+    allowed = {"accept_task", "reroute", "wait", "deliver", "complete"}
+    intent = str(parsed.get("intent") or snapshot.get("default_intent") or "wait").strip().lower()
+    if intent not in allowed:
+        intent = str(snapshot.get("default_intent") or "wait")
+    reason = str(parsed.get("reason") or "Worker local model produced an intent.").strip()
+    try:
+        confidence = float(parsed.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    return {
+        "worker_id": snapshot["worker_id"],
+        "worker_name": snapshot["worker_name"],
+        "event": snapshot["event"],
+        "task_id": snapshot.get("task_id"),
+        "intent": intent,
+        "reason": reason[:160],
+        "confidence": max(0.0, min(confidence, 1.0)),
+    }
+
+
+def _submit_worker_llm_decision(world_state: dict, worker: dict, event: str, payload: dict) -> None:
+    if not _worker_llm_enabled(world_state):
+        return
+    task_id = int(worker.get("current_task") if worker.get("current_task") is not None else -1)
+    key = (int(worker["id"]), event, task_id)
+    if key in _pending_worker_llm:
+        return
+    snapshot = {
+        "worker_id": worker["id"],
+        "worker_name": worker.get("name", f"Worker-{worker['id']}"),
+        "event": event,
+        "default_intent": payload.get("default_intent", "wait"),
+        "task_id": worker.get("current_task"),
+        "status": worker.get("status"),
+        "pos": worker.get("pos"),
+        "target_factory_id": worker.get("target_factory_id"),
+        "target_dropbox_id": worker.get("target_dropbox_id"),
+        "carrying_color": (worker.get("carrying") or {}).get("color"),
+        "path_remaining": len(worker.get("path") or []),
+        "payload": payload,
+    }
+    _pending_worker_llm[key] = _decision_executor.submit(_worker_decide_llm, snapshot)
+    worker["llm_pending"] = event
+    _policy_log(world_state, worker.get("name", "Worker"), "worker_llm_submit", True, f"{event} -> local worker model")
+
+
+def _drain_worker_llm_decisions(world_state: dict, blackboard: Blackboard, elapsed: float) -> None:
+    for key, future in list(_pending_worker_llm.items()):
+        if not future.done():
+            continue
+        _pending_worker_llm.pop(key, None)
+        try:
+            decision = future.result()
+        except Exception as exc:
+            worker = _worker_by_id(world_state, key[0])
+            if worker:
+                worker["llm_pending"] = None
+                worker["last_llm_error"] = str(exc)[:120]
+                _thought(world_state, S.WARNING, worker["name"], f"Worker LLM unavailable; deterministic behavior continues ({exc}).", elapsed, blackboard)
+                _policy_log(world_state, worker["name"], "worker_llm_result", False, str(exc)[:180])
+            continue
+        worker = _worker_by_id(world_state, int(decision["worker_id"]))
+        if not worker:
+            continue
+        worker["llm_pending"] = None
+        worker["last_llm_intent"] = decision["intent"]
+        worker["last_llm_reason"] = decision["reason"]
+        worker["llm_decisions"] = int(worker.get("llm_decisions", 0)) + 1
+        _thought(
+            world_state,
+            S.INTENT,
+            worker.get("name", decision["worker_name"]),
+            f"LLM intent={decision['intent']} ({decision['reason']})",
+            elapsed,
+            blackboard,
+        )
+        _policy_log(
+            world_state,
+            worker.get("name", decision["worker_name"]),
+            "worker_llm_result",
+            True,
+            f"{decision['event']} -> {decision['intent']} confidence={decision['confidence']:.2f}",
+        )
+
+
 def _validate_llm_assignments(world_state: dict, proposed: object) -> list[dict]:
     if not isinstance(proposed, list):
         return []
@@ -495,6 +616,19 @@ def _assign_worker_to_package(world_state: dict, assignment: dict,
     worker["path"] = path
     content = f"{worker['name']} -> {factory['name']} ({assignment.get('reason')}); then {dropbox['name']}"
     _thought(world_state, S.ASSIGN, "Leader", content[:120], elapsed, blackboard)
+    _submit_worker_llm_decision(
+        world_state,
+        worker,
+        "task_accept",
+        {
+            "default_intent": "accept_task",
+            "package_color": package["color"],
+            "pickup": factory["drop_pad"],
+            "dropoff": dropbox["pos"],
+            "route_cells_to_pickup": len(path),
+            "leader_reason": str(assignment.get("reason") or ""),
+        },
+    )
     return True
 
 
@@ -522,6 +656,16 @@ def _move_workers(world_state: dict, elapsed: float, blackboard: Blackboard) -> 
             if worker["traffic_wait_ticks"] >= TRAFFIC_REPLAN_TICKS:
                 worker["traffic_wait_ticks"] = 0
                 blockers = _dynamic_blockers(world_state, worker)
+                _submit_worker_llm_decision(
+                    world_state,
+                    worker,
+                    "traffic_conflict",
+                    {
+                        "default_intent": "reroute",
+                        "blocked_by_worker_id": blocker_id,
+                        "blocked_cell": next_pos,
+                    },
+                )
                 if _replan_worker(world_state, worker, elapsed, blackboard, blockers):
                     _thought(
                         world_state,
@@ -631,6 +775,17 @@ def _pickup_package(world_state: dict, worker: dict, factory: dict,
     dropbox = _dropbox_by_id(world_state, worker.get("target_dropbox_id"))
     if dropbox:
         worker["path"] = a_star(worker["pos"], dropbox["pos"], {tuple(c) for c in world_state.get("wall", [])})
+        _submit_worker_llm_decision(
+            world_state,
+            worker,
+            "delivery_start",
+            {
+                "default_intent": "deliver",
+                "package_color": package["color"],
+                "dropbox": dropbox["name"],
+                "route_cells_to_dropoff": len(worker.get("path") or []),
+            },
+        )
         if worker["pos"] != dropbox["pos"] and not worker["path"]:
             package["status"] = "pad"
             package["reserved_by"] = None
@@ -678,6 +833,17 @@ def _drop_package(world_state: dict, worker: dict, dropbox: dict,
         f"delivered {package['color']} package to {dropbox['name']} [{route_time:.2f}s]",
         elapsed,
         blackboard,
+    )
+    _submit_worker_llm_decision(
+        world_state,
+        worker,
+        "task_complete",
+        {
+            "default_intent": "complete",
+            "package_color": package["color"],
+            "dropbox": dropbox["name"],
+            "route_time": route_time,
+        },
     )
     worker["carrying"] = None
     worker["current_task"] = None
@@ -1081,6 +1247,7 @@ def run_pygame() -> None:
                     "warning": f"Leader planner failed; deterministic policy planner used ({exc}).",
                 }
             _apply_leader_plan(world_state, plan, blackboard, now)
+        _drain_worker_llm_decisions(world_state, blackboard, now)
 
         if world_state.get("running"):
             if now - last_factory_tick >= FACTORY_TICK_INTERVAL:
@@ -1126,6 +1293,9 @@ def _cancel_pending_decisions() -> None:
     if _pending_leader is not None:
         _pending_leader.cancel()
         _pending_leader = None
+    for future in _pending_worker_llm.values():
+        future.cancel()
+    _pending_worker_llm.clear()
 
 
 def main() -> None:

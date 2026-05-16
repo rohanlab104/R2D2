@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import math
+import time
 
+from factorymind import main as M
 from factorymind.agents import Blackboard
 from factorymind.main import (
     _apply_leader_plan,
+    _drain_worker_llm_decisions,
     _deterministic_assignments,
     _handle_builder_action,
     _make_package,
@@ -214,3 +217,44 @@ def test_worker_replans_around_traffic_blocker() -> None:
     assert worker["path"]
     assert worker["path"][0] != [11, 10]
     assert any("rerouting around occupied cells" in event["content"] for event in world_state["thought_log"])
+
+
+def test_worker_llm_runs_on_task_assignment(monkeypatch) -> None:
+    world_state = create_initial_state()
+    world_state["llm_ready"] = True
+    blackboard = Blackboard()
+    factory = world_state["factories"][0]
+
+    package = _make_package(world_state, factory)
+    package["status"] = "pad"
+    package["progress"] = factory["belt_length"]
+    factory["pad_packages"].append(package)
+
+    calls = []
+
+    def fake_worker(prompt: str) -> str:
+        calls.append(prompt)
+        return '{"intent":"accept_task","reason":"route is clear and package matches bin","confidence":0.91}'
+
+    monkeypatch.setattr("factorymind.inference.ask_worker", fake_worker)
+    _apply_leader_plan(
+        world_state,
+        {"assignments": _deterministic_assignments(world_state), "thought": "", "warning": ""},
+        blackboard,
+        elapsed=0.0,
+    )
+
+    worker = world_state["workers"][0]
+    for _ in range(25):
+        _drain_worker_llm_decisions(world_state, blackboard, elapsed=0.1)
+        if worker.get("last_llm_intent"):
+            break
+        time.sleep(0.01)
+
+    try:
+        assert calls
+        assert worker["last_llm_intent"] == "accept_task"
+        assert worker["llm_decisions"] == 1
+        assert any(event["type"] == "INTENT" and "LLM intent=accept_task" in event["content"] for event in world_state["thought_log"])
+    finally:
+        M._cancel_pending_decisions()

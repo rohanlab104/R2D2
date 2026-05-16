@@ -122,8 +122,9 @@ def run() -> None:
                         "assignments": M._deterministic_assignments(copy.deepcopy(world_state)),
                         "thought": "",
                         "warning": f"Leader planner failed; deterministic policy planner used ({exc}).",
-                    }
+                }
                 M._apply_leader_plan(world_state, plan, blackboard, now)
+            M._drain_worker_llm_decisions(world_state, blackboard, now)
 
             if world_state.get("running"):
                 if now - last_factory_tick >= M.FACTORY_TICK_INTERVAL:
