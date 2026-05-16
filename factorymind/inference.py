@@ -44,7 +44,8 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-LEADER_MODEL = os.getenv("LEADER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
+LEADER_MODEL = os.getenv("LEADER_MODEL", "nvidia/llama-3_3-nemotron-super-49b-v1_5")
+WORKER_MODEL = os.getenv("WORKER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
 STRATEGIST_MODEL = os.getenv(
     "STRATEGIST_MODEL",
     "nvidia/llama-3_3-nemotron-super-49b-v1_5",
@@ -98,6 +99,7 @@ def _make_client(base_url: str) -> OpenAI:
 
 
 _leader_client = _make_client(_leader_base_url())
+_worker_client = _make_client(_leader_base_url())   # same endpoint, smaller model
 _strategist_client = _make_client(_strategist_base_url())
 
 
@@ -154,12 +156,22 @@ def ask_nemotron(
 # ---------------------------------------------------------------------------
 
 def ask_leader(prompt: str) -> str:
-    """Query the fast leader model (Nemotron Nano 9B)."""
+    """Query the leader model (Nemotron Super 49B)."""
     return ask_nemotron(
         prompt,
         model=LEADER_MODEL,
         max_tokens=256,
         client=_leader_client,
+    )
+
+
+def ask_worker(prompt: str) -> str:
+    """Query the fast worker model (Nemotron Nano 9B)."""
+    return ask_nemotron(
+        prompt,
+        model=WORKER_MODEL,
+        max_tokens=256,
+        client=_worker_client,
     )
 
 

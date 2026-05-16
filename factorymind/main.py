@@ -55,7 +55,7 @@ STRATEGIST_TICK_INTERVAL = 20.0
 TASK_SPAWN_INTERVAL = 1.2
 MOVE_TICK_INTERVAL = 0.05  # how often robots advance one step
 TARGET_ACTIVE_TASKS = 5
-SPEED_OPTIONS = (1, 2, 4)
+SPEED_OPTIONS = (1, 2, 3, 4)
 
 # Set ALL_AGENTS_LLM=false to fall back to the rule-based worker dispatcher
 # (cheaper, no per-worker NIM traffic). Default is true so every ball is its
@@ -75,6 +75,7 @@ _decision_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="agen
 _pending_leader: dict[int, Future] = {}
 _pending_worker: dict[int, Future] = {}
 _pending_strategist: Optional[Future] = None
+_sim_started: bool = False  # True once user sends first chat prompt
 
 # ---------------------------------------------------------------------------
 # A* pathfinding
@@ -157,7 +158,7 @@ def _spawn_task(world_state: dict) -> dict:
 # Robot movement helpers
 # ---------------------------------------------------------------------------
 
-def _advance_robot(robot: dict, world_state: dict) -> None:
+def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> None:
     """Move robot one cell along its pre-computed path, completing tasks as needed."""
     path = robot.get("path", [])
     if not path:
@@ -175,20 +176,38 @@ def _advance_robot(robot: dict, world_state: dict) -> None:
         return
 
     pos = robot["pos"]
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+
     # If at pickup and task not yet in transit
     if pos == task["pickup"] and task["status"] == "open":
         task["status"] = "in_transit"
-        robot["path"] = a_star(
-            pos, task["delivery"],
-            {tuple(c) for c in world_state.get("wall", [])}
-        )
+        robot["path"] = a_star(pos, task["delivery"], wall_set)
 
-    # If at delivery
+    # If at delivery — task done, return to spawn
     elif pos == task["delivery"] and task["status"] == "in_transit":
+        route_time = round(time.time() - task.get("started_at", time.time()), 2)
         task["status"] = "done"
         robot["current_task"] = None
-        robot["path"] = []
+
         world_state["stats"]["completed"] += 1
+        world_state["stats"]["last_route_time"] = route_time
+        count = world_state["stats"]["completed"]
+        prev_avg = world_state["stats"].get("avg_route_time", route_time)
+        world_state["stats"]["avg_route_time"] = round(
+            (prev_avg * (count - 1) + route_time) / count, 2
+        )
+
+        blackboard.post(
+            robot["id"], "COMPLETE",
+            f"task-{task['id']} {task.get('pickup_name','?')}→{task.get('delivery_name','?')} done",
+            route_time=route_time,
+        )
+
+        spawn = robot.get("spawn_pos")
+        if spawn and spawn != pos:
+            robot["path"] = a_star(pos, spawn, wall_set)
+        else:
+            robot["path"] = []
 
 
 def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
@@ -204,6 +223,7 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
             previous_robot["path"] = []
     task["status"] = "open"  # will become claimed
     task["assigned_to"] = robot["id"]
+    task["started_at"] = time.time()
     robot["current_task"] = task["id"]
     wall_set = {tuple(c) for c in world_state.get("wall", [])}
     robot["path"] = a_star(robot["pos"], task["pickup"], wall_set)
@@ -314,6 +334,9 @@ def _apply_leader_decision(
     msg = decision.get("post_message", "")
     if msg:
         blackboard.post(leader["id"], CLAIM, msg)
+    reasoning = str(decision.get("reasoning", "")).strip()
+    if reasoning:
+        blackboard.post(leader["id"], "REASONING", reasoning[:140])
 
 
 def _apply_worker_decision(
@@ -355,6 +378,9 @@ def _apply_worker_decision(
     msg = decision.get("post_message", "")
     if msg:
         blackboard.post(worker["id"], INTENT, msg)
+    reasoning = str(decision.get("reasoning", "")).strip()
+    if reasoning:
+        blackboard.post(worker["id"], "REASONING", reasoning[:140])
 
 
 def _assign_idle_workers(world_state: dict, blackboard: Blackboard) -> None:
@@ -391,6 +417,9 @@ def _apply_strategist_decision(
         return
     msg_type = BOTTLENECK if "bottleneck" in directive.lower() else STRATEGY
     blackboard.post(-1, msg_type, directive)
+    reasoning_text = str(decision.get("reasoning", "")).strip()
+    if reasoning_text:
+        blackboard.post(-1, "REASONING", reasoning_text[:140])
     M.record_strategy(
         world_state["layout"],
         directive,
@@ -586,7 +615,7 @@ def _precompute_timeline(duration: float) -> list[dict]:
                         next_pos = worker_step(robot, world_state, blackboard)
                         if robot.get("path") and next_pos != robot["path"][0]:
                             robot["path"].insert(0, next_pos)
-                    _advance_robot(robot, world_state)
+                    _advance_robot(robot, world_state, blackboard)
             last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
 
         world_state["speed_multiplier"] = speed_multiplier
@@ -712,7 +741,7 @@ def _auto_fallback_to_mock_if_endpoints_dead() -> None:
 
 def main() -> None:
     """Run the FactoryMind simulation."""
-    global _pending_strategist  # we both read and write it below
+    global _pending_strategist, _sim_started
 
     _print_startup_banner()
     _auto_fallback_to_mock_if_endpoints_dead()
@@ -732,20 +761,22 @@ def main() -> None:
     max_runtime = float(os.getenv("FACTORYMIND_MAX_RUNTIME", "0") or 0)
     world_state = _reset_demo_state(layout, speed_multiplier, "online")
     blackboard = Blackboard()
+    blackboard.post(-1, "STRATEGY", "FactoryMind ready — type a command below to begin production.")
+    _sim_started = False
 
     print("[main] initializing pygame display...", flush=True)
     screen = R.init_display()
     print("[main] pygame ready, entering main loop", flush=True)
     clock = pygame.time.Clock()
 
-    # Timers
+    # Timers — start at -(interval) so first tick fires immediately on sim start
     sim_elapsed          = 0.0
     last_frame_time      = time.time()
-    last_leader_tick     = 0.0
-    last_worker_tick     = 0.0
+    last_leader_tick     = -LEADER_TICK_INTERVAL
+    last_worker_tick     = -WORKER_TICK_INTERVAL
     last_strategist_tick = 0.0
-    last_task_spawn      = 0.0
-    last_move_tick       = 0.0
+    last_task_spawn      = -TASK_SPAWN_INTERVAL
+    last_move_tick       = -MOVE_TICK_INTERVAL
     last_heartbeat       = time.time()
     frames_since_beat    = 0
 
@@ -754,7 +785,9 @@ def main() -> None:
         wall_now = time.time()
         real_delta = wall_now - last_frame_time
         last_frame_time = wall_now
-        sim_elapsed += real_delta * speed_multiplier
+
+        if _sim_started:
+            sim_elapsed += real_delta * speed_multiplier
         now = sim_elapsed
 
         # --- Heartbeat (proves the main loop is alive) ---
@@ -767,163 +800,183 @@ def main() -> None:
             )
             print(
                 f"[main] alive  fps={frames_since_beat / (wall_now - last_heartbeat):.0f}  "
-                f"sim_t={sim_elapsed:.1f}s  in_flight_decisions={in_flight}  "
-                f"completed={world_state['stats'].get('completed', 0)}",
+                f"sim_t={sim_elapsed:.1f}s  in_flight={in_flight}  "
+                f"completed={world_state['stats'].get('completed', 0)}  started={_sim_started}",
                 flush=True,
             )
             last_heartbeat = wall_now
             frames_since_beat = 0
 
-        # --- Pygame events ---
+        # --- Pygame events (use handle_event for all input) ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                action = R.get_button_click(event.pos)
-                if action == "disconnect":
-                    from factorymind.state import STRATEGY
-                    _cancel_pending_decisions()
-                    if world_state["connection_status"] == "online":
-                        _set_inference_mode(True)
-                        world_state["connection_status"] = "offline"
-                        local_ready = _local_nim_available()
-                        os.environ["AGENTS_USE_MOCK"] = (
-                            "true" if initial_use_mock or not local_ready else "false"
-                        )
-                        fallback = (
-                            "local endpoints are reachable."
-                            if local_ready
-                            else "local endpoints are down, so mock fallback is active."
-                        )
-                        blackboard.post(
-                            -1,
-                            STRATEGY,
-                            (
-                                "Cloud disconnect: forcing local DGX Spark NIM; "
-                                f"{fallback}"
-                            ),
-                        )
-                    else:
-                        _set_inference_mode(initial_use_local)
-                        os.environ["AGENTS_USE_MOCK"] = "true" if initial_use_mock else "false"
-                        world_state["connection_status"] = "online"
-                        blackboard.post(
-                            -1,
-                            STRATEGY,
-                            "Demo reconnect: inference mode restored to startup configuration.",
-                        )
-                elif action == "layout_open":
-                    _cancel_pending_decisions()
-                    world_state = _reset_demo_state(
-                        OPEN_FLOOR,
-                        speed_multiplier,
-                        world_state["connection_status"],
-                    )
-                    blackboard.clear()
-                    sim_elapsed = 0.0
-                    last_leader_tick = last_worker_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
-                elif action == "layout_bottleneck":
-                    _cancel_pending_decisions()
-                    world_state = _reset_demo_state(
-                        BOTTLENECK_BRIDGE,
-                        speed_multiplier,
-                        world_state["connection_status"],
-                    )
-                    blackboard.clear()
-                    sim_elapsed = 0.0
-                    last_leader_tick = last_worker_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
-                elif action == "reset":
-                    _cancel_pending_decisions()
-                    world_state = _reset_demo_state(
-                        world_state["layout"],
-                        speed_multiplier,
-                        world_state["connection_status"],
-                    )
-                    blackboard.clear()
-                    sim_elapsed = 0.0
-                    last_leader_tick = last_worker_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
-                elif action == "speedup":
-                    speed_multiplier = _cycle_speed(speed_multiplier)
-                    world_state["speed_multiplier"] = speed_multiplier
+                continue
 
-        # --- Apply any LLM decisions that finished since last frame ---
+            result = R.handle_event(event, world_state)
+            if result is None:
+                continue
+
+            if result == "disconnect":
+                from factorymind.state import STRATEGY
+                _cancel_pending_decisions()
+                if world_state["connection_status"] == "online":
+                    _set_inference_mode(True)
+                    world_state["connection_status"] = "offline"
+                    local_ready = _local_nim_available()
+                    os.environ["AGENTS_USE_MOCK"] = (
+                        "true" if initial_use_mock or not local_ready else "false"
+                    )
+                    fallback = (
+                        "local endpoints are reachable."
+                        if local_ready
+                        else "local endpoints are down, so mock fallback is active."
+                    )
+                    blackboard.post(
+                        -1, STRATEGY,
+                        f"Cloud disconnect: forcing local DGX Spark NIM; {fallback}",
+                    )
+                else:
+                    _set_inference_mode(initial_use_local)
+                    os.environ["AGENTS_USE_MOCK"] = "true" if initial_use_mock else "false"
+                    world_state["connection_status"] = "online"
+                    blackboard.post(
+                        -1, STRATEGY,
+                        "Demo reconnect: inference mode restored to startup configuration.",
+                    )
+
+            elif result == "reset":
+                _cancel_pending_decisions()
+                world_state = _reset_demo_state(OPEN_FLOOR, speed_multiplier, world_state["connection_status"])
+                blackboard.clear()
+                blackboard.post(-1, "STRATEGY", "Simulation reset — type a command to begin production.")
+                _sim_started = False
+                sim_elapsed = 0.0
+                last_leader_tick = -LEADER_TICK_INTERVAL
+                last_worker_tick = -WORKER_TICK_INTERVAL
+                last_strategist_tick = 0.0
+                last_task_spawn = -TASK_SPAWN_INTERVAL
+                last_move_tick = -MOVE_TICK_INTERVAL
+
+            elif result == "speedup":
+                speed_multiplier = _cycle_speed(speed_multiplier)
+                world_state["speed_multiplier"] = speed_multiplier
+
+            elif result in ("mode_cursor", "mode_builder"):
+                pass  # render.py manages _mode state
+
+            elif isinstance(result, dict):
+                action_type = result.get("type")
+                if action_type == "wall_add":
+                    cell = result["cell"]
+                    wall_list = world_state.get("wall", [])
+                    if cell not in wall_list:
+                        wall_list.append(cell)
+                        world_state["wall"] = wall_list
+                        world_state["layout"] = "CUSTOM"
+                elif action_type == "wall_remove":
+                    cell = result["cell"]
+                    wall_list = list(world_state.get("wall", []))
+                    if cell in wall_list:
+                        wall_list.remove(cell)
+                        world_state["wall"] = wall_list
+                elif action_type == "user_prompt":
+                    user_text = result["text"]
+                    _sim_started = True
+                    blackboard.post(-1, "USER", user_text)
+                    # Trigger immediate strategist response to user command
+                    if _pending_strategist is None:
+                        try:
+                            retrieved = M.retrieve_strategies(
+                                world_state["layout"],
+                                state_description=M.describe_world_state(world_state),
+                            )
+                        except Exception:
+                            retrieved = []
+                        _pending_strategist = _decision_executor.submit(
+                            strategist_decide, world_state, blackboard, retrieved, user_text,
+                        )
+                        last_strategist_tick = now
+
+        # --- Drain completed LLM futures (always, to flush startup strategist) ---
         _drain_completed_decisions(world_state, blackboard)
 
-        # --- Spawn new tasks ---
-        if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
-            if _active_task_count(world_state) < TARGET_ACTIVE_TASKS:
-                world_state["tasks"].append(_spawn_task(world_state))
-            last_task_spawn = now
+        # --- Sim logic: only runs while started ---
+        if _sim_started:
+            # --- Spawn new tasks ---
+            if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
+                if _active_task_count(world_state) < TARGET_ACTIVE_TASKS:
+                    world_state["tasks"].append(_spawn_task(world_state))
+                last_task_spawn = now
 
-        # --- Leader ticks (dispatch async LLM calls) ---
-        if now - last_leader_tick >= LEADER_TICK_INTERVAL:
-            for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
-                if leader["id"] in _pending_leader:
-                    continue  # previous decision still in flight; don't pile up
-                _pending_leader[leader["id"]] = _decision_executor.submit(
-                    leader_decide, leader, world_state, blackboard,
-                )
-            last_leader_tick = now
-
-        # --- Worker ticks: each ball is its own LLM-driven agent ---
-        if now - last_worker_tick >= WORKER_TICK_INTERVAL:
-            if _ALL_AGENTS_LLM:
-                workers = [r for r in world_state["robots"] if r["role"] == WORKER]
-                for worker in workers:
-                    if worker["id"] in _pending_worker:
-                        continue
-                    if worker.get("current_task") is not None:
-                        continue  # busy executing a claim — let it finish
-                    _pending_worker[worker["id"]] = _decision_executor.submit(
-                        worker_decide, worker, world_state, blackboard,
+            # --- Leader ticks (dispatch async LLM calls) ---
+            if now - last_leader_tick >= LEADER_TICK_INTERVAL:
+                for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
+                    if leader["id"] in _pending_leader:
+                        continue  # previous decision still in flight; don't pile up
+                    _pending_leader[leader["id"]] = _decision_executor.submit(
+                        leader_decide, leader, world_state, blackboard,
                     )
-            else:
-                _assign_idle_workers(world_state, blackboard)
-            last_worker_tick = now
+                last_leader_tick = now
 
-        # --- Strategist tick (one in flight at a time) ---
-        if (
-            now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
-            and _pending_strategist is None
-        ):
-            try:
-                state_description = M.describe_world_state(world_state)
-                retrieved = M.retrieve_strategies(
-                    world_state["layout"],
-                    state_description=state_description,
+            # --- Worker ticks: each ball is its own LLM-driven agent ---
+            if now - last_worker_tick >= WORKER_TICK_INTERVAL:
+                if _ALL_AGENTS_LLM:
+                    workers = [r for r in world_state["robots"] if r["role"] == WORKER]
+                    for worker in workers:
+                        if worker["id"] in _pending_worker:
+                            continue
+                        if worker.get("current_task") is not None:
+                            continue  # busy executing a claim — let it finish
+                        _pending_worker[worker["id"]] = _decision_executor.submit(
+                            worker_decide, worker, world_state, blackboard,
+                        )
+                else:
+                    _assign_idle_workers(world_state, blackboard)
+                last_worker_tick = now
+
+            # --- Strategist tick (one in flight at a time) ---
+            if (
+                now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
+                and _pending_strategist is None
+            ):
+                try:
+                    state_description = M.describe_world_state(world_state)
+                    retrieved = M.retrieve_strategies(
+                        world_state["layout"],
+                        state_description=state_description,
+                    )
+                except Exception as exc:
+                    print(f"[main] strategy retrieval failed: {exc}", file=sys.stderr, flush=True)
+                    retrieved = []
+                _pending_strategist = _decision_executor.submit(
+                    strategist_decide, world_state, blackboard, retrieved,
                 )
-            except Exception as exc:
-                print(f"[main] strategy retrieval failed: {exc}", file=sys.stderr, flush=True)
-                retrieved = []
-            _pending_strategist = _decision_executor.submit(
-                strategist_decide, world_state, blackboard, retrieved,
-            )
-            last_strategist_tick = now
+                last_strategist_tick = now
 
-        # --- Movement tick ---
-        if now - last_move_tick >= MOVE_TICK_INTERVAL:
-            move_steps = min(int((now - last_move_tick) // MOVE_TICK_INTERVAL), 4)
-            for _ in range(max(1, move_steps)):
-                for robot in world_state["robots"]:
-                    if robot["role"] == WORKER:
-                        next_pos = worker_step(robot, world_state, blackboard)
-                        if robot.get("path") and next_pos != robot["path"][0]:
-                            robot["path"].insert(0, next_pos)
-                    _advance_robot(robot, world_state)
-            last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
+            # --- Movement tick ---
+            if now - last_move_tick >= MOVE_TICK_INTERVAL:
+                move_steps = min(int((now - last_move_tick) // MOVE_TICK_INTERVAL), 4)
+                for _ in range(max(1, move_steps)):
+                    for robot in world_state["robots"]:
+                        if robot["role"] == WORKER:
+                            next_pos = worker_step(robot, world_state, blackboard)
+                            if robot.get("path") and next_pos != robot["path"][0]:
+                                robot["path"].insert(0, next_pos)
+                        _advance_robot(robot, world_state, blackboard)
+                last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
 
-        # --- Update shared state from blackboard ---
+            # --- Stats ---
+            elapsed = sim_elapsed
+            world_state["stats"]["elapsed"] = round(elapsed, 1)
+            completed = world_state["stats"]["completed"]
+            world_state["stats"]["rate"] = round(completed / elapsed * 60, 1) if elapsed > 0 else 0.0
+
+        # --- Always sync blackboard + speed + tick, then render ---
         world_state["blackboard"] = blackboard.to_list()
         world_state["speed_multiplier"] = speed_multiplier
-
-        # --- Stats ---
-        elapsed = sim_elapsed
-        world_state["stats"]["elapsed"] = round(elapsed, 1)
-        completed = world_state["stats"]["completed"]
-        world_state["stats"]["rate"] = round(completed / elapsed * 60, 1) if elapsed > 0 else 0.0
         world_state["tick"] += 1
 
-        # --- Render ---
         try:
             R.render(screen, world_state)
         except Exception as exc:

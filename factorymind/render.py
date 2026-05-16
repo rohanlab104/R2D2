@@ -101,9 +101,6 @@ _chat_focused: bool = False
 
 # Button rects — updated every frame by draw_sidepanel
 _BTN_DISCONNECT:   Optional["pygame.Rect"] = None
-_BTN_OPEN:         Optional["pygame.Rect"] = None
-_BTN_BOTTLENECK:   Optional["pygame.Rect"] = None
-_BTN_CUSTOM:       Optional["pygame.Rect"] = None
 _BTN_MODE_CURSOR:  Optional["pygame.Rect"] = None
 _BTN_MODE_BUILDER: Optional["pygame.Rect"] = None
 _BTN_RESET:        Optional["pygame.Rect"] = None
@@ -214,6 +211,7 @@ def render(screen: "pygame.Surface", world_state: dict) -> None:
     draw_grid(screen)
     draw_walls(screen, wall_set)
     draw_builder_overlay(screen, world_state)   # preview sits above walls, below robots
+    draw_spawn_points(screen, world_state)
     draw_workstations(screen, world_state.get("workstations", []))
     draw_robots(screen, world_state.get("robots", []))
     draw_sidepanel(screen, world_state)
@@ -321,9 +319,6 @@ def _check_panel_buttons(pos: tuple[int, int]) -> Optional[str]:
     """Map a click position to a string action, or None."""
     global _mode
     if _BTN_DISCONNECT   and _BTN_DISCONNECT.collidepoint(pos):   return "disconnect"
-    if _BTN_OPEN         and _BTN_OPEN.collidepoint(pos):         return "layout_open"
-    if _BTN_BOTTLENECK   and _BTN_BOTTLENECK.collidepoint(pos):   return "layout_bottleneck"
-    if _BTN_CUSTOM       and _BTN_CUSTOM.collidepoint(pos):       return "layout_custom"
     if _BTN_RESET        and _BTN_RESET.collidepoint(pos):        return "reset"
     if _BTN_SPEED        and _BTN_SPEED.collidepoint(pos):        return "speedup"
     if _BTN_MODE_CURSOR  and _BTN_MODE_CURSOR.collidepoint(pos):
@@ -446,6 +441,16 @@ def draw_builder_overlay(screen: "pygame.Surface", world_state: dict) -> None:
 # Workstations
 # ---------------------------------------------------------------------------
 
+def draw_spawn_points(screen: "pygame.Surface", world_state: dict) -> None:
+    """Faint home-base rings at each robot spawn position."""
+    for sp in world_state.get("spawn_positions", []):
+        x, y = sp
+        px = GRID_OFFSET_X + x * CELL_SIZE + CELL_SIZE // 2
+        py = GRID_OFFSET_Y + y * CELL_SIZE + CELL_SIZE // 2
+        _draw_alpha_circle(screen, C_ACCENT, (px, py), 5, 35)
+        pygame.draw.circle(screen, _dim(C_ACCENT, 70), (px, py), 2)
+
+
 _WS_ABBREV = {"Parts": "P", "Assembly": "A", "QA": "Q", "Shipping": "S"}
 
 def draw_workstations(screen: "pygame.Surface", workstations: list[dict]) -> None:
@@ -540,7 +545,7 @@ def draw_robots(screen: "pygame.Surface", robots: list[dict]) -> None:
 
 def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     """Interactive ops-dashboard: stats, mode/layout controls, agent log, chat."""
-    global _BTN_DISCONNECT, _BTN_OPEN, _BTN_BOTTLENECK, _BTN_CUSTOM
+    global _BTN_DISCONNECT
     global _BTN_MODE_CURSOR, _BTN_MODE_BUILDER
     global _BTN_RESET, _BTN_SPEED, _BTN_SEND, _BTN_CHAT_INPUT
 
@@ -620,24 +625,11 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
                         btn.y + btn.h // 2 - t.get_height() // 2))
     y += 26 + 7
 
-    # ── Layout switcher: OPEN | BOTTLENECK | CUSTOM ───────────────────────
-    lbw = (W - PAD * 2 - 8) // 3
-    _BTN_OPEN       = pygame.Rect(x0,                y, lbw, 24)
-    _BTN_BOTTLENECK = pygame.Rect(x0 + lbw + 4,      y, lbw, 24)
-    _BTN_CUSTOM     = pygame.Rect(x0 + (lbw + 4) * 2, y, lbw, 24)
-    for btn, label, key in [
-        (_BTN_OPEN,       "OPEN",       "OPEN_FLOOR"),
-        (_BTN_BOTTLENECK, "BOTTLENECK", "BOTTLENECK_BRIDGE"),
-        (_BTN_CUSTOM,     "CUSTOM",     "CUSTOM"),
-    ]:
-        active_btn = (active == key)
-        pygame.draw.rect(screen, (15, 25, 50) if active_btn else (12, 15, 28), btn, border_radius=4)
-        pygame.draw.rect(screen, C_ACCENT if active_btn else (50, 50, 80),
-                         btn, 2 if active_btn else 1, border_radius=4)
-        t = f_caps.render(label, True, C_ACCENT if active_btn else C_DIM)
-        screen.blit(t, (btn.x + btn.w // 2 - t.get_width() // 2,
-                        btn.y + btn.h // 2 - t.get_height() // 2))
-    y += 24 + 7
+    # ── Layout status pill ────────────────────────────────────────────────
+    layout_label = active if active else "OPEN_FLOOR"
+    ls_pill = f_caps.render(f"layout: {layout_label}", True, C_DIM)
+    screen.blit(ls_pill, (x0, y + 4))
+    y += ls_pill.get_height() + 10
 
     # ── Divider ───────────────────────────────────────────────────────────
     pygame.draw.line(screen, C_PANEL_EDGE, (x0, y), (PANEL_X + W - PAD, y))
@@ -652,7 +644,7 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
 
     # ── Log feed (newest first, opacity decay) ─────────────────────────────
     feed_top    = y
-    feed_bottom = H - 174   # leave room for badge + chat + controls + disconnect
+    feed_bottom = H - 188   # leave room for 3 badges + chat + controls + disconnect
     line_h      = 14
 
     from factorymind.state import LEADER as _LEADER
@@ -716,7 +708,8 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
 
     # Model badges
     for role_str, model_str, col in [
-        ("leaders:",    "Nemotron-Nano-9B",   C_ACCENT),
+        ("leaders:",    "Nemotron-Super-49B", (220, 0, 255)),
+        ("workers:",    "Nemotron-Nano-9B",   C_ACCENT),
         ("strategist:", "Nemotron-Super-49B", (220, 0, 255)),
     ]:
         ls = f_small.render(f"  {role_str}", True, C_DIM)

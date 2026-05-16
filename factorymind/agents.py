@@ -84,7 +84,7 @@ Return valid JSON only, exactly this schema:
 }}
 
 Most important: post only when the directive changes behavior on screen; otherwise set should_post false.
-"""
+{user_instruction}"""
 
 WORKER_PROMPT_TEMPLATE = """\
 You are Worker R{robot_id}, an autonomous floor robot. Pick the single best task to commit to right now.
@@ -126,14 +126,16 @@ class Blackboard:
     def __init__(self) -> None:
         self._messages: list[dict] = []
 
-    def post(self, from_id: int, msg_type: str, content: str) -> None:
-        """Append a new message to the board."""
-        self._messages.append({
+    def post(self, from_id: int, msg_type: str, content: str, **extra) -> None:
+        """Append a new message to the board. Extra kwargs are merged into the dict."""
+        msg = {
             "from": from_id,
             "type": msg_type,
             "content": content,
             "timestamp": time.time(),
-        })
+        }
+        msg.update(extra)
+        self._messages.append(msg)
 
     def read_recent(self, n: int = 20) -> list[dict]:
         """Return the last n messages."""
@@ -204,6 +206,7 @@ def strategist_decide(
     world_state: dict,
     blackboard: Blackboard,
     retrieved_strategies: list[dict],
+    user_message: str = "",
 ) -> dict:
     """High-level strategic directive for all leaders.
 
@@ -213,12 +216,17 @@ def strategist_decide(
         reasoning   : str
     """
     if _use_mock():
-        return _mock_strategist_decide(world_state)
+        return _mock_strategist_decide(world_state, user_message)
 
     from factorymind import inference
 
     open_tasks = _candidate_tasks(world_state, include_assigned=True)
     recent = blackboard.read_recent(12)
+    user_section = (
+        f"\nDirect user command: \"{user_message}\"\n"
+        "Your directive MUST address this command specifically.\n"
+        if user_message else ""
+    )
     prompt = STRATEGIST_PROMPT_TEMPLATE.format(
         layout=world_state.get("layout"),
         workstations=_summarize_workstations(world_state),
@@ -227,6 +235,7 @@ def strategist_decide(
         robots=_summarize_robots(world_state),
         retrieved_strategies=retrieved_strategies,
         recent_messages=recent,
+        user_instruction=user_section,
     )
     try:
         raw = inference.ask_strategist(prompt)
@@ -269,7 +278,7 @@ def worker_decide(robot: dict, world_state: dict, blackboard: Blackboard) -> dic
         recent_messages=recent,
     )
     try:
-        raw = inference.ask_leader(prompt)  # workers use the fast 9B model
+        raw = inference.ask_worker(prompt)  # workers use the fast 9B model
         parsed = inference.safe_parse_json(raw)
     except Exception as exc:
         print(f"[worker {robot['id']}] LLM call failed, using mock: {exc}", flush=True)
@@ -341,6 +350,15 @@ def choose_worker_task(worker_robot: dict, world_state: dict, blackboard: Blackb
 
 def _mock_leader_decide(robot: dict, world_state: dict, blackboard: Optional[Blackboard] = None) -> dict:
     """Return a sensible mock leader decision without calling any LLM."""
+    # Don't re-claim while already executing a task
+    if robot.get("current_task") is not None:
+        return {
+            "claim_task_id": None,
+            "destination": robot["pos"],
+            "post_message": f"Leader {robot['id']} busy on task {robot['current_task']}.",
+            "reasoning": "Mock: already executing a task; holding position.",
+        }
+
     open_tasks = _candidate_tasks(world_state)
     claim_id: Optional[int] = None
     destination = robot["pos"]
@@ -390,11 +408,13 @@ def _mock_worker_decide(robot: dict, world_state: dict, blackboard: Optional[Bla
     }
 
 
-def _mock_strategist_decide(world_state: dict) -> dict:
+def _mock_strategist_decide(world_state: dict, user_message: str = "") -> dict:
     """Return a hardcoded reasonable strategist directive."""
     open_count = sum(1 for t in world_state["tasks"] if t.get("status") == "open")
     layout = world_state.get("layout")
-    if layout == BOTTLENECK_BRIDGE:
+    if user_message:
+        directive = f"Acknowledged: {user_message[:80]}. Assigning nearest workers to priority tasks."
+    elif layout == BOTTLENECK_BRIDGE:
         directive = (
             "Bottleneck at center bridge: keep cross-wall trips sparse and let nearest workers assist claimed pickups."
         )
@@ -405,9 +425,10 @@ def _mock_strategist_decide(world_state: dict) -> dict:
     else:
         directive = "No change needed: task flow is light, so keep nearest-pickup dispatch."
     return {
-        "should_post": open_count > 0,
+        "should_post": open_count > 0 or bool(user_message),
         "directive": directive,
         "reasoning": (
+            f"Mock: responding to user command." if user_message else
             "Mock strategist: layout and queue depth are the main heuristics. "
             "The directive is concise so the blackboard stays readable."
         ),
