@@ -38,11 +38,85 @@ python3 -m factorymind.main
 python3 -m pytest tests/
 ```
 
-### Local NIM (ASUS Ascent GX10)
+### Where does inference happen?
+
+The Python in `factorymind/inference.py` is just an OpenAI-compatible HTTP client. The GPU work happens wherever the URL points:
+
+| `USE_LOCAL_NIM` | `GX10_IP` | Endpoint hit | Where the model actually runs |
+|---|---|---|---|
+| `false` | (ignored) | `https://integrate.api.nvidia.com/v1` | NVIDIA cloud |
+| `true` | `localhost` | `http://localhost:8000/v1` and `:8001/v1` | This GX10's GPU (running Docker NIM) |
+| `true` | GX10 IP | `http://<gx10>:8000/v1` and `:8001/v1` | The GX10's GPU (from a remote laptop) |
+
+| Port | Model | Role |
+|------|-------|------|
+| 8000 | `nemotron-nano-9b-v2` | Leader |
+| 8001 | `llama-3_3-nemotron-super-49b-v1_5` | Strategist |
+
+### Person A — Inference checklist (running on the DGX Spark GX10)
+
+**On the GX10**
 
 ```bash
-USE_LOCAL_NIM=true AGENTS_USE_MOCK=false python3 -m factorymind.main
+git clone https://github.com/rohanlab104/R2D2.git
+cd R2D2
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+chmod +x scripts/*.sh
+
+cp .env.example .env
+# Edit .env: set NVIDIA_API_KEY and NGC_API_KEY (same value works).
+# USE_LOCAL_NIM=true and GX10_IP=localhost are already the defaults.
+
+nvidia-smi && docker --version    # confirm Blackwell GPU + Docker
 ```
+
+**Start NIM (two terminals on the GX10)**
+
+```bash
+# terminal 1 — leader (9B) on host port 8000
+./scripts/run_nim_nano.sh
+
+# terminal 2 — strategist (49B) on host port 8001
+./scripts/run_nim_49b.sh
+```
+
+First pull is 20–40 min; weights are cached in `~/.cache/nim` for fast restarts.
+
+**Verify (third terminal on the GX10)**
+
+```bash
+./scripts/test_nim_curl.sh localhost 8000
+./scripts/test_nim_curl.sh localhost 8001 nvidia/llama-3_3-nemotron-super-49b-v1_5
+source .venv/bin/activate
+./scripts/verify_local.sh
+```
+
+**Run the full sim on the GX10**
+
+```bash
+python3 scripts/seed_memory.py
+python3 -m factorymind.main
+```
+
+**Teammate laptops** — open an SSH tunnel and they can use `localhost:8000/8001`:
+
+```bash
+export GX10_USER=... GX10_IP=<gx10-ip>
+./scripts/gx10_tunnel.sh           # keep open
+USE_LOCAL_NIM=true GX10_IP=localhost ./scripts/verify_local.sh
+```
+
+**Cloud fallback** (only if NIM isn't ready, e.g. early dev) — set `USE_LOCAL_NIM=false` and run `./scripts/verify_cloud.sh`.
+
+**Demo controls**
+
+```bash
+./scripts/disconnect_demo_block.sh   # block cloud egress; local NIM keeps working
+./scripts/reset_demo.sh              # undo + stop NIM containers
+```
+
+SSH note: `gx10-d8fb` is a short hostname that won't resolve outside the lab's DNS. Use the GX10's **IP** from event organizers.
 
 ---
 
