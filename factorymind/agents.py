@@ -192,11 +192,11 @@ def leader_decide(robot: dict, world_state: dict, blackboard: Blackboard) -> dic
     try:
         raw = inference.ask_leader(prompt)
         parsed = inference.safe_parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        print(f"[leader {robot['id']}] LLM call failed, using mock: {exc}", flush=True)
         parsed = None
     if parsed and isinstance(parsed, dict):
         return _normalize_leader_decision(parsed, robot, world_state)
-    # Fallback to mock if parse fails
     return _mock_leader_decide(robot, world_state, blackboard)
 
 
@@ -231,7 +231,8 @@ def strategist_decide(
     try:
         raw = inference.ask_strategist(prompt)
         parsed = inference.safe_parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        print(f"[strategist] LLM call failed, using mock: {exc}", flush=True)
         parsed = None
     if parsed and isinstance(parsed, dict):
         return _normalize_strategist_decision(parsed)
@@ -270,7 +271,8 @@ def worker_decide(robot: dict, world_state: dict, blackboard: Blackboard) -> dic
     try:
         raw = inference.ask_leader(prompt)  # workers use the fast 9B model
         parsed = inference.safe_parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        print(f"[worker {robot['id']}] LLM call failed, using mock: {exc}", flush=True)
         parsed = None
     if parsed and isinstance(parsed, dict):
         return _normalize_worker_decision(parsed, robot, world_state)

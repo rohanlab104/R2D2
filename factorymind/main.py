@@ -462,8 +462,61 @@ def _cancel_pending_decisions() -> None:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _print_startup_banner() -> None:
+    """Print a clear start-of-run banner so freezes are easy to diagnose."""
+    print("=" * 72, flush=True)
+    print("FactoryMind R2D2 — starting simulation", flush=True)
+    try:
+        from factorymind import inference
+        print(inference.describe_endpoints(), flush=True)
+    except Exception as exc:
+        print(f"  (could not describe inference endpoints: {exc})", flush=True)
+    print(
+        f"  AGENTS_USE_MOCK={os.getenv('AGENTS_USE_MOCK', 'false')}  "
+        f"ALL_AGENTS_LLM={os.getenv('ALL_AGENTS_LLM', 'true')}  "
+        f"USE_LOCAL_NIM={os.getenv('USE_LOCAL_NIM', 'false')}  "
+        f"GX10_IP={os.getenv('GX10_IP', 'localhost')}",
+        flush=True,
+    )
+    print("  thread pool: 12 workers (each ball has its own LLM future)", flush=True)
+    print("=" * 72, flush=True)
+
+
+def _auto_fallback_to_mock_if_endpoints_dead() -> None:
+    """If neither cloud nor local NIM is reachable, force AGENTS_USE_MOCK=true.
+
+    This keeps the demo moving even when the inference endpoints are gone, and
+    means a misconfigured `.env` never produces a frozen window.
+    """
+    if os.getenv("AGENTS_USE_MOCK", "false").lower() == "true":
+        return  # already in mock mode, nothing to check
+
+    use_local = os.getenv("USE_LOCAL_NIM", "false").lower() == "true"
+    if use_local:
+        if _local_nim_available(timeout=0.5):
+            return
+        reason = "local NIM (port 8000/8001) not reachable"
+    else:
+        # Cloud mode: a missing API key is the usual cause of silent hangs.
+        key = os.getenv("NVIDIA_API_KEY", "").strip()
+        if key and key != "your_key_here":
+            return
+        reason = "NVIDIA_API_KEY not set"
+
+    print(
+        f"[main] {reason}; falling back to AGENTS_USE_MOCK=true so the demo runs.",
+        flush=True,
+    )
+    os.environ["AGENTS_USE_MOCK"] = "true"
+
+
 def main() -> None:
     """Run the FactoryMind simulation."""
+    global _pending_strategist  # we both read and write it below
+
+    _print_startup_banner()
+    _auto_fallback_to_mock_if_endpoints_dead()
+
     # --- Init ---
     layout = os.getenv("LAYOUT", OPEN_FLOOR)
     speed_multiplier = 1
@@ -473,7 +526,9 @@ def main() -> None:
     world_state = _reset_demo_state(layout, speed_multiplier, "online")
     blackboard = Blackboard()
 
+    print("[main] initializing pygame display...", flush=True)
     screen = R.init_display()
+    print("[main] pygame ready, entering main loop", flush=True)
     clock = pygame.time.Clock()
 
     # Timers
@@ -484,6 +539,8 @@ def main() -> None:
     last_strategist_tick = 0.0
     last_task_spawn      = 0.0
     last_move_tick       = 0.0
+    last_heartbeat       = time.time()
+    frames_since_beat    = 0
 
     running = True
     while running:
@@ -492,6 +549,23 @@ def main() -> None:
         last_frame_time = wall_now
         sim_elapsed += real_delta * speed_multiplier
         now = sim_elapsed
+
+        # --- Heartbeat (proves the main loop is alive) ---
+        frames_since_beat += 1
+        if wall_now - last_heartbeat >= 5.0:
+            in_flight = (
+                len(_pending_leader)
+                + len(_pending_worker)
+                + (1 if _pending_strategist else 0)
+            )
+            print(
+                f"[main] alive  fps={frames_since_beat / (wall_now - last_heartbeat):.0f}  "
+                f"sim_t={sim_elapsed:.1f}s  in_flight_decisions={in_flight}  "
+                f"completed={world_state['stats'].get('completed', 0)}",
+                flush=True,
+            )
+            last_heartbeat = wall_now
+            frames_since_beat = 0
 
         # --- Pygame events ---
         for event in pygame.event.get():
@@ -605,11 +679,15 @@ def main() -> None:
             now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
             and _pending_strategist is None
         ):
-            state_description = M.describe_world_state(world_state)
-            retrieved = M.retrieve_strategies(
-                world_state["layout"],
-                state_description=state_description,
-            )
+            try:
+                state_description = M.describe_world_state(world_state)
+                retrieved = M.retrieve_strategies(
+                    world_state["layout"],
+                    state_description=state_description,
+                )
+            except Exception as exc:
+                print(f"[main] strategy retrieval failed: {exc}", file=sys.stderr, flush=True)
+                retrieved = []
             _pending_strategist = _decision_executor.submit(
                 strategist_decide, world_state, blackboard, retrieved,
             )
@@ -639,7 +717,10 @@ def main() -> None:
         world_state["tick"] += 1
 
         # --- Render ---
-        R.render(screen, world_state)
+        try:
+            R.render(screen, world_state)
+        except Exception as exc:
+            print(f"[main] render failed: {exc}", file=sys.stderr, flush=True)
         if max_runtime and sim_elapsed >= max_runtime:
             running = False
         clock.tick(FPS)

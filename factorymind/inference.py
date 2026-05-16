@@ -86,7 +86,15 @@ def _strategist_base_url() -> str:
 
 
 def _make_client(base_url: str) -> OpenAI:
-    return OpenAI(base_url=base_url, api_key=_API_KEY, timeout=_TIMEOUT_SECONDS)
+    # max_retries=0 so a dead endpoint surfaces in `_TIMEOUT_SECONDS` instead
+    # of getting silently retried for ~30s while the worker thread holds the
+    # pool slot. Callers (agents.py) fall back to mock decisions on failure.
+    return OpenAI(
+        base_url=base_url,
+        api_key=_API_KEY,
+        timeout=_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
 
 
 _leader_client = _make_client(_leader_base_url())
