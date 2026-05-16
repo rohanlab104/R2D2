@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 
 # Message / log event types
 CLAIM = "CLAIM"
@@ -54,17 +55,37 @@ _LEADER_POS = [25, 47]
 
 
 def _initial_shelf_walls() -> list[list[int]]:
-    """Warehouse rack aisles represented as wall cells for pathfinding."""
+    """Three shelf racks, each rotated 45 deg in-plane around its own center.
+
+    Each rack is a 11x3 rectangle (half_w=5.5, half_h=1.5). We rasterize the
+    rotated shape by inverse-rotating every nearby grid cell and keeping the
+    ones that fall inside the original axis-aligned rectangle.
+    """
     cells: set[tuple[int, int]] = set()
-    rack_runs = [
-        (13, 23, 16, 18),
-        (26, 36, 24, 26),
-        (18, 28, 33, 35),
+    # (center_x, center_y, half_w, half_h) for each rack.
+    racks = [
+        (18.0, 17.0, 5.5, 1.5),
+        (31.0, 25.0, 5.5, 1.5),
+        (23.0, 34.0, 5.5, 1.5),
     ]
-    for x0, x1, y0, y1 in rack_runs:
-        for x in range(x0, x1 + 1):
-            for y in range(y0, y1 + 1):
-                cells.add((x, y))
+    # Inverse rotation by -45 deg.
+    angle = math.radians(-45.0)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    for cx, cy, hw, hh in racks:
+        # The rotated rectangle fits inside a (sqrt(2)*half) bounding box.
+        bound = int(math.ceil(max(hw, hh) * math.sqrt(2.0))) + 1
+        for x in range(int(cx) - bound, int(cx) + bound + 1):
+            for y in range(int(cy) - bound, int(cy) + bound + 1):
+                if not (0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT):
+                    continue
+                dx = x - cx
+                dy = y - cy
+                # Apply the inverse rotation to test against the original AABB.
+                rx = dx * cos_a - dy * sin_a
+                ry = dx * sin_a + dy * cos_a
+                if abs(rx) <= hw + 0.4 and abs(ry) <= hh + 0.4:
+                    cells.add((x, y))
     return [[x, y] for x, y in sorted(cells)]
 
 
