@@ -53,6 +53,26 @@ _INITIAL_WORKERS = [[22, 43], [25, 43], [28, 43]]
 _LEADER_POS = [25, 47]
 
 
+def _initial_shelf_walls() -> list[list[int]]:
+    """Warehouse rack aisles represented as wall cells for pathfinding."""
+    cells: set[tuple[int, int]] = set()
+    rack_runs = [
+        (17, 19, 8, 17),
+        (17, 19, 22, 32),
+        (17, 19, 36, 43),
+        (26, 28, 6, 15),
+        (26, 28, 20, 30),
+        (26, 28, 35, 41),
+        (34, 36, 10, 20),
+        (34, 36, 25, 35),
+    ]
+    for x0, x1, y0, y1 in rack_runs:
+        for x in range(x0, x1 + 1):
+            for y in range(y0, y1 + 1):
+                cells.add((x, y))
+    return [[x, y] for x, y in sorted(cells)]
+
+
 def color_rgb(color_name: str) -> list[int]:
     """Return RGB for a configured package color."""
     for color in PACKAGE_COLORS:
@@ -175,7 +195,7 @@ def create_initial_state(
     }
     return {
         "layout": layout,
-        "wall": [],
+        "wall": _initial_shelf_walls(),
         "leader": leader,
         "robots": [leader] + workers,
         "workers": workers,

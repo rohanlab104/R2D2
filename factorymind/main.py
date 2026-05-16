@@ -332,7 +332,12 @@ def _validate_llm_assignments(world_state: dict, proposed: object) -> list[dict]
             continue
         factory = _factory_by_id(world_state, factory_id)
         package = _first_unreserved_package(factory) if factory else None
-        dropbox = _dropbox_for_color(world_state, factory["color"]) if factory else None
+        dropbox = _nearest_dropbox_for_color(
+            world_state,
+            factory["color"],
+            factory["drop_pad"],
+            {tuple(c) for c in world_state.get("wall", [])},
+        ) if factory else None
         if not factory or not package or not dropbox:
             continue
         assignments.append({
@@ -354,12 +359,13 @@ def _deterministic_assignments(world_state: dict) -> list[dict]:
     ]
     available = []
     for factory in world_state.get("factories", []):
-        dropbox = _dropbox_for_color(world_state, factory["color"])
-        if not dropbox:
+        matching_dropboxes = _dropboxes_for_color(world_state, factory["color"])
+        if not matching_dropboxes:
             continue
         for package in factory.get("pad_packages", []):
             if package.get("reserved_by") is None:
-                available.append((factory, package, dropbox))
+                for dropbox in matching_dropboxes:
+                    available.append((factory, package, dropbox))
     assignments = []
     used_packages: set[int] = set()
     for worker in idle_workers:
@@ -416,7 +422,7 @@ def _assign_worker_to_package(world_state: dict, assignment: dict,
     worker = _worker_by_id(world_state, assignment.get("worker_id"))
     factory = _factory_by_id(world_state, assignment.get("factory_id"))
     dropbox = _dropbox_by_id(world_state, assignment.get("dropbox_id"))
-    if not worker or not factory or not dropbox:
+    if not worker or not factory:
         return False
     if worker.get("status") != "idle" or worker.get("carrying") or worker.get("path"):
         return False
@@ -426,10 +432,15 @@ def _assign_worker_to_package(world_state: dict, assignment: dict,
     )
     if not package or package.get("reserved_by") is not None:
         return False
-    if dropbox.get("color") != package.get("color"):
+    if dropbox and dropbox.get("color") != package.get("color"):
         _policy_log(world_state, worker["name"], "assign_dropbox", False, "drop box color mismatch")
         return False
     wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    best_dropbox = _nearest_dropbox_for_color(world_state, package["color"], factory["drop_pad"], wall_set)
+    if best_dropbox:
+        dropbox = best_dropbox
+    if not dropbox:
+        return False
     path = a_star(worker["pos"], factory["drop_pad"], wall_set)
     if worker["pos"] != factory["drop_pad"] and not path:
         _thought(world_state, S.WARNING, "Leader", f"{worker['name']} cannot reach {factory['name']} pad.", elapsed, blackboard)
@@ -468,8 +479,11 @@ def _move_workers(world_state: dict, elapsed: float, blackboard: Blackboard) -> 
     occupied = {
         tuple(w["pos"]): w["id"]
         for w in world_state.get("workers", [])
+        if w.get("status") != "disabled"
     }
     for worker in world_state.get("workers", []):
+        if worker.get("status") == "disabled":
+            continue
         if not worker.get("path"):
             _worker_transition(world_state, worker, elapsed, blackboard)
             continue
@@ -640,16 +654,72 @@ def _task_by_id(world_state: dict, task_id: int | None) -> dict | None:
     return next((t for t in world_state.get("tasks", []) if t.get("id") == task_id), None)
 
 
+def _dropboxes_for_color(world_state: dict, color: str) -> list[dict]:
+    return [b for b in world_state.get("dropboxes", []) if b.get("color") == color]
+
+
 def _dropbox_for_color(world_state: dict, color: str) -> dict | None:
-    return next((b for b in world_state.get("dropboxes", []) if b.get("color") == color), None)
+    return next(iter(_dropboxes_for_color(world_state, color)), None)
+
+
+def _nearest_dropbox_for_color(
+    world_state: dict,
+    color: str,
+    pickup: list[int],
+    wall_set: set[tuple[int, int]] | None = None,
+) -> dict | None:
+    walls = wall_set if wall_set is not None else {tuple(c) for c in world_state.get("wall", [])}
+    best: tuple[int, dict] | None = None
+    for dropbox in _dropboxes_for_color(world_state, color):
+        cost = _route_len(pickup, dropbox["pos"], walls)
+        if cost >= 10**6:
+            continue
+        if best is None or cost < best[0]:
+            best = (cost, dropbox)
+    return best[1] if best else None
 
 
 def _first_unreserved_package(factory: dict) -> dict | None:
     return next((p for p in factory.get("pad_packages", []) if p.get("reserved_by") is None), None)
 
 
+def _cell_occupied_by_asset(world_state: dict, cell: list[int]) -> bool:
+    x, y = cell
+    if [x, y] in world_state.get("wall", []):
+        return True
+    if any(w.get("pos") == [x, y] for w in world_state.get("workers", [])):
+        return True
+    for factory in world_state.get("factories", []):
+        fx, fy = factory.get("pos", [0, 0])
+        width = 3 + int(factory.get("belt_length", 5))
+        if fx <= x < fx + width and fy <= y < fy + 3:
+            return True
+    for dropbox in world_state.get("dropboxes", []):
+        bx, by = dropbox.get("pos", [0, 0])
+        width, height = _rotated_footprint(3, 2, float(dropbox.get("rotation_y") or 0.0))
+        if bx <= x < bx + width and by <= y < by + height:
+            return True
+    return False
+
+
+def _rotated_footprint(width: int, height: int, rotation_y: float) -> tuple[int, int]:
+    quarter_turns = round(rotation_y / (3.141592653589793 / 2)) % 2
+    return (height, width) if quarter_turns else (width, height)
+
+
+def _area_is_clear(world_state: dict, cell: list[int], width: int, height: int) -> bool:
+    x0, y0 = cell
+    if x0 < 0 or y0 < 0 or x0 + width > GRID_WIDTH or y0 + height > GRID_HEIGHT:
+        return False
+    return not any(
+        _cell_occupied_by_asset(world_state, [x, y])
+        for x in range(x0, x0 + width)
+        for y in range(y0, y0 + height)
+    )
+
+
 def _place_factory(world_state: dict, cell: list[int], color: str, rotation_y: float = 0.0) -> None:
-    if cell[0] > GRID_WIDTH - 9 or cell[1] > GRID_HEIGHT - 3:
+    if not _area_is_clear(world_state, cell, 8, 3):
         return
     factory_id = world_state["next_factory_id"]
     world_state["next_factory_id"] += 1
@@ -660,7 +730,8 @@ def _place_factory(world_state: dict, cell: list[int], color: str, rotation_y: f
 
 
 def _place_dropbox(world_state: dict, cell: list[int], color: str, rotation_y: float = 0.0) -> None:
-    if cell[0] > GRID_WIDTH - 3 or cell[1] > GRID_HEIGHT - 2:
+    width, height = _rotated_footprint(3, 2, rotation_y)
+    if not _area_is_clear(world_state, cell, width, height):
         return
     box_id = world_state["next_dropbox_id"]
     world_state["next_dropbox_id"] += 1
@@ -668,6 +739,8 @@ def _place_dropbox(world_state: dict, cell: list[int], color: str, rotation_y: f
 
 
 def _place_worker(world_state: dict, cell: list[int]) -> None:
+    if not _area_is_clear(world_state, cell, 1, 1):
+        return
     worker_id = world_state["next_worker_id"]
     world_state["next_worker_id"] += 1
     worker = S.make_worker(worker_id, cell)
@@ -679,7 +752,7 @@ def _handle_builder_action(world_state: dict, action: dict) -> None:
     action_type = action.get("type")
     if action_type == "wall_add":
         cell = action["cell"]
-        if cell not in world_state["wall"]:
+        if cell not in world_state["wall"] and not _cell_occupied_by_asset(world_state, cell):
             world_state["wall"].append(cell)
     elif action_type == "wall_remove":
         cell = action["cell"]

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
+
 from factorymind.agents import Blackboard
 from factorymind.main import (
     _apply_leader_plan,
     _deterministic_assignments,
+    _handle_builder_action,
     _make_package,
     _move_workers,
 )
@@ -51,3 +54,29 @@ def test_initial_autonomous_layout_counts() -> None:
     assert len(world_state["dropboxes"]) == 3
     assert len(world_state["workers"]) == 3
     assert world_state["leader"]["role"] == "LEADER"
+
+
+def test_duplicate_dropbox_uses_closest_matching_bin() -> None:
+    world_state = create_initial_state()
+    factory = world_state["factories"][0]
+    _handle_builder_action(world_state, {"type": "place_dropbox", "cell": [14, 6], "color": factory["color"]})
+
+    package = _make_package(world_state, factory)
+    package["status"] = "pad"
+    package["progress"] = factory["belt_length"]
+    factory["pad_packages"].append(package)
+
+    assignments = _deterministic_assignments(world_state)
+    assert assignments
+    assert assignments[0]["dropbox_id"] == world_state["dropboxes"][-1]["id"]
+
+
+def test_builder_stores_rotated_dropbox() -> None:
+    world_state = create_initial_state()
+
+    _handle_builder_action(
+        world_state,
+        {"type": "place_dropbox", "cell": [14, 6], "color": "Red", "rotation_y": math.pi / 2},
+    )
+
+    assert math.isclose(world_state["dropboxes"][-1]["rotation_y"], math.pi / 2)

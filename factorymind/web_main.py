@@ -234,8 +234,78 @@ def _handle_web_action(
         world_state["builder_mode"] = kind.replace("builder_", "")
     elif kind in {"wall_add", "wall_remove", "place_factory", "place_dropbox", "place_worker"}:
         M._handle_builder_action(world_state, action)
+    elif kind == "order_spike":
+        _trigger_order_spike(world_state, blackboard, now)
+    elif kind == "disable_worker":
+        _disable_worker(world_state, blackboard, action.get("worker_id"), now)
+    elif kind == "enable_worker":
+        _enable_worker(world_state, blackboard, action.get("worker_id"), now)
 
     return result
+
+
+def _trigger_order_spike(world_state: dict, blackboard: Blackboard, now: float) -> None:
+    """Demo control: push an immediate backlog onto every factory pad."""
+    count = 0
+    for factory in world_state.get("factories", []):
+        for _ in range(3):
+            package = M._make_package(world_state, factory)
+            package["status"] = "pad"
+            package["progress"] = float(factory.get("belt_length", 5))
+            factory.setdefault("pad_packages", []).append(package)
+            count += 1
+    M._thought(world_state, M.S.WARNING, "Leader", f"Order spike injected {count} packages across intake pads.", now, blackboard)
+
+
+def _disable_worker(world_state: dict, blackboard: Blackboard, worker_id, now: float) -> None:
+    """Demo control: fault a worker and release any active assignment."""
+    try:
+        worker_id = int(worker_id)
+    except (TypeError, ValueError):
+        return
+    worker = next((w for w in world_state.get("workers", []) if w.get("id") == worker_id), None)
+    if not worker:
+        return
+    _release_worker_assignment(world_state, worker)
+    worker["status"] = "disabled"
+    worker["path"] = []
+    M._thought(world_state, M.S.WARNING, worker.get("name", f"Worker-{worker_id}"), "Worker removed from fleet; tasks redistributed.", now, blackboard)
+
+
+def _enable_worker(world_state: dict, blackboard: Blackboard, worker_id, now: float) -> None:
+    try:
+        worker_id = int(worker_id)
+    except (TypeError, ValueError):
+        return
+    worker = next((w for w in world_state.get("workers", []) if w.get("id") == worker_id), None)
+    if not worker or worker.get("status") != "disabled":
+        return
+    worker["status"] = "idle"
+    worker["current_task"] = None
+    worker["path"] = []
+    M._thought(world_state, M.S.OBSERVE, worker.get("name", f"Worker-{worker_id}"), "Worker returned to active fleet.", now, blackboard)
+
+
+def _release_worker_assignment(world_state: dict, worker: dict) -> None:
+    task = next((t for t in world_state.get("tasks", []) if t.get("id") == worker.get("current_task")), None)
+    if task and task.get("status") not in {"done", "blocked"}:
+        task["status"] = "blocked"
+    carrying = worker.get("carrying")
+    if carrying:
+        factory = next((f for f in world_state.get("factories", []) if f.get("id") == carrying.get("factory_id")), None)
+        if factory:
+            carrying["status"] = "pad"
+            carrying["reserved_by"] = None
+            factory.setdefault("pad_packages", []).append(carrying)
+    for factory in world_state.get("factories", []):
+        for package in factory.get("pad_packages", []):
+            if package.get("reserved_by") == worker.get("id"):
+                package["reserved_by"] = None
+    worker["carrying"] = None
+    worker["current_task"] = None
+    worker["target_factory_id"] = None
+    worker["target_dropbox_id"] = None
+    worker["task_started_at"] = None
 
 
 def _build_info(world_state: dict) -> dict:
