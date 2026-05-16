@@ -1,0 +1,674 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FactoryMind R2D2 — 3D viewer</title>
+<style>
+  :root {
+    --bg: #08080f;
+    --panel: #0c0c18;
+    --edge: #1c1c38;
+    --text: #e0e0e0;
+    --dim: #6a6a8a;
+    --accent: #00d4ff;
+    --leader: #00d4ff;
+    --worker: #ff8c00;
+    --strategy: #dc00ff;
+    --error: #ffc800;
+    --ok: #00ff88;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    overflow: hidden;
+  }
+  #stage { position: absolute; inset: 0 380px 0 0; }
+  #panel {
+    position: absolute; right: 0; top: 0; bottom: 0; width: 380px;
+    background: var(--panel);
+    border-left: 1px solid var(--edge);
+    display: flex; flex-direction: column;
+    padding: 14px;
+    gap: 10px;
+    overflow: hidden;
+  }
+  #title {
+    color: var(--accent);
+    font-size: 18px; font-weight: 700; letter-spacing: 0.04em;
+  }
+  .subtitle { color: var(--dim); font-size: 10px; margin-top: 2px; }
+  hr.rule { border: none; border-top: 1px solid var(--edge); margin: 4px 0; }
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+  }
+  .tile {
+    background: #14142a; border: 1px solid #28284a; border-radius: 4px;
+    padding: 6px 4px; text-align: center; min-height: 50px;
+  }
+  .tile .label { color: var(--dim); font-size: 9px; letter-spacing: 0.08em; }
+  .tile .value { color: var(--accent); font-size: 17px; font-weight: 700; line-height: 1.2; }
+  .tile .sub { color: var(--dim); font-size: 9px; }
+  .row { display: flex; gap: 6px; }
+  .btn {
+    flex: 1;
+    background: #14142a; border: 1px solid #28284a;
+    color: var(--dim); padding: 7px 8px; border-radius: 4px;
+    font-family: inherit; font-size: 10px; letter-spacing: 0.08em;
+    cursor: pointer; text-align: center;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.active { color: var(--accent); border-color: var(--accent); background: #0f1830; }
+  .btn.danger { border-color: #501a1a; color: #d05a5a; }
+  .btn.danger:hover { background: #2a0a0a; }
+  .btn.ok { border-color: #1a4a2a; color: #5acc7a; }
+  #log {
+    flex: 1 1 auto; min-height: 0;
+    overflow-y: auto;
+    background: #0a0a18;
+    border: 1px solid var(--edge); border-radius: 4px;
+    padding: 6px; font-size: 10px; line-height: 1.5;
+  }
+  #log .row { display: block; padding: 1px 0; opacity: 1; }
+  #log .ts   { color: var(--dim); }
+  #log .src  { color: var(--dim); margin-right: 4px; }
+  #log .msg  { color: #c8c8d8; }
+  .type-CLAIM      { color: var(--accent); }
+  .type-STRATEGY   { color: var(--strategy); }
+  .type-BOTTLENECK { color: var(--error); }
+  .type-COMPLETE   { color: var(--ok); }
+  .type-INTENT     { color: #b0b0c0; }
+  .type-REASONING  { color: var(--strategy); }
+  .type-ERROR      { color: var(--error); }
+  .type-USER       { color: #fff; font-weight: 700; }
+  #chat-row { display: flex; gap: 6px; }
+  #chat-input {
+    flex: 1;
+    background: #10101e; border: 1px solid #2a2a55; border-radius: 4px;
+    color: var(--text); padding: 8px 10px;
+    font-family: inherit; font-size: 12px;
+  }
+  #chat-input:focus { outline: none; border-color: var(--accent); }
+  #send-btn {
+    background: #0a1428; border: 1px solid #284060;
+    color: var(--accent); padding: 8px 16px; border-radius: 4px;
+    font-family: inherit; font-size: 11px; letter-spacing: 0.1em;
+    cursor: pointer;
+  }
+  #send-btn:hover { background: #112038; border-color: var(--accent); }
+  #endpoints { color: var(--dim); font-size: 10px; white-space: pre-wrap; }
+  #endpoints b { color: #b8b8c8; font-weight: 600; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 9px; letter-spacing: 0.08em; }
+  .badge.online  { background: #0a2818; color: #5acc7a; }
+  .badge.offline { background: #2a0a0a; color: #d05a5a; }
+  .badge.mock    { background: #2a1a0a; color: #ddaa55; }
+  #hint {
+    position: absolute; left: 12px; bottom: 12px;
+    color: var(--dim); font-size: 10px; pointer-events: none;
+  }
+  #hint b { color: #c8c8d8; font-weight: 600; }
+  #status-bar {
+    position: absolute; left: 12px; top: 12px;
+    display: flex; gap: 8px; align-items: center;
+  }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+
+<body>
+<div id="stage"></div>
+
+<div id="status-bar">
+  <span id="conn-badge" class="badge online">ONLINE</span>
+  <span id="mock-badge" class="badge mock" style="display:none">MOCK</span>
+</div>
+
+<div id="hint">
+  <b>drag</b> rotate &nbsp; <b>scroll</b> zoom &nbsp; <b>right-drag</b> pan
+</div>
+
+<div id="panel">
+  <div>
+    <div id="title">FACTORYMIND <span style="font-weight:400;color:var(--dim);">3D</span></div>
+    <div class="subtitle">Nemotron + DGX Spark GX10</div>
+  </div>
+  <hr class="rule" />
+
+  <div class="stats">
+    <div class="tile"><div class="label">COMPLETED</div><div class="value" id="s-completed">0</div></div>
+    <div class="tile"><div class="label">TIME</div>     <div class="value" id="s-time">00:00</div></div>
+    <div class="tile"><div class="label">RATE/MIN</div> <div class="value" id="s-rate">0.0</div></div>
+    <div class="tile">
+      <div class="label">LAST ROUTE</div>
+      <div class="value" id="s-last">--</div>
+      <div class="sub" id="s-avg"></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <button class="btn" id="btn-reset">RESET</button>
+    <button class="btn" id="btn-speed">SPEED 1x →</button>
+    <button class="btn danger" id="btn-disconnect">FORCE LOCAL NIM</button>
+  </div>
+
+  <hr class="rule" />
+  <div id="endpoints">connecting…</div>
+
+  <hr class="rule" />
+  <div style="color: var(--accent); font-size: 11px; letter-spacing: 0.08em;">AGENT REASONING</div>
+  <div id="log"></div>
+
+  <div id="chat-row">
+    <input id="chat-input" placeholder="Give the agents a task…" autocomplete="off" />
+    <button id="send-btn">SEND</button>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const GRID = 50;
+const STATE_URL  = "/state.json";
+const ACTION_URL = "/action";
+const LEADER_COLOR = 0x00d4ff;
+const WORKER_COLOR = 0xff8c00;
+const WS_LIGHT = { Parts: 0xff5050, Assembly: 0x5080ff, QA: 0x44dd66, Shipping: 0xffcc44 };
+
+// ---------------------------------------------------------------------------
+// Scene setup
+// ---------------------------------------------------------------------------
+const stage = document.getElementById("stage");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+stage.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x06060e);
+scene.fog = new THREE.Fog(0x06060e, GRID * 1.2, GRID * 3.2);
+
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 800);
+camera.position.set(GRID * 0.95, GRID * 1.0, GRID * 1.45);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(GRID / 2, 0, GRID / 2);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 12;
+controls.maxDistance = 180;
+controls.maxPolarAngle = Math.PI * 0.49;
+
+// Lights
+scene.add(new THREE.AmbientLight(0x404060, 1.1));
+const sun = new THREE.DirectionalLight(0xfff4e0, 1.6);
+sun.position.set(60, 90, 40);
+sun.castShadow = true;
+sun.shadow.mapSize.width = 2048;
+sun.shadow.mapSize.height = 2048;
+sun.shadow.camera.left   = -GRID;
+sun.shadow.camera.right  =  GRID * 1.5;
+sun.shadow.camera.top    =  GRID * 1.5;
+sun.shadow.camera.bottom = -GRID;
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far  = 220;
+scene.add(sun);
+
+const rim = new THREE.DirectionalLight(0x4488ff, 0.45);
+rim.position.set(-30, 60, -40);
+scene.add(rim);
+
+// Floor
+{
+  const geo = new THREE.PlaneGeometry(GRID, GRID, 1, 1);
+  geo.rotateX(-Math.PI / 2);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x14142a, metalness: 0.15, roughness: 0.85,
+  });
+  const floor = new THREE.Mesh(geo, mat);
+  floor.position.set(GRID / 2, 0, GRID / 2);
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  const grid = new THREE.GridHelper(GRID, 50, 0x2a2a52, 0x16162a);
+  grid.position.set(GRID / 2, 0.02, GRID / 2);
+  scene.add(grid);
+
+  // bordering rim
+  const rimGeo = new THREE.BoxGeometry(GRID + 1, 0.4, GRID + 1);
+  const rimMat = new THREE.MeshStandardMaterial({ color: 0x1a1a36, roughness: 0.6 });
+  const rimMesh = new THREE.Mesh(rimGeo, rimMat);
+  rimMesh.position.set(GRID / 2, -0.2, GRID / 2);
+  rimMesh.receiveShadow = true;
+  scene.add(rimMesh);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function gridToWorld(gx, gy) {
+  return { x: gx + 0.5, z: gy + 0.5 };
+}
+
+function makeLabelSprite(text, color = "#ffffff", scale = 1.2) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 256; canvas.height = 96;
+  const ctx = canvas.getContext("2d");
+  ctx.font = "bold 56px ui-monospace, Menlo, monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.shadowColor = "rgba(0,0,0,0.85)";
+  ctx.shadowBlur = 8;
+  ctx.fillText(text, 128, 50);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
+  const spr = new THREE.Sprite(mat);
+  spr.scale.set(scale * 3.0, scale, 1);
+  return spr;
+}
+
+// ---------------------------------------------------------------------------
+// Scene maps
+// ---------------------------------------------------------------------------
+const wallMeshes  = new Map();   // "x,y" -> mesh
+const wsMeshes    = new Map();   // name  -> Group
+const robotMeshes = new Map();   // id    -> Group
+const taskMeshes  = new Map();   // id    -> Group
+const robotVisualPos = new Map();// id    -> {x, z, target:{x,z}}
+let pathLines = [];
+
+// ---------------------------------------------------------------------------
+// Sync functions: take latest world snapshot, mutate scene to match
+// ---------------------------------------------------------------------------
+function syncWalls(world) {
+  const seen = new Set();
+  for (const cell of world.wall ?? []) {
+    const wx = cell[0], wy = cell[1];
+    const key = wx + "," + wy;
+    seen.add(key);
+    if (!wallMeshes.has(key)) {
+      const geo = new THREE.BoxGeometry(1, 1.4, 1);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x3a3a66, roughness: 0.55, metalness: 0.25,
+      });
+      const m = new THREE.Mesh(geo, mat);
+      const w = gridToWorld(wx, wy);
+      m.position.set(w.x, 0.7, w.z);
+      m.castShadow = true; m.receiveShadow = true;
+      scene.add(m);
+      wallMeshes.set(key, m);
+    }
+  }
+  for (const [key, m] of wallMeshes) {
+    if (!seen.has(key)) {
+      scene.remove(m);
+      m.geometry.dispose(); m.material.dispose();
+      wallMeshes.delete(key);
+    }
+  }
+}
+
+function syncWorkstations(world) {
+  for (const ws of world.workstations ?? []) {
+    if (wsMeshes.has(ws.name)) continue;
+    const group = new THREE.Group();
+    const tint = new THREE.Color(`rgb(${ws.color[0]},${ws.color[1]},${ws.color[2]})`);
+
+    // Base platform
+    const base = new THREE.Mesh(
+      new THREE.BoxGeometry(3, 0.4, 3),
+      new THREE.MeshStandardMaterial({ color: 0x12122a, roughness: 0.7, metalness: 0.4 }),
+    );
+    base.position.y = 0.2;
+    base.castShadow = true; base.receiveShadow = true;
+    group.add(base);
+
+    // Equipment block
+    const eq = new THREE.Mesh(
+      new THREE.BoxGeometry(2.4, 1.6, 2.4),
+      new THREE.MeshStandardMaterial({
+        color: tint, emissive: tint, emissiveIntensity: 0.35,
+        roughness: 0.35, metalness: 0.55,
+      }),
+    );
+    eq.position.y = 1.2;
+    eq.castShadow = true; eq.receiveShadow = true;
+    group.add(eq);
+
+    // Top accent
+    const top = new THREE.Mesh(
+      new THREE.BoxGeometry(1.4, 0.25, 1.4),
+      new THREE.MeshStandardMaterial({
+        color: tint, emissive: tint, emissiveIntensity: 1.0,
+      }),
+    );
+    top.position.y = 2.15;
+    group.add(top);
+
+    // Floating label
+    const lbl = makeLabelSprite(ws.name.toUpperCase(), `rgb(${ws.color[0]},${ws.color[1]},${ws.color[2]})`, 1.4);
+    lbl.position.set(0, 3.4, 0);
+    group.add(lbl);
+
+    const w = gridToWorld(ws.pos[0], ws.pos[1]);
+    group.position.set(w.x, 0, w.z);
+    scene.add(group);
+    wsMeshes.set(ws.name, group);
+  }
+}
+
+function syncRobots(world) {
+  const seen = new Set();
+  for (const r of world.robots ?? []) {
+    seen.add(r.id);
+    let g = robotMeshes.get(r.id);
+    const isLeader = r.role === "LEADER";
+    const color = isLeader ? LEADER_COLOR : WORKER_COLOR;
+    const radius = isLeader ? 0.55 : 0.45;
+    if (!g) {
+      g = new THREE.Group();
+      const body = new THREE.Mesh(
+        new THREE.SphereGeometry(radius, 28, 18),
+        new THREE.MeshStandardMaterial({
+          color, emissive: color, emissiveIntensity: 0.55,
+          roughness: 0.25, metalness: 0.5,
+        }),
+      );
+      body.castShadow = true;
+      body.position.y = radius;
+      g.add(body);
+
+      const ringGeo = new THREE.RingGeometry(radius * 1.4, radius * 1.7, 32);
+      ringGeo.rotateX(-Math.PI / 2);
+      const ring = new THREE.Mesh(
+        ringGeo,
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35, side: THREE.DoubleSide }),
+      );
+      ring.position.y = 0.05;
+      g.add(ring);
+      g.userData.ring = ring;
+
+      const lbl = makeLabelSprite(`${isLeader ? "L" : "W"}${r.id}`, "#ffffff", 0.55);
+      lbl.position.set(0, radius * 2 + 0.4, 0);
+      g.add(lbl);
+
+      scene.add(g);
+      robotMeshes.set(r.id, g);
+    }
+    const target = gridToWorld(r.pos[0], r.pos[1]);
+    let v = robotVisualPos.get(r.id);
+    if (!v) {
+      v = { x: target.x, z: target.z, target };
+      robotVisualPos.set(r.id, v);
+    } else {
+      v.target = target;
+    }
+  }
+  for (const [id, g] of robotMeshes) {
+    if (!seen.has(id)) {
+      scene.remove(g);
+      robotMeshes.delete(id);
+      robotVisualPos.delete(id);
+    }
+  }
+}
+
+function syncTasks(world) {
+  const seen = new Set();
+  for (const t of world.tasks ?? []) {
+    if (t.status === "done" || t.status === "cancelled") continue;
+    seen.add(t.id);
+    let g = taskMeshes.get(t.id);
+    if (!g) {
+      g = new THREE.Group();
+      const pickupMat = new THREE.MeshStandardMaterial({
+        color: 0xff5a5a, emissive: 0xff5a5a, emissiveIntensity: 0.8,
+      });
+      const pickup = new THREE.Mesh(new THREE.OctahedronGeometry(0.4), pickupMat);
+
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+      const line = new THREE.Line(
+        lineGeo,
+        new THREE.LineDashedMaterial({
+          color: 0xffffff, transparent: true, opacity: 0.45,
+          dashSize: 0.6, gapSize: 0.4,
+        }),
+      );
+
+      g.add(pickup); g.add(line);
+      g.userData = { pickup, line };
+      scene.add(g);
+      taskMeshes.set(t.id, g);
+    }
+    const p = gridToWorld(t.pickup[0], t.pickup[1]);
+    const d = gridToWorld(t.delivery[0], t.delivery[1]);
+    g.userData.pickup.position.set(p.x, 1.6, p.z);
+    const claimedColor = (t.assigned_to !== null && t.assigned_to !== undefined) ? 0x55dd77 : 0xff5a5a;
+    g.userData.pickup.material.color.setHex(claimedColor);
+    g.userData.pickup.material.emissive.setHex(claimedColor);
+    const positions = g.userData.line.geometry.attributes.position.array;
+    positions[0] = p.x; positions[1] = 0.15; positions[2] = p.z;
+    positions[3] = d.x; positions[4] = 0.15; positions[5] = d.z;
+    g.userData.line.geometry.attributes.position.needsUpdate = true;
+    g.userData.line.computeLineDistances();
+  }
+  for (const [id, g] of taskMeshes) {
+    if (!seen.has(id)) {
+      scene.remove(g);
+      taskMeshes.delete(id);
+    }
+  }
+}
+
+function syncPaths(world) {
+  for (const pl of pathLines) {
+    scene.remove(pl);
+    pl.geometry.dispose(); pl.material.dispose();
+  }
+  pathLines = [];
+  for (const r of world.robots ?? []) {
+    if (!r.path || r.path.length === 0) continue;
+    const isLeader = r.role === "LEADER";
+    const points = [];
+    const start = gridToWorld(r.pos[0], r.pos[1]);
+    points.push(new THREE.Vector3(start.x, 0.25, start.z));
+    for (const cell of r.path) {
+      const p = gridToWorld(cell[0], cell[1]);
+      points.push(new THREE.Vector3(p.x, 0.25, p.z));
+    }
+    const geo = new THREE.BufferGeometry().setFromPoints(points);
+    const mat = new THREE.LineBasicMaterial({
+      color: isLeader ? LEADER_COLOR : WORKER_COLOR,
+      transparent: true, opacity: 0.55,
+    });
+    const line = new THREE.Line(geo, mat);
+    scene.add(line);
+    pathLines.push(line);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HUD updates
+// ---------------------------------------------------------------------------
+function fmtTime(t) {
+  const s = Math.max(0, Math.floor(t || 0));
+  return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+}
+
+function updateHUD(world, info) {
+  const stats = world.stats ?? {};
+  document.getElementById("s-completed").textContent = stats.completed ?? 0;
+  document.getElementById("s-time").textContent      = fmtTime(stats.elapsed ?? 0);
+  document.getElementById("s-rate").textContent      = (stats.rate ?? 0).toFixed(1);
+  document.getElementById("s-last").textContent      =
+    stats.last_route_time != null ? `${stats.last_route_time.toFixed(2)}s` : "--";
+  document.getElementById("s-avg").textContent       =
+    stats.avg_route_time != null ? `avg ${stats.avg_route_time.toFixed(1)}s` : "";
+
+  const speed = world.speed_multiplier ?? 1;
+  document.getElementById("btn-speed").textContent = `SPEED ${speed}x →`;
+
+  const conn = world.connection_status ?? "online";
+  const cb = document.getElementById("conn-badge");
+  cb.textContent = conn.toUpperCase();
+  cb.className = "badge " + conn;
+  const dis = document.getElementById("btn-disconnect");
+  if (conn === "offline") {
+    dis.textContent = "LOCAL NIM ACTIVE";
+    dis.classList.remove("danger");
+    dis.classList.add("ok");
+  } else {
+    dis.textContent = "FORCE LOCAL NIM";
+    dis.classList.remove("ok");
+    dis.classList.add("danger");
+  }
+
+  const mockBadge = document.getElementById("mock-badge");
+  if (info && info.mock) { mockBadge.style.display = "inline-block"; }
+  else { mockBadge.style.display = "none"; }
+
+  if (info && info.endpoints) {
+    document.getElementById("endpoints").textContent = info.endpoints;
+  }
+
+  const log = document.getElementById("log");
+  const messages = (world.blackboard ?? []).slice(-32);
+  // Build role lookup for nicer source labels
+  const roleById = new Map();
+  for (const r of (world.robots ?? [])) roleById.set(r.id, r.role);
+  // Re-render only when content actually changed
+  const sig = messages.length + ":" + (messages[messages.length - 1]?.timestamp ?? 0);
+  if (log.dataset.sig !== sig) {
+    log.dataset.sig = sig;
+    log.innerHTML = "";
+    for (const m of messages.slice().reverse()) {
+      const row = document.createElement("div");
+      row.className = "row";
+      const fromId = m.from;
+      const src =
+        fromId === -1 ? "Strategist" :
+        roleById.get(fromId) === "LEADER" ? `Leader-${fromId}` : `Worker-${fromId}`;
+      const t = String(m.type || "");
+      const content = String(m.content || "").slice(0, 80);
+      row.innerHTML =
+        `<span class="ts">[${t}]</span> ` +
+        `<span class="src">${src}:</span>` +
+        `<span class="msg type-${t}"> ${escapeHtml(content)}</span>`;
+      log.appendChild(row);
+    }
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// ---------------------------------------------------------------------------
+// Polling loop
+// ---------------------------------------------------------------------------
+async function pollState() {
+  try {
+    const r = await fetch(STATE_URL, { cache: "no-store" });
+    if (!r.ok) return;
+    const data = await r.json();
+    const world = data.world ?? {};
+    syncWalls(world);
+    syncWorkstations(world);
+    syncRobots(world);
+    syncTasks(world);
+    syncPaths(world);
+    updateHUD(world, data.info ?? {});
+  } catch (e) { /* server down briefly; just try again */ }
+}
+setInterval(pollState, 100);
+pollState();
+
+// ---------------------------------------------------------------------------
+// Animation loop with smooth lerp for robots and rotating task gems
+// ---------------------------------------------------------------------------
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  const lerp = 1 - Math.exp(-dt * 9);
+  for (const [id, g] of robotMeshes) {
+    const v = robotVisualPos.get(id);
+    if (!v || !v.target) continue;
+    v.x += (v.target.x - v.x) * lerp;
+    v.z += (v.target.z - v.z) * lerp;
+    g.position.x = v.x;
+    g.position.z = v.z;
+    if (g.userData.ring) g.userData.ring.rotation.y += dt * 0.7;
+  }
+  for (const [, g] of taskMeshes) {
+    if (g.userData.pickup) g.userData.pickup.rotation.y += dt * 1.4;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ---------------------------------------------------------------------------
+// Resize
+// ---------------------------------------------------------------------------
+function resize() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h, false);
+}
+new ResizeObserver(resize).observe(stage);
+resize();
+
+// ---------------------------------------------------------------------------
+// Actions: chat + buttons
+// ---------------------------------------------------------------------------
+async function sendAction(payload) {
+  try {
+    await fetch(ACTION_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) { console.warn("action failed", e); }
+}
+
+const chat = document.getElementById("chat-input");
+const send = () => {
+  const text = chat.value.trim();
+  if (!text) return;
+  sendAction({ type: "user_prompt", text });
+  chat.value = "";
+};
+document.getElementById("send-btn").addEventListener("click", send);
+chat.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+
+document.getElementById("btn-reset").addEventListener("click",      () => sendAction({ type: "reset" }));
+document.getElementById("btn-speed").addEventListener("click",      () => sendAction({ type: "speedup" }));
+document.getElementById("btn-disconnect").addEventListener("click", () => sendAction({ type: "disconnect" }));
+</script>
+</body>
+</html>

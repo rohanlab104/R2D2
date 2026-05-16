@@ -38,6 +38,17 @@ python3 -m factorymind.main
 python3 -m pytest tests/
 ```
 
+### 3D viewer (Three.js, runs on the GX10)
+
+Same simulation as `factorymind.main`, rendered in 3D in a browser instead of pygame:
+
+```bash
+./scripts/run_web.sh
+# then open http://<gx10-ip>:8080  (or http://localhost:8080 on the GX10 itself)
+```
+
+`scripts/run_web.sh` runs `python -m factorymind.web_main`, which serves a static Three.js page on port 8080 and a JSON snapshot of `world_state` at `/state.json`. The browser polls 10 Hz and posts chat prompts / button clicks back to `/action`. No new Python deps — the HTTP bridge is stdlib `http.server`.
+
 ### Where does inference happen?
 
 The Python in `factorymind/inference.py` is just an OpenAI-compatible HTTP client. The GPU work happens wherever the URL points:
