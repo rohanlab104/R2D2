@@ -30,7 +30,6 @@ from factorymind.agents import (
     leader_decide,
     strategist_decide,
     worker_decide,
-    worker_step,
 )
 from factorymind.state import (
     LEADER, OPEN_FLOOR, STRATEGY, WORKER,
@@ -306,12 +305,7 @@ def run() -> None:
                 if now - timers["last_move_tick"] >= M.MOVE_TICK_INTERVAL:
                     move_steps = min(int((now - timers["last_move_tick"]) // M.MOVE_TICK_INTERVAL), 4)
                     for _ in range(max(1, move_steps)):
-                        for robot in world_state["robots"]:
-                            if robot["role"] == WORKER:
-                                next_pos = worker_step(robot, world_state, blackboard)
-                                if robot.get("path") and next_pos != robot["path"][0]:
-                                    robot["path"].insert(0, next_pos)
-                            M._advance_robot(robot, world_state, blackboard)
+                        M._advance_robots_coordinated(world_state, blackboard)
                     timers["last_move_tick"] += max(1, move_steps) * M.MOVE_TICK_INTERVAL
 
                 world_state["stats"]["elapsed"] = round(sim_elapsed, 1)

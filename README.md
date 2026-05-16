@@ -61,8 +61,14 @@ The Python in `factorymind/inference.py` is just an OpenAI-compatible HTTP clien
 
 | Port | Model | Role |
 |------|-------|------|
-| 8000 | `nemotron-nano-9b-v2` | Leader |
+| 8000 | `nemotron-nano-9b-v2` | Leaders, workers, chat task interpreter |
 | 8001 | `llama-3_3-nemotron-super-49b-v1_5` | Strategist |
+
+Runtime defaults are tuned for the GX10 demo: `USE_LOCAL_NIM=true`,
+`ALL_AGENTS_LLM=true`, `USE_LLM_TASK_INTERPRETER=true`,
+`COOPERATIVE_PATHING=true`, and `NEMOTRON_TIMEOUT_SECONDS=60`. If any model
+override contains `120B`, the client ignores it for now and falls back to the
+configured smaller role model.
 
 ### Person A — Inference checklist (running on the DGX Spark GX10)
 
@@ -196,7 +202,7 @@ SSH note: `gx10-d8fb` is a short hostname that won't resolve outside the lab's D
 
 | Role | Model |
 |------|-------|
-| Leader (fast decisions) | `nvidia/nvidia-nemotron-nano-9b-v2` |
+| Leader / Worker / Chat task interpreter | `nvidia/nvidia-nemotron-nano-9b-v2` |
 | Strategist (high-level) | `nvidia/llama-3_3-nemotron-super-49b-v1_5` |
 
 ---

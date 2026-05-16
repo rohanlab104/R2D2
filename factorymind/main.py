@@ -55,10 +55,10 @@ STRATEGIST_TICK_INTERVAL = 20.0
 MOVE_TICK_INTERVAL = 0.05  # how often robots advance one step
 SPEED_OPTIONS = (1, 2, 3, 4)
 
-# Set ALL_AGENTS_LLM=true if you want every worker to make its own model call.
-# Default is false: leaders/strategist use the LLM, while workers assist only
-# after a leader claim. This is faster and keeps the chain of command visible.
-_ALL_AGENTS_LLM = os.getenv("ALL_AGENTS_LLM", "false").lower() == "true"
+# Defaults favor the full agentic demo: every idle worker gets its own model
+# decision, while path execution stays deterministic and locally verifiable.
+_ALL_AGENTS_LLM = os.getenv("ALL_AGENTS_LLM", "true").lower() == "true"
+_COOPERATIVE_PATHING = os.getenv("COOPERATIVE_PATHING", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Background inference workers
@@ -128,6 +128,108 @@ def a_star(start: list[int], goal: list[int], wall_set: set) -> list[list[int]]:
     return []  # no path
 
 
+def _cooperative_a_star(
+    start: list[int],
+    goal: list[int],
+    wall_set: set,
+    reservations: dict[str, dict[int, set]],
+    *,
+    max_steps: int = 220,
+) -> list[list[int]]:
+    """Plan a path in x/y/time, respecting other robots' reserved cells.
+
+    Robots may wait in place. This gives each agent an independent route plan
+    that accounts for the paths already committed by its neighbors.
+    """
+    if start == goal:
+        return []
+
+    sx, sy = start
+    gx, gy = goal
+    start_state = (sx, sy, 0)
+    open_heap: list[tuple[int, int, int, tuple[int, int, int]]] = []
+    heapq.heappush(open_heap, (abs(sx - gx) + abs(sy - gy), 0, 0, start_state))
+    came_from: dict[tuple[int, int, int], tuple[int, int, int] | None] = {start_state: None}
+    g_score: dict[tuple[int, int, int], int] = {start_state: 0}
+
+    cells_by_time = reservations.get("cells", {})
+    edges_by_time = reservations.get("edges", {})
+    moves = [(1, 0), (-1, 0), (0, 1), (0, -1), (0, 0)]
+
+    while open_heap:
+        _, g, _, state = heapq.heappop(open_heap)
+        cx, cy, t = state
+        if [cx, cy] == goal:
+            path: list[list[int]] = []
+            node: tuple[int, int, int] | None = state
+            while node is not None:
+                path.append([node[0], node[1]])
+                node = came_from[node]
+            path.reverse()
+            return path[1:]
+        if t >= max_steps:
+            continue
+
+        for dx, dy in moves:
+            nx, ny, nt = cx + dx, cy + dy, t + 1
+            if not (0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT):
+                continue
+            if (nx, ny) in wall_set:
+                continue
+            if (nx, ny) in cells_by_time.get(nt, set()):
+                continue
+            if ((nx, ny), (cx, cy)) in edges_by_time.get(nt, set()):
+                continue
+            next_state = (nx, ny, nt)
+            ng = g + 1
+            if ng >= g_score.get(next_state, 10**9):
+                continue
+            g_score[next_state] = ng
+            came_from[next_state] = state
+            priority = ng + abs(nx - gx) + abs(ny - gy)
+            # Waiting is useful, but moving wins ties so robots do not loiter.
+            wait_bias = 1 if (nx, ny) == (cx, cy) else 0
+            heapq.heappush(open_heap, (priority + wait_bias, ng, id(next_state), next_state))
+
+    return []
+
+
+def _reservation_table(world_state: dict, *, exclude_robot_id: int | None = None) -> dict[str, dict[int, set]]:
+    """Build time-indexed cell and edge reservations from active robot paths."""
+    cells: dict[int, set[tuple[int, int]]] = {}
+    edges: dict[int, set[tuple[tuple[int, int], tuple[int, int]]]] = {}
+    for robot in world_state.get("robots", []):
+        if robot.get("id") == exclude_robot_id:
+            continue
+        positions = [list(robot.get("pos", [0, 0]))] + [list(p) for p in robot.get("path", [])]
+        for t, pos in enumerate(positions):
+            cells.setdefault(t, set()).add(tuple(pos))
+            if t > 0:
+                edges.setdefault(t, set()).add((tuple(positions[t - 1]), tuple(pos)))
+        if positions:
+            last = tuple(positions[-1])
+            for t in range(len(positions), len(positions) + 12):
+                cells.setdefault(t, set()).add(last)
+    return {"cells": cells, "edges": edges}
+
+
+def _planned_path_to(
+    robot: dict,
+    goal: list[int],
+    world_state: dict,
+    *,
+    ignore_reservations: bool = False,
+) -> list[list[int]]:
+    """Return a route that accounts for walls and, by default, other robots."""
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    if _COOPERATIVE_PATHING and not ignore_reservations:
+        reservations = _reservation_table(world_state, exclude_robot_id=robot.get("id"))
+        path = _cooperative_a_star(robot["pos"], goal, wall_set, reservations)
+        if path:
+            return path
+    return a_star(robot["pos"], goal, wall_set)
+
+
 # ---------------------------------------------------------------------------
 # Task generation
 # ---------------------------------------------------------------------------
@@ -180,12 +282,10 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
         return
 
     pos = robot["pos"]
-    wall_set = {tuple(c) for c in world_state.get("wall", [])}
-
     # If at pickup and task not yet in transit
     if pos == task["pickup"] and task["status"] == "open":
         task["status"] = "in_transit"
-        robot["path"] = a_star(pos, task["delivery"], wall_set)
+        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
 
     # If at delivery — task done, then stop until the next user task.
     elif pos == task["delivery"] and task["status"] == "in_transit":
@@ -296,8 +396,7 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
     task["assigned_to"] = robot["id"]
     task["started_at"] = time.time()
     robot["current_task"] = task["id"]
-    wall_set = {tuple(c) for c in world_state.get("wall", [])}
-    robot["path"] = a_star(robot["pos"], task["pickup"], wall_set)
+    robot["path"] = _planned_path_to(robot, task["pickup"], world_state)
 
 
 def _route_cost(start: list[int], goal: list[int], wall_set: set) -> int:
@@ -308,11 +407,56 @@ def _route_cost(start: list[int], goal: list[int], wall_set: set) -> int:
     return len(path) if path else 10**6
 
 
-def _estimate_task_cost(robot: dict, task: dict, wall_set: set) -> int:
-    """Estimate total route length: robot -> pickup -> delivery."""
-    to_pickup = _route_cost(robot["pos"], task["pickup"], wall_set)
+def _traffic_penalty_for_path(robot: dict, path: list[list[int]], world_state: dict | None) -> int:
+    """Score route overlap with other agents' current commitments."""
+    if not world_state or not path:
+        return 0
+
+    penalty = 0
+    occupied_now = {
+        tuple(r.get("pos", []))
+        for r in world_state.get("robots", [])
+        if r.get("id") != robot.get("id")
+    }
+    active_path_cells: set[tuple[int, int]] = set()
+    for other in world_state.get("robots", []):
+        if other.get("id") == robot.get("id"):
+            continue
+        active_path_cells.update(tuple(p) for p in other.get("path", []))
+
+    for index, cell in enumerate(path):
+        tcell = tuple(cell)
+        if tcell in occupied_now:
+            penalty += 8
+        if tcell in active_path_cells:
+            penalty += 3
+        if index > 0 and cell == path[index - 1]:
+            penalty += 1
+
+    if world_state.get("layout") == BOTTLENECK_BRIDGE:
+        bridge_cells = sum(1 for x, y in path if y == 25 and 22 <= x <= 28)
+        penalty += bridge_cells * 2
+    return penalty
+
+
+def _estimate_task_cost(
+    robot: dict,
+    task: dict,
+    wall_set: set,
+    world_state: dict | None = None,
+) -> int:
+    """Estimate route length with congestion and existing robot paths included."""
+    if world_state is not None:
+        to_pickup_path = _planned_path_to(robot, task["pickup"], world_state)
+        to_pickup = len(to_pickup_path) if to_pickup_path or robot["pos"] == task["pickup"] else 10**6
+    else:
+        to_pickup_path = []
+        to_pickup = _route_cost(robot["pos"], task["pickup"], wall_set)
     to_delivery = _route_cost(task["pickup"], task["delivery"], wall_set)
-    return to_pickup + to_delivery
+    if to_pickup >= 10**6 or to_delivery >= 10**6:
+        return 10**6
+    route_stub = to_pickup_path + a_star(task["pickup"], task["delivery"], wall_set)
+    return to_pickup + to_delivery + _traffic_penalty_for_path(robot, route_stub, world_state)
 
 
 def _delegate_task_to_nearest_worker(
@@ -331,12 +475,20 @@ def _delegate_task_to_nearest_worker(
 
     worker = min(
         idle_workers,
-        key=lambda r: (_estimate_task_cost(r, task, {tuple(c) for c in world_state.get("wall", [])}), r["id"]),
+        key=lambda r: (
+            _estimate_task_cost(r, task, {tuple(c) for c in world_state.get("wall", [])}, world_state),
+            r["id"],
+        ),
     )
     _assign_task_to_robot(worker, task, world_state)
     task["delegated_by"] = leader["id"]
     route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
-    distance = _estimate_task_cost(worker, task, {tuple(c) for c in world_state.get("wall", [])})
+    distance = _estimate_task_cost(
+        worker,
+        task,
+        {tuple(c) for c in world_state.get("wall", [])},
+        world_state,
+    )
     blackboard.post(
         leader["id"],
         "INTENT",
@@ -372,7 +524,7 @@ def _dispatch_batch_to_workers(
         best_pair: tuple[dict, dict, int] | None = None
         for task in remaining_tasks:
             for worker in remaining_workers:
-                cost = _estimate_task_cost(worker, task, wall_set)
+                cost = _estimate_task_cost(worker, task, wall_set, world_state)
                 if cost >= 10**6:
                     continue
                 if best_pair is None or (cost, worker["id"], task["id"]) < (
@@ -544,6 +696,11 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     if _is_go_and_stop_command(text):
         return []
 
+    if os.getenv("USE_LLM_TASK_INTERPRETER", "true").lower() == "true":
+        interpreted = _interpret_user_task_requests(text, world_state)
+        if interpreted:
+            return interpreted
+
     worker_count = max(1, sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER))
     remaining = worker_count
     requests: list[tuple[dict, dict, int]] = []
@@ -570,11 +727,6 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     parsed = _parse_user_task_request(text, world_state)
     if parsed is not None:
         return [parsed]
-
-    if os.getenv("USE_LLM_TASK_INTERPRETER", "false").lower() == "true":
-        interpreted = _interpret_user_task_requests(text, world_state)
-        if interpreted:
-            return interpreted
 
     return []
 
@@ -1040,7 +1192,7 @@ def _precompute_timeline(duration: float) -> list[dict]:
 
     snapshot_interval = float(os.getenv("FACTORYMIND_REPLAY_SNAPSHOT_INTERVAL", "0.2"))
     precompute_dt = float(os.getenv("FACTORYMIND_PRECOMPUTE_DT", "0.1"))
-    wait_default = float(os.getenv("NEMOTRON_TIMEOUT_SECONDS", "3.0")) + 1.0
+    wait_default = float(os.getenv("NEMOTRON_TIMEOUT_SECONDS", "60.0")) + 1.0
     decision_wait = float(os.getenv("FACTORYMIND_PRECOMPUTE_WAIT_SECONDS", str(wait_default)))
 
     sim_elapsed = 0.0
@@ -1202,7 +1354,9 @@ def _print_startup_banner() -> None:
         print(f"  (could not describe inference endpoints: {exc})", flush=True)
     print(
         f"  AGENTS_USE_MOCK={os.getenv('AGENTS_USE_MOCK', 'false')}  "
-        f"ALL_AGENTS_LLM={os.getenv('ALL_AGENTS_LLM', 'false')}  "
+        f"ALL_AGENTS_LLM={os.getenv('ALL_AGENTS_LLM', 'true')}  "
+        f"USE_LLM_TASK_INTERPRETER={os.getenv('USE_LLM_TASK_INTERPRETER', 'true')}  "
+        f"COOPERATIVE_PATHING={os.getenv('COOPERATIVE_PATHING', 'true')}  "
         f"USE_LOCAL_NIM={os.getenv('USE_LOCAL_NIM', 'true')}  "
         f"GX10_IP={os.getenv('GX10_IP', 'localhost')}",
         flush=True,

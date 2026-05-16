@@ -25,6 +25,7 @@ NIM_STRATEGIST_BASE_URL : Override strategist endpoint (default http://{GX10_IP}
 LOCAL_NIM_BASE_URL      : Shared local endpoint override for both roles.
 LEADER_MODEL            : Override leader model id.
 STRATEGIST_MODEL        : Override strategist model id.
+NEMOTRON_TIMEOUT_SECONDS: Per-call HTTP timeout (default 60s for local NIM).
 NGC_API_KEY             : For docker login / NIM image pulls (often == NVIDIA_API_KEY).
 """
 
@@ -44,13 +45,28 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-LEADER_MODEL = os.getenv("LEADER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
-WORKER_MODEL = os.getenv("WORKER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
-TASK_INTERPRETER_MODEL = os.getenv("TASK_INTERPRETER_MODEL", LEADER_MODEL)
-STRATEGIST_MODEL = os.getenv(
-    "STRATEGIST_MODEL",
-    "nvidia/llama-3_3-nemotron-super-49b-v1_5",
-)
+_FAST_MODEL = "nvidia/nvidia-nemotron-nano-9b-v2"
+_STRATEGIST_FALLBACK_MODEL = "nvidia/llama-3_3-nemotron-super-49b-v1_5"
+
+
+def _model_env(name: str, fallback: str) -> str:
+    """Read a model env var while avoiding oversized 120B models for now."""
+    model = os.getenv(name, fallback).strip() or fallback
+    if "120b" in model.lower() or "120-b" in model.lower():
+        print(
+            f"[inference] {name}={model!r} is disabled for this sim run; "
+            f"using {fallback!r}.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return fallback
+    return model
+
+
+LEADER_MODEL = _model_env("LEADER_MODEL", _FAST_MODEL)
+WORKER_MODEL = _model_env("WORKER_MODEL", _FAST_MODEL)
+TASK_INTERPRETER_MODEL = _model_env("TASK_INTERPRETER_MODEL", LEADER_MODEL)
+STRATEGIST_MODEL = _model_env("STRATEGIST_MODEL", _STRATEGIST_FALLBACK_MODEL)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -64,7 +80,7 @@ _SHARED_LOCAL_URL = (
     or ""
 ).rstrip("/")
 _API_KEY = os.getenv("NVIDIA_API_KEY") or "no-key-needed-for-local"
-_TIMEOUT_SECONDS = float(os.getenv("NEMOTRON_TIMEOUT_SECONDS", "3.0"))
+_TIMEOUT_SECONDS = float(os.getenv("NEMOTRON_TIMEOUT_SECONDS", "60.0"))
 
 
 def _leader_base_url() -> str:
