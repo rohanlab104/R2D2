@@ -266,6 +266,50 @@ def _delegate_task_to_nearest_worker(
     return True
 
 
+def _dispatch_batch_to_workers(
+    tasks: list[dict],
+    world_state: dict,
+    blackboard: Blackboard,
+) -> int:
+    """Dispatch a user-created batch across idle workers at the same time."""
+    leaders = [r for r in world_state.get("robots", []) if r.get("role") == LEADER]
+    idle_workers = [
+        r for r in world_state.get("robots", [])
+        if r.get("role") == WORKER and r.get("current_task") is None and not r.get("path")
+    ]
+    if not leaders or not idle_workers:
+        return 0
+
+    dispatched = 0
+    for task in tasks:
+        if not idle_workers:
+            break
+        leader = leaders[dispatched % len(leaders)]
+        worker = min(
+            idle_workers,
+            key=lambda r: (
+                abs(r["pos"][0] - task["pickup"][0]) + abs(r["pos"][1] - task["pickup"][1]),
+                r["id"],
+            ),
+        )
+        idle_workers.remove(worker)
+        _assign_task_to_robot(worker, task, world_state)
+        task["delegated_by"] = leader["id"]
+        route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
+        distance = abs(worker["pos"][0] - task["pickup"][0]) + abs(worker["pos"][1] - task["pickup"][1])
+        blackboard.post(
+            leader["id"],
+            "CLAIM",
+            f"Batch dispatch: {route} task {task['id']} assigned to W{worker['id']} ({distance} cells to pickup).",
+        )
+        print(
+            f"[leader {leader['id']}] batch dispatch task {task['id']} ({route}) to worker {worker['id']}",
+            flush=True,
+        )
+        dispatched += 1
+    return dispatched
+
+
 # ---------------------------------------------------------------------------
 # Demo / integration helpers
 # ---------------------------------------------------------------------------
@@ -407,13 +451,15 @@ def _apply_user_task_request(
         for _ in range(count)
     ]
     world_state["tasks"].extend(new_tasks)
+    dispatched = _dispatch_batch_to_workers(new_tasks, world_state, blackboard)
     world_state["manual_control"] = False
     blackboard.post(
         -1,
         "STRATEGY",
         (
             f"User task accepted: {count} priority route(s) "
-            f"{pickup_ws['name']}->{delivery_ws['name']}."
+            f"{pickup_ws['name']}->{delivery_ws['name']}; "
+            f"{dispatched} worker(s) dispatched now."
         ),
     )
     print(
