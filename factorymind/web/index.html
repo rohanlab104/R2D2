@@ -137,7 +137,8 @@
 </div>
 
 <div id="hint">
-  <b>drag</b> rotate &nbsp; <b>scroll</b> zoom &nbsp; <b>right-drag</b> pan
+  <b>cursor</b>: drag rotate · scroll zoom · right-drag pan<br />
+  <b>builder</b>: left-click/drag add · right-click remove
 </div>
 
 <div id="panel">
@@ -158,6 +159,10 @@
     </div>
   </div>
 
+  <div class="row">
+    <button class="btn active" id="btn-mode-cursor">✦ CURSOR</button>
+    <button class="btn" id="btn-mode-builder">✏ BUILDER</button>
+  </div>
   <div class="row">
     <button class="btn" id="btn-reset">RESET</button>
     <button class="btn" id="btn-speed">SPEED 1x →</button>
@@ -669,6 +674,109 @@ chat.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 document.getElementById("btn-reset").addEventListener("click",      () => sendAction({ type: "reset" }));
 document.getElementById("btn-speed").addEventListener("click",      () => sendAction({ type: "speedup" }));
 document.getElementById("btn-disconnect").addEventListener("click", () => sendAction({ type: "disconnect" }));
+
+// ---------------------------------------------------------------------------
+// BUILDER mode — click the floor to add walls, right-click to remove.
+// Drag with the left button to paint a row of cells.
+// ---------------------------------------------------------------------------
+let mode = "cursor";  // "cursor" | "builder"
+const btnCursor  = document.getElementById("btn-mode-cursor");
+const btnBuilder = document.getElementById("btn-mode-builder");
+
+function setMode(next) {
+  mode = next;
+  btnCursor.classList.toggle("active",  mode === "cursor");
+  btnBuilder.classList.toggle("active", mode === "builder");
+  // OrbitControls hijacks left-drag for camera rotation; in builder mode we
+  // want left-drag to paint walls instead. Right-drag still pans the camera.
+  controls.enabled = (mode !== "builder");
+  hoverMesh.visible = (mode === "builder");
+  renderer.domElement.style.cursor = (mode === "builder") ? "crosshair" : "";
+}
+btnCursor.addEventListener("click",  () => setMode("cursor"));
+btnBuilder.addEventListener("click", () => setMode("builder"));
+
+// Invisible plane we raycast against to convert mouse -> grid cell.
+const pickPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(GRID, GRID),
+  new THREE.MeshBasicMaterial({ visible: false }),
+);
+pickPlane.rotation.x = -Math.PI / 2;
+pickPlane.position.set(GRID / 2, 0, GRID / 2);
+scene.add(pickPlane);
+
+// Hover preview cell.
+const hoverMesh = new THREE.Mesh(
+  new THREE.BoxGeometry(1.02, 0.05, 1.02),
+  new THREE.MeshBasicMaterial({ color: 0x00d4ff, transparent: true, opacity: 0.45 }),
+);
+hoverMesh.visible = false;
+scene.add(hoverMesh);
+
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const paintedThisDrag = new Set();
+let painting = false;
+
+function eventToCell(ev) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.x = ((ev.clientX - rect.left) / rect.width)  * 2 - 1;
+  ndc.y = -((ev.clientY - rect.top)  / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObject(pickPlane, false);
+  if (!hits.length) return null;
+  const p = hits[0].point;
+  const gx = Math.floor(p.x);
+  const gy = Math.floor(p.z);
+  if (gx < 0 || gx >= GRID || gy < 0 || gy >= GRID) return null;
+  return [gx, gy];
+}
+
+renderer.domElement.addEventListener("contextmenu", (ev) => {
+  if (mode === "builder") ev.preventDefault();  // right-click = erase, not menu
+});
+
+renderer.domElement.addEventListener("pointermove", (ev) => {
+  if (mode !== "builder") return;
+  const cell = eventToCell(ev);
+  if (!cell) { hoverMesh.visible = false; return; }
+  hoverMesh.visible = true;
+  hoverMesh.position.set(cell[0] + 0.5, 0.05, cell[1] + 0.5);
+  // Drag-paint: if left button is held, paint each cell entered exactly once.
+  if (painting && (ev.buttons & 1)) {
+    const key = cell[0] + "," + cell[1];
+    if (!paintedThisDrag.has(key)) {
+      paintedThisDrag.add(key);
+      sendAction({ type: "wall_add", cell });
+    }
+  }
+});
+
+renderer.domElement.addEventListener("pointerdown", (ev) => {
+  if (mode !== "builder") return;
+  const cell = eventToCell(ev);
+  if (!cell) return;
+  if (ev.button === 2) {
+    sendAction({ type: "wall_remove", cell });
+    return;
+  }
+  if (ev.button === 0) {
+    painting = true;
+    paintedThisDrag.clear();
+    paintedThisDrag.add(cell[0] + "," + cell[1]);
+    sendAction({ type: "wall_add", cell });
+  }
+});
+
+renderer.domElement.addEventListener("pointerup", () => {
+  painting = false;
+  paintedThisDrag.clear();
+});
+renderer.domElement.addEventListener("pointerleave", () => {
+  hoverMesh.visible = false;
+  painting = false;
+  paintedThisDrag.clear();
+});
 </script>
 </body>
 </html>

@@ -239,6 +239,21 @@ def run() -> None:
                         initial_use_local=initial_use_local,
                         initial_use_mock=initial_use_mock,
                     )
+                elif kind == "wall_add":
+                    cell = action.get("cell")
+                    if isinstance(cell, list) and len(cell) == 2:
+                        wall_list = world_state.get("wall", [])
+                        if cell not in wall_list:
+                            wall_list.append(cell)
+                            world_state["wall"] = wall_list
+                            world_state["layout"] = "CUSTOM"
+                elif kind == "wall_remove":
+                    cell = action.get("cell")
+                    if isinstance(cell, list) and len(cell) == 2:
+                        wall_list = list(world_state.get("wall", []))
+                        if cell in wall_list:
+                            wall_list.remove(cell)
+                            world_state["wall"] = wall_list
                 # Unknown kinds are ignored — nothing to do.
 
             # ---- always drain in-flight LLM decisions ---------------------
