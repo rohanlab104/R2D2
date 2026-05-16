@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import heapq
 import importlib
+import copy
 import os
 import random
 import socket
@@ -458,6 +459,205 @@ def _cancel_pending_decisions() -> None:
         _pending_strategist = None
 
 
+def _pending_decision_count() -> int:
+    return (
+        len(_pending_leader)
+        + len(_pending_worker)
+        + (1 if _pending_strategist is not None else 0)
+    )
+
+
+def _wait_for_pending_decisions(
+    world_state: dict,
+    blackboard: Blackboard,
+    *,
+    max_wait: float,
+) -> None:
+    """Let in-flight model calls finish during precompute before advancing far."""
+    deadline = time.time() + max_wait
+    while _pending_decision_count() and time.time() < deadline:
+        _drain_completed_decisions(world_state, blackboard)
+        if _pending_decision_count():
+            time.sleep(0.05)
+    _drain_completed_decisions(world_state, blackboard)
+
+
+def _snapshot_world_state(world_state: dict, blackboard: Blackboard) -> dict:
+    """Return an immutable-ish snapshot for replay."""
+    world_state["blackboard"] = blackboard.to_list()
+    return copy.deepcopy(world_state)
+
+
+def _precompute_timeline(duration: float) -> list[dict]:
+    """Run the factory headlessly first, recording snapshots for later replay."""
+    global _pending_strategist
+
+    _cancel_pending_decisions()
+    layout = os.getenv("LAYOUT", OPEN_FLOOR)
+    speed_multiplier = 1
+    world_state = _reset_demo_state(layout, speed_multiplier, "online")
+    blackboard = Blackboard()
+
+    snapshot_interval = float(os.getenv("FACTORYMIND_REPLAY_SNAPSHOT_INTERVAL", "0.2"))
+    precompute_dt = float(os.getenv("FACTORYMIND_PRECOMPUTE_DT", "0.1"))
+    wait_default = float(os.getenv("NEMOTRON_TIMEOUT_SECONDS", "3.0")) + 1.0
+    decision_wait = float(os.getenv("FACTORYMIND_PRECOMPUTE_WAIT_SECONDS", str(wait_default)))
+
+    sim_elapsed = 0.0
+    last_leader_tick = 0.0
+    last_worker_tick = 0.0
+    last_strategist_tick = 0.0
+    last_task_spawn = 0.0
+    last_move_tick = 0.0
+    next_snapshot = 0.0
+    timeline: list[dict] = []
+
+    print(
+        f"[precompute] computing {duration:.1f}s timeline "
+        f"(snapshot every {snapshot_interval:.1f}s, ALL_AGENTS_LLM={_ALL_AGENTS_LLM})",
+        flush=True,
+    )
+
+    while sim_elapsed <= duration:
+        now = sim_elapsed
+        _drain_completed_decisions(world_state, blackboard)
+
+        if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
+            if _active_task_count(world_state) < TARGET_ACTIVE_TASKS:
+                world_state["tasks"].append(_spawn_task(world_state))
+            last_task_spawn = now
+
+        dispatched = False
+        if now - last_leader_tick >= LEADER_TICK_INTERVAL:
+            for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
+                if leader["id"] not in _pending_leader:
+                    _pending_leader[leader["id"]] = _decision_executor.submit(
+                        leader_decide, leader, world_state, blackboard,
+                    )
+                    dispatched = True
+            last_leader_tick = now
+
+        if now - last_worker_tick >= WORKER_TICK_INTERVAL:
+            if _ALL_AGENTS_LLM:
+                for worker in [r for r in world_state["robots"] if r["role"] == WORKER]:
+                    if worker["id"] in _pending_worker:
+                        continue
+                    if worker.get("current_task") is not None:
+                        continue
+                    _pending_worker[worker["id"]] = _decision_executor.submit(
+                        worker_decide, worker, world_state, blackboard,
+                    )
+                    dispatched = True
+            else:
+                _assign_idle_workers(world_state, blackboard)
+            last_worker_tick = now
+
+        if (
+            now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
+            and _pending_strategist is None
+        ):
+            try:
+                state_description = M.describe_world_state(world_state)
+                retrieved = M.retrieve_strategies(
+                    world_state["layout"],
+                    state_description=state_description,
+                )
+            except Exception as exc:
+                print(f"[precompute] strategy retrieval failed: {exc}", file=sys.stderr, flush=True)
+                retrieved = []
+            _pending_strategist = _decision_executor.submit(
+                strategist_decide, world_state, blackboard, retrieved,
+            )
+            dispatched = True
+            last_strategist_tick = now
+
+        if dispatched:
+            _wait_for_pending_decisions(
+                world_state,
+                blackboard,
+                max_wait=decision_wait,
+            )
+
+        if now - last_move_tick >= MOVE_TICK_INTERVAL:
+            move_steps = min(int((now - last_move_tick) // MOVE_TICK_INTERVAL), 4)
+            for _ in range(max(1, move_steps)):
+                for robot in world_state["robots"]:
+                    if robot["role"] == WORKER:
+                        next_pos = worker_step(robot, world_state, blackboard)
+                        if robot.get("path") and next_pos != robot["path"][0]:
+                            robot["path"].insert(0, next_pos)
+                    _advance_robot(robot, world_state)
+            last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
+
+        world_state["speed_multiplier"] = speed_multiplier
+        world_state["stats"]["elapsed"] = round(sim_elapsed, 1)
+        completed = world_state["stats"]["completed"]
+        world_state["stats"]["rate"] = (
+            round(completed / sim_elapsed * 60, 1) if sim_elapsed > 0 else 0.0
+        )
+        world_state["tick"] += 1
+
+        if sim_elapsed >= next_snapshot:
+            timeline.append(_snapshot_world_state(world_state, blackboard))
+            next_snapshot += snapshot_interval
+
+        if int(sim_elapsed * 10) % 50 == 0:
+            print(
+                f"[precompute] sim_t={sim_elapsed:.1f}s snapshots={len(timeline)} "
+                f"completed={world_state['stats']['completed']} "
+                f"messages={len(blackboard.to_list())}",
+                flush=True,
+            )
+        sim_elapsed = round(sim_elapsed + precompute_dt, 4)
+
+    _wait_for_pending_decisions(world_state, blackboard, max_wait=decision_wait)
+    timeline.append(_snapshot_world_state(world_state, blackboard))
+    _cancel_pending_decisions()
+    print(f"[precompute] ready: {len(timeline)} replay frames", flush=True)
+    return timeline
+
+
+def _replay_timeline(timeline: list[dict]) -> None:
+    """Render a precomputed timeline without any model calls during playback."""
+    if not timeline:
+        print("[replay] no frames to replay", file=sys.stderr, flush=True)
+        return
+
+    print("[replay] initializing pygame display...", flush=True)
+    screen = R.init_display()
+    clock = pygame.time.Clock()
+    replay_fps = float(os.getenv("FACTORYMIND_REPLAY_FPS", "12"))
+    seconds_per_frame = 1.0 / replay_fps if replay_fps > 0 else 0.0
+    frame_index = 0
+    last_step = time.time()
+    running = True
+    print(
+        f"[replay] playing {len(timeline)} frames at {replay_fps:g} fps; "
+        "no LLM calls happen during replay",
+        flush=True,
+    )
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
+
+        now = time.time()
+        if seconds_per_frame == 0.0 or now - last_step >= seconds_per_frame:
+            frame_index = min(frame_index + 1, len(timeline) - 1)
+            last_step = now
+
+        R.render(screen, timeline[frame_index])
+        if frame_index >= len(timeline) - 1:
+            # Keep the final state visible for judges until they close it.
+            pass
+        clock.tick(FPS)
+
+    pygame.quit()
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -516,6 +716,13 @@ def main() -> None:
 
     _print_startup_banner()
     _auto_fallback_to_mock_if_endpoints_dead()
+
+    precompute_seconds = float(os.getenv("FACTORYMIND_PRECOMPUTE_SECONDS", "0") or 0)
+    if precompute_seconds > 0:
+        timeline = _precompute_timeline(precompute_seconds)
+        _replay_timeline(timeline)
+        _decision_executor.shutdown(wait=False, cancel_futures=True)
+        sys.exit(0)
 
     # --- Init ---
     layout = os.getenv("LAYOUT", OPEN_FLOOR)
