@@ -615,6 +615,18 @@ def _station_by_name(name: str, world_state: dict) -> dict | None:
     )
 
 
+def _default_downstream_station(pickup_name: str, world_state: dict) -> dict | None:
+    """Return the normal warehouse flow target for a vague command."""
+    flow = {
+        "Parts": "Assembly",
+        "Assembly": "QA",
+        "QA": "Shipping",
+        "Shipping": "Parts",
+    }
+    target = flow.get(pickup_name)
+    return _station_by_name(target, world_state) if target else None
+
+
 def _station_mentions_in_order(text: str, world_state: dict) -> list[dict]:
     """Return distinct workstation mentions in the order the user typed them."""
     lower = text.lower()
@@ -728,29 +740,57 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     if parsed is not None:
         return [parsed]
 
+    inferred = _infer_vague_task_requests(text, world_state)
+    if inferred:
+        return inferred
+
     return []
 
 
 def _interpret_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, dict, int]]:
-    """Ask the leader/interpreter model for structured task groups."""
+    """Ask the interpreter model for structured mission groups."""
     parsed = interpret_user_tasks(text, world_state)
     if not parsed:
         return []
 
     worker_count = max(1, sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER))
+    idle_worker_count = sum(
+        1
+        for r in world_state.get("robots", [])
+        if r.get("role") == WORKER and r.get("current_task") is None and not r.get("path")
+    )
     station_names = {ws.get("name"): ws for ws in world_state.get("workstations", [])}
     remaining = worker_count
     requests: list[tuple[dict, dict, int]] = []
+    confidence = _coerce_float(parsed.get("confidence"), 0.0)
+    if parsed.get("needs_clarification") and confidence < 0.7:
+        question = str(parsed.get("clarifying_question", "")).strip()
+        print(
+            f"[task-interpreter] clarification needed: {question or 'no safe warehouse action inferred'}",
+            flush=True,
+        )
+        return []
+
     for item in parsed.get("tasks", []):
         if not isinstance(item, dict):
             continue
         pickup = station_names.get(str(item.get("pickup", "")).strip())
-        delivery = station_names.get(str(item.get("delivery", "")).strip())
+        delivery_name = str(item.get("delivery", "")).strip()
+        delivery = station_names.get(delivery_name)
+        if pickup and not delivery:
+            delivery = _default_downstream_station(pickup["name"], world_state)
         if not pickup or not delivery or pickup["name"] == delivery["name"]:
             continue
 
         raw_count = item.get("count", 1)
-        if isinstance(raw_count, str) and raw_count.lower() == "rest":
+        if isinstance(raw_count, str) and raw_count.lower() in {
+            "all_idle_workers",
+            "all_workers",
+            "everyone",
+            "all",
+        }:
+            count = idle_worker_count or worker_count
+        elif isinstance(raw_count, str) and raw_count.lower() == "rest":
             count = remaining
         else:
             try:
@@ -764,12 +804,76 @@ def _interpret_user_task_requests(text: str, world_state: dict) -> list[tuple[di
     if requests:
         strategy = str(parsed.get("strategy", "minimize_average_completion_time"))
         constraints = parsed.get("constraints", [])
+        assumptions = parsed.get("assumptions", [])
         print(
             f"[task-interpreter] parsed {len(requests)} route group(s); "
-            f"strategy={strategy}; constraints={constraints}",
+            f"intent={parsed.get('intent', 'create_delivery_tasks')}; "
+            f"confidence={confidence:.2f}; strategy={strategy}; "
+            f"constraints={constraints}; assumptions={assumptions}",
             flush=True,
         )
     return requests
+
+
+def _coerce_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _infer_vague_task_requests(text: str, world_state: dict) -> list[tuple[dict, dict, int]]:
+    """Local fallback for vague commands when the LLM interpreter is unavailable."""
+    lower = text.lower()
+    actionish = bool(
+        re.search(
+            r"\b(clear|empty|backlog|catch\s*up|speed|faster|optimi[sz]e|rebalance|get\s+.*moving|busy|priority)\b",
+            lower,
+        )
+    )
+    if not actionish:
+        return []
+
+    worker_count = max(1, sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER))
+    idle_count = sum(
+        1
+        for r in world_state.get("robots", [])
+        if r.get("role") == WORKER and r.get("current_task") is None and not r.get("path")
+    )
+    count = idle_count or worker_count
+    stations = _station_mentions_in_order(text, world_state)
+
+    if len(stations) >= 2:
+        pickup, delivery = stations[0], stations[1]
+    elif len(stations) == 1:
+        pickup = stations[0]
+        delivery = _default_downstream_station(pickup["name"], world_state)
+    else:
+        pickup = _highest_backlog_station(world_state) or _station_by_name("Parts", world_state)
+        delivery = _default_downstream_station(pickup["name"], world_state) if pickup else None
+
+    if not pickup or not delivery or pickup["name"] == delivery["name"]:
+        return []
+
+    print(
+        f"[task-interpreter] local vague fallback inferred {count}x "
+        f"{pickup['name']}->{delivery['name']}",
+        flush=True,
+    )
+    return [(pickup, delivery, count)]
+
+
+def _highest_backlog_station(world_state: dict) -> dict | None:
+    """Return the station with the most open pickup work, if any."""
+    counts: dict[str, int] = {}
+    for task in world_state.get("tasks", []):
+        if task.get("status") == "open":
+            name = str(task.get("pickup_name", ""))
+            counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        return None
+    name, count = max(counts.items(), key=lambda item: (item[1], item[0]))
+    return _station_by_name(name, world_state) if count > 0 else None
 
 
 def _create_user_task(world_state: dict, pickup_ws: dict, delivery_ws: dict) -> dict:

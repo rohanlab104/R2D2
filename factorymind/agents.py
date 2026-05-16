@@ -114,27 +114,42 @@ Return valid JSON only, exactly this schema:
 """
 
 TASK_INTERPRETER_PROMPT_TEMPLATE = """\
-You are the off-floor warehouse lead. Convert the human command into task JSON only.
+You are the warehouse mission interpreter for a robot simulator.
+Convert casual, vague, or technically imperfect human language into executable mission JSON.
 
 Known stations: {station_names}
 Available workers: {worker_count}
+Idle workers: {idle_worker_count}
+Layout: {layout}
+Open task summary: {open_tasks}
+Station backlog: {station_backlog}
 
 Rules:
-- Extract one or more delivery task groups.
-- Each task group must have count, pickup, and delivery.
-- If the user says "all workers", use count {worker_count} unless specific counts are given.
-- If the user says "rest", assign remaining workers after explicit counts.
+- Return JSON only. No prose, markdown, or commentary.
+- Prefer action over clarification when a safe warehouse action is reasonably guessable.
+- Each task group must have count, pickup, delivery, and priority.
+- If the user says "all workers", "everyone", "clear", "catch up", or "get moving", use "all_idle_workers" unless a count is explicit.
+- If the user says "rest", use "rest".
+- If pickup is vague, infer the mentioned station, the station with highest backlog, or the upstream station implied by the request.
+- If delivery is vague, use this default flow: Parts -> Assembly -> QA -> Shipping.
+- If the user asks to "clear out" Shipping or move finished goods, deliver Shipping -> Parts only when restocking or recycling is implied; otherwise use Shipping as the destination.
+- If the user asks to optimize, speed up, reduce traffic, rebalance, or make robots smarter, set intent "optimize" and include strategy/constraints. Add tasks only if a pickup/delivery can be inferred.
+- Use assumptions to record guesses you made from vague language.
+- Set needs_clarification true only when no safe simulator action can be inferred.
 - Do not invent station names.
-- Do not output prose, markdown, or commentary.
-- If the request is not a delivery task, return {{"tasks": [], "strategy": "none", "constraints": []}}.
 
 Return exactly this JSON schema:
 {{
+  "intent": "create_delivery_tasks",
+  "confidence": 0.82,
   "tasks": [
-    {{"count": 2, "pickup": "Assembly", "delivery": "Shipping"}}
+    {{"count": "all_idle_workers", "pickup": "Parts", "delivery": "Assembly", "priority": 90}}
   ],
   "strategy": "minimize_average_completion_time",
-  "constraints": ["avoid_congestion", "stop_after_delivery"]
+  "constraints": ["avoid_congestion", "rebalance_idle_workers"],
+  "assumptions": ["User said clear Parts, so Parts is the pickup.", "Assembly is the default downstream station."],
+  "needs_clarification": false,
+  "clarifying_question": ""
 }}
 
 Human command:
@@ -318,7 +333,7 @@ def worker_decide(robot: dict, world_state: dict, blackboard: Blackboard) -> dic
 
 
 def interpret_user_tasks(user_text: str, world_state: dict) -> dict | None:
-    """Use the leader/interpreter model to convert human language into task JSON."""
+    """Use the interpreter model to convert human language into mission JSON."""
     if _use_mock():
         return None
 
@@ -326,9 +341,18 @@ def interpret_user_tasks(user_text: str, world_state: dict) -> dict | None:
 
     station_names = [ws.get("name") for ws in world_state.get("workstations", [])]
     worker_count = sum(1 for r in world_state.get("robots", []) if r.get("role") != LEADER)
+    idle_worker_count = sum(
+        1
+        for r in world_state.get("robots", [])
+        if r.get("role") != LEADER and r.get("current_task") is None and not r.get("path")
+    )
     prompt = TASK_INTERPRETER_PROMPT_TEMPLATE.format(
         station_names=station_names,
         worker_count=worker_count,
+        idle_worker_count=idle_worker_count,
+        layout=world_state.get("layout"),
+        open_tasks=[_summarize_task(t) for t in _candidate_tasks(world_state, include_assigned=True)[:12]],
+        station_backlog=_station_backlog(world_state),
         user_text=user_text,
     )
     try:
@@ -557,6 +581,17 @@ def _latest_directive(blackboard: Blackboard) -> str:
         if msg.get("type") in {STRATEGY, BOTTLENECK}:
             return str(msg.get("content", ""))
     return "None."
+
+
+def _station_backlog(world_state: dict) -> dict[str, int]:
+    """Count open tasks waiting at each pickup station."""
+    counts = {str(ws.get("name")): 0 for ws in world_state.get("workstations", [])}
+    for task in world_state.get("tasks", []):
+        if task.get("status") == "open":
+            name = str(task.get("pickup_name", ""))
+            if name in counts:
+                counts[name] += 1
+    return counts
 
 
 def _claimed_task_ids(blackboard: Blackboard) -> set[int]:
