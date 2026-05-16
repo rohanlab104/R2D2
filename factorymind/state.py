@@ -49,6 +49,11 @@ _SPAWN_POSITIONS: list[list[int]] = [
     [22, 24], [23, 24], [24, 24], [25, 24],
 ]
 
+# Leaders sit off the warehouse floor visually, acting like dispatch/control agents.
+_LEADER_POSITIONS: list[list[int]] = [
+    [2, 24], [2, 26],
+]
+
 
 def _make_workstations(layout: str) -> list[dict]:
     """Return a fresh copy of workstations for the given layout."""
@@ -74,7 +79,7 @@ def _make_wall(layout: str) -> list[list[int]]:
 
 def create_initial_state(
     layout: str,
-    num_leaders: int = 2,
+    num_leaders: int = 1,
     num_workers: int = 4,
 ) -> dict:
     """Create and return a fresh world_state dict for the given layout.
@@ -99,7 +104,7 @@ def create_initial_state(
     robot_id = 0
 
     for _ in range(num_leaders):
-        sp = _SPAWN_POSITIONS[robot_id % len(_SPAWN_POSITIONS)]
+        sp = _LEADER_POSITIONS[robot_id % len(_LEADER_POSITIONS)]
         robots.append({
             "id": robot_id,
             "role": LEADER,
@@ -111,7 +116,7 @@ def create_initial_state(
         robot_id += 1
 
     for _ in range(num_workers):
-        sp = _SPAWN_POSITIONS[robot_id % len(_SPAWN_POSITIONS)]
+        sp = _SPAWN_POSITIONS[(robot_id - num_leaders) % len(_SPAWN_POSITIONS)]
         robots.append({
             "id": robot_id,
             "role": WORKER,

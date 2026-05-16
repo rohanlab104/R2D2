@@ -113,6 +113,34 @@ Return valid JSON only, exactly this schema:
 }}
 """
 
+TASK_INTERPRETER_PROMPT_TEMPLATE = """\
+You are the off-floor warehouse lead. Convert the human command into task JSON only.
+
+Known stations: {station_names}
+Available workers: {worker_count}
+
+Rules:
+- Extract one or more delivery task groups.
+- Each task group must have count, pickup, and delivery.
+- If the user says "all workers", use count {worker_count} unless specific counts are given.
+- If the user says "rest", assign remaining workers after explicit counts.
+- Do not invent station names.
+- Do not output prose, markdown, or commentary.
+- If the request is not a delivery task, return {{"tasks": [], "strategy": "none", "constraints": []}}.
+
+Return exactly this JSON schema:
+{{
+  "tasks": [
+    {{"count": 2, "pickup": "Assembly", "delivery": "Shipping"}}
+  ],
+  "strategy": "minimize_average_completion_time",
+  "constraints": ["avoid_congestion", "stop_after_delivery"]
+}}
+
+Human command:
+{user_text}
+"""
+
 
 # ---------------------------------------------------------------------------
 # Blackboard
@@ -287,6 +315,31 @@ def worker_decide(robot: dict, world_state: dict, blackboard: Blackboard) -> dic
     if parsed and isinstance(parsed, dict):
         return _normalize_worker_decision(parsed, robot, world_state)
     return _mock_worker_decide(robot, world_state, blackboard)
+
+
+def interpret_user_tasks(user_text: str, world_state: dict) -> dict | None:
+    """Use the leader/interpreter model to convert human language into task JSON."""
+    if _use_mock():
+        return None
+
+    from factorymind import inference
+
+    station_names = [ws.get("name") for ws in world_state.get("workstations", [])]
+    worker_count = sum(1 for r in world_state.get("robots", []) if r.get("role") != LEADER)
+    prompt = TASK_INTERPRETER_PROMPT_TEMPLATE.format(
+        station_names=station_names,
+        worker_count=worker_count,
+        user_text=user_text,
+    )
+    try:
+        raw = inference.ask_task_interpreter(prompt)
+        parsed = inference.safe_parse_json(raw)
+    except Exception as exc:
+        print(f"[task-interpreter] LLM parse failed, using regex fallback: {exc}", flush=True)
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
 
 
 def worker_step(worker_robot: dict, world_state: dict, blackboard: Blackboard) -> list[int]:

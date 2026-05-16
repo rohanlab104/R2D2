@@ -35,6 +35,7 @@ from factorymind import memory as M
 from factorymind.agents import (
     Blackboard,
     choose_worker_task,
+    interpret_user_tasks,
     leader_decide,
     strategist_decide,
     worker_decide,
@@ -463,6 +464,79 @@ def _parse_user_task_request(text: str, world_state: dict) -> tuple[dict, dict, 
     return pickup, delivery, _requested_task_count(text)
 
 
+def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, dict, int]]:
+    """Parse one or more route clauses from a user prompt.
+
+    Examples:
+    - "deliver 4 Parts to QA"
+    - "move 2 Assembly to Shipping and 2 Parts to QA"
+    """
+    if _is_go_and_stop_command(text):
+        return []
+
+    interpreted = _interpret_user_task_requests(text, world_state)
+    if interpreted:
+        return interpreted
+
+    requests: list[tuple[dict, dict, int]] = []
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"\b(?:and|then|plus)\b|[,;]", text, flags=re.IGNORECASE)
+        if clause.strip()
+    ]
+    for clause in clauses:
+        parsed = _parse_user_task_request(clause, world_state)
+        if parsed is not None:
+            requests.append(parsed)
+
+    if requests:
+        return requests
+
+    parsed = _parse_user_task_request(text, world_state)
+    return [parsed] if parsed is not None else []
+
+
+def _interpret_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, dict, int]]:
+    """Ask the leader/interpreter model for structured task groups."""
+    parsed = interpret_user_tasks(text, world_state)
+    if not parsed:
+        return []
+
+    worker_count = max(1, sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER))
+    station_names = {ws.get("name"): ws for ws in world_state.get("workstations", [])}
+    remaining = worker_count
+    requests: list[tuple[dict, dict, int]] = []
+    for item in parsed.get("tasks", []):
+        if not isinstance(item, dict):
+            continue
+        pickup = station_names.get(str(item.get("pickup", "")).strip())
+        delivery = station_names.get(str(item.get("delivery", "")).strip())
+        if not pickup or not delivery or pickup["name"] == delivery["name"]:
+            continue
+
+        raw_count = item.get("count", 1)
+        if isinstance(raw_count, str) and raw_count.lower() == "rest":
+            count = remaining
+        else:
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                count = 1
+        count = max(1, min(count, worker_count))
+        remaining = max(0, remaining - count)
+        requests.append((pickup, delivery, count))
+
+    if requests:
+        strategy = str(parsed.get("strategy", "minimize_average_completion_time"))
+        constraints = parsed.get("constraints", [])
+        print(
+            f"[task-interpreter] parsed {len(requests)} route group(s); "
+            f"strategy={strategy}; constraints={constraints}",
+            flush=True,
+        )
+    return requests
+
+
 def _create_user_task(world_state: dict, pickup_ws: dict, delivery_ws: dict) -> dict:
     """Create a high-priority task from a user command."""
     task = _create_task(world_state, pickup_ws, delivery_ws, source="user")
@@ -476,11 +550,10 @@ def _apply_user_task_request(
     blackboard: Blackboard,
 ) -> bool:
     """Convert a natural-language task request into structured work robots can execute."""
-    parsed = _parse_user_task_request(text, world_state)
-    if parsed is None:
+    requests = _parse_user_task_requests(text, world_state)
+    if not requests:
         return False
 
-    pickup_ws, delivery_ws, count = parsed
     _cancel_pending_decisions()
 
     for robot in world_state.get("robots", []):
@@ -492,25 +565,29 @@ def _apply_user_task_request(
             task["status"] = "cancelled"
             task["assigned_to"] = None
 
-    new_tasks = [
-        _create_user_task(world_state, pickup_ws, delivery_ws)
-        for _ in range(count)
-    ]
+    new_tasks: list[dict] = []
+    route_summaries: list[str] = []
+    for pickup_ws, delivery_ws, count in requests:
+        new_tasks.extend(
+            _create_user_task(world_state, pickup_ws, delivery_ws)
+            for _ in range(count)
+        )
+        route_summaries.append(f"{count}x {pickup_ws['name']}->{delivery_ws['name']}")
+
     world_state["tasks"].extend(new_tasks)
     dispatched = _dispatch_batch_to_workers(new_tasks, world_state, blackboard)
     world_state["manual_control"] = False
+    summary = "; ".join(route_summaries)
     blackboard.post(
         -1,
         "STRATEGY",
         (
-            f"User task accepted: {count} priority route(s) "
-            f"{pickup_ws['name']}->{delivery_ws['name']}; "
+            f"User task accepted: {summary}; "
             f"{dispatched} worker(s) dispatched now."
         ),
     )
     print(
-        f"[command] created {count} user task(s): "
-        f"{pickup_ws['name']}->{delivery_ws['name']}",
+        f"[command] created {len(new_tasks)} user task(s): {summary}",
         flush=True,
     )
     return True

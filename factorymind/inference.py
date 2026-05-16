@@ -46,6 +46,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 LEADER_MODEL = os.getenv("LEADER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
 WORKER_MODEL = os.getenv("WORKER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
+TASK_INTERPRETER_MODEL = os.getenv("TASK_INTERPRETER_MODEL", LEADER_MODEL)
 STRATEGIST_MODEL = os.getenv(
     "STRATEGIST_MODEL",
     "nvidia/llama-3_3-nemotron-super-49b-v1_5",
@@ -116,12 +117,14 @@ def describe_endpoints() -> str:
         return (
             f"Inference target: LOCAL NIM on {location}\n"
             f"  leader     -> {_leader_base_url()}  ({LEADER_MODEL})\n"
+            f"  task parse -> {_leader_base_url()}  ({TASK_INTERPRETER_MODEL})\n"
             f"  worker     -> {_leader_base_url()}  ({WORKER_MODEL})\n"
             f"  strategist -> {_strategist_base_url()}  ({STRATEGIST_MODEL})"
         )
     return (
         "Inference target: NVIDIA CLOUD (build.nvidia.com)\n"
         f"  leader     -> {_CLOUD_URL}  ({LEADER_MODEL})\n"
+        f"  task parse -> {_CLOUD_URL}  ({TASK_INTERPRETER_MODEL})\n"
         f"  worker     -> {_CLOUD_URL}  ({WORKER_MODEL})\n"
         f"  strategist -> {_CLOUD_URL}  ({STRATEGIST_MODEL})"
     )
@@ -174,6 +177,16 @@ def ask_worker(prompt: str) -> str:
         model=WORKER_MODEL,
         max_tokens=256,
         client=_worker_client,
+    )
+
+
+def ask_task_interpreter(prompt: str) -> str:
+    """Query the task interpreter model for structured warehouse commands."""
+    return ask_nemotron(
+        prompt,
+        model=TASK_INTERPRETER_MODEL,
+        max_tokens=384,
+        client=_leader_client,
     )
 
 
