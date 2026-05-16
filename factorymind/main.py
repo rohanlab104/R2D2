@@ -453,7 +453,6 @@ def _apply_go_to_station_and_stop(
     )
     return True
 
-
 def _reset_demo_state(layout: str, speed_multiplier: int, connection_status: str) -> dict:
     """Create a fresh run while preserving demo controls."""
     global _task_counter

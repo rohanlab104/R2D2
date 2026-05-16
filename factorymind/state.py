@@ -5,7 +5,6 @@ Every other module must conform to the schema returned by create_initial_state()
 """
 
 from __future__ import annotations
-import random
 
 # ---------------------------------------------------------------------------
 # Message types posted to the blackboard
