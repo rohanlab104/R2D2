@@ -209,8 +209,11 @@ def _reservation_table(world_state: dict, *, exclude_robot_id: int | None = None
     """Build time-indexed cell and edge reservations from active robot paths."""
     cells: dict[int, set[tuple[int, int]]] = {}
     edges: dict[int, set[tuple[tuple[int, int], tuple[int, int]]]] = {}
+    hold_steps = 3 if _FLEET_MASTER_ONLY else 8
     for robot in world_state.get("robots", []):
         if robot.get("id") == exclude_robot_id:
+            continue
+        if not robot.get("path"):
             continue
         positions = [list(robot.get("pos", [0, 0]))] + [list(p) for p in robot.get("path", [])]
         for t, pos in enumerate(positions):
@@ -219,7 +222,7 @@ def _reservation_table(world_state: dict, *, exclude_robot_id: int | None = None
                 edges.setdefault(t, set()).add((tuple(positions[t - 1]), tuple(pos)))
         if positions:
             last = tuple(positions[-1])
-            for t in range(len(positions), len(positions) + 12):
+            for t in range(len(positions), len(positions) + hold_steps):
                 cells.setdefault(t, set()).add(last)
     return {"cells": cells, "edges": edges}
 
@@ -283,6 +286,88 @@ def _is_workstation_cell(pos: list[int], world_state: dict) -> bool:
     return False
 
 
+def _cell_occupied_by_other(
+    cell: tuple[int, int],
+    world_state: dict,
+    *,
+    exclude_robot_id: int,
+) -> bool:
+    for robot in world_state.get("robots", []):
+        if robot.get("id") == exclude_robot_id:
+            continue
+        if tuple(robot.get("pos", [])) == cell:
+            return True
+    return False
+
+
+def _robot_blocks_traffic(robot: dict) -> bool:
+    """Whether this robot should deny another robot the cell it stands on."""
+    if robot.get("role") == LEADER:
+        return False
+    if robot.get("current_task") is not None:
+        return True
+    return bool(robot.get("path"))
+
+
+def _step_aside_from_workstation(robot: dict, world_state: dict) -> bool:
+    """Move one cell off a station tile so the next delivery/pickup can enter."""
+    pos = list(robot.get("pos", []))
+    if not _is_workstation_cell(pos, world_state):
+        return False
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    spawn = tuple(robot.get("spawn_pos", pos))
+    occupied = {
+        tuple(r.get("pos", []))
+        for r in world_state.get("robots", [])
+        if r.get("id") != robot.get("id")
+    }
+    candidates: list[tuple[int, list[int]]] = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)):
+        nx, ny = pos[0] + dx, pos[1] + dy
+        if not (0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT):
+            continue
+        cell = (nx, ny)
+        if cell in wall_set or cell in occupied:
+            continue
+        if _is_workstation_cell([nx, ny], world_state):
+            continue
+        dist = abs(nx - spawn[0]) + abs(ny - spawn[1])
+        candidates.append((dist, [nx, ny]))
+    if not candidates:
+        return False
+    candidates.sort(key=lambda item: item[0])
+    robot["path"] = [candidates[0][1]]
+    robot["yield_streak"] = 0
+    return True
+
+
+def _replenish_task_path(robot: dict, world_state: dict) -> None:
+    """Re-plan when a worker has a task but lost its route (avoids permanent stall)."""
+    task_id = robot.get("current_task")
+    if task_id is None or robot.get("path"):
+        return
+    task = next((t for t in world_state.get("tasks", []) if t["id"] == task_id), None)
+    if task is None or task.get("status") == "done":
+        robot["current_task"] = None
+        return
+    pos = list(robot.get("pos", []))
+    if task["status"] == "open":
+        if pos == list(task["pickup"]):
+            task["status"] = "in_transit"
+            goal = task["delivery"]
+        else:
+            goal = task["pickup"]
+    elif task["status"] == "in_transit":
+        if pos == list(task["delivery"]):
+            return
+        goal = task["delivery"]
+    else:
+        return
+    robot["path"] = _planned_path_to(
+        robot, list(goal), world_state, ignore_reservations=True,
+    )
+
+
 def _park_robot_at_spawn(robot: dict, world_state: dict) -> None:
     """Route an idle robot away from a workstation tile back to its spawn slot.
 
@@ -335,14 +420,16 @@ def _complete_task_delivery(
         quotas[pickup_name]["completed"] = quotas[pickup_name].get("completed", 0) + 1
 
     robot["path"] = []
+    robot["yield_streak"] = 0
     pos = robot["pos"]
-    # In master-dispatch mode, do not send workers back to spawn (causes "orbiting").
-    if (
-        not _master_controls_fleet(world_state)
-        and not world_state.get("task_queue")
-        and _is_workstation_cell(pos, world_state)
-    ):
-        _park_robot_at_spawn(robot, world_state)
+    # Free the delivery tile for the next worker (master mode stays off spawn-orbit).
+    if _is_workstation_cell(pos, world_state):
+        if not _step_aside_from_workstation(robot, world_state):
+            if (
+                not _master_controls_fleet(world_state)
+                and not world_state.get("task_queue")
+            ):
+                _park_robot_at_spawn(robot, world_state)
 
 
 def _reconcile_stationary_task_progress(
@@ -366,7 +453,9 @@ def _reconcile_stationary_task_progress(
     pos = list(robot["pos"])
     if task["status"] == "open" and pos == list(task["pickup"]):
         task["status"] = "in_transit"
-        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
+        robot["path"] = _planned_path_to(
+            robot, task["delivery"], world_state, ignore_reservations=_FLEET_MASTER_ONLY,
+        )
     if task["status"] == "in_transit" and pos == list(task["delivery"]):
         _complete_task_delivery(robot, task, world_state, blackboard)
 
@@ -392,7 +481,9 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
     # If at pickup and task not yet in transit
     if list(pos) == list(task["pickup"]) and task["status"] == "open":
         task["status"] = "in_transit"
-        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
+        robot["path"] = _planned_path_to(
+            robot, task["delivery"], world_state, ignore_reservations=_FLEET_MASTER_ONLY,
+        )
 
     # If at delivery — task done, then stop until the next user task.
     elif list(pos) == list(task["delivery"]) and task["status"] == "in_transit":
@@ -400,16 +491,25 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
 
 
 def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> None:
-    """Move robots one step with simple agent reservations to avoid collisions.
+    """Move robots one step with simple collision avoidance.
 
-    Each robot proposes its next cell from its own path. If two robots want the
-    same cell, or two robots would swap cells head-on, one waits and posts a
-    brief blackboard message. This keeps path execution distributed while still
-    making coordination visible.
+    Idle workers on station tiles step aside; stuck workers re-plan. Yield ties
+    rotate by tick so the same robot does not block forever.
     """
     robots = world_state.get("robots", [])
+    tick = int(world_state.get("tick", 0))
+
     for robot in robots:
+        _replenish_task_path(robot, world_state)
+        if (
+            robot.get("role") == WORKER
+            and robot.get("current_task") is None
+            and not robot.get("path")
+            and _is_workstation_cell(robot.get("pos", []), world_state)
+        ):
+            _step_aside_from_workstation(robot, world_state)
         _reconcile_stationary_task_progress(robot, world_state, blackboard)
+
     current = {r["id"]: tuple(r["pos"]) for r in robots}
     proposals = {
         r["id"]: tuple(r["path"][0])
@@ -424,17 +524,17 @@ def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> 
     by_cell: dict[tuple[int, int], list[int]] = {}
     for rid, cell in proposals.items():
         by_cell.setdefault(cell, []).append(rid)
-    for cell, ids in by_cell.items():
+    for _cell, ids in by_cell.items():
         if len(ids) <= 1:
             continue
-        winner = min(ids)
+        winner = min(ids, key=lambda rid: (rid + tick) % 1000)
         denied.update(rid for rid in ids if rid != winner)
 
     for rid, target in proposals.items():
         if rid in denied:
             continue
         for other_id, other_target in proposals.items():
-            if other_id <= rid or other_id in denied:
+            if other_id == rid or other_id in denied:
                 continue
             if target == current.get(other_id) and other_target == current.get(rid):
                 denied.add(max(rid, other_id))
@@ -450,6 +550,7 @@ def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> 
                 if other["id"] != rid
                 and tuple(other["pos"]) == target
                 and other["id"] not in moving_away
+                and _robot_blocks_traffic(other)
             ),
             None,
         )
@@ -460,7 +561,15 @@ def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> 
     for robot in robots:
         rid = robot["id"]
         if rid in denied:
-            if now - robot.get("last_yield_post", 0.0) > 1.0:
+            streak = int(robot.get("yield_streak", 0)) + 1
+            robot["yield_streak"] = streak
+            if streak >= 4:
+                if robot.get("current_task") is not None:
+                    _replenish_task_path(robot, world_state)
+                elif _is_workstation_cell(robot.get("pos", []), world_state):
+                    _step_aside_from_workstation(robot, world_state)
+                robot["yield_streak"] = 0
+            elif now - robot.get("last_yield_post", 0.0) > 2.5:
                 blackboard.post(
                     rid,
                     "INTENT",
@@ -468,6 +577,7 @@ def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> 
                 )
                 robot["last_yield_post"] = now
             continue
+        robot["yield_streak"] = 0
         if rid in proposals:
             _advance_robot(robot, world_state, blackboard)
 
@@ -488,14 +598,22 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
     task["started_at"] = time.time()
     robot["current_task"] = task["id"]
     robot.pop("master_assigned", None)
-    robot["path"] = _planned_path_to(robot, task["pickup"], world_state)
+    robot["path"] = _planned_path_to(
+        robot, task["pickup"], world_state, ignore_reservations=_FLEET_MASTER_ONLY,
+    )
     if (
         not robot["path"]
         and list(robot["pos"]) == list(task["pickup"])
         and task["status"] == "open"
     ):
         task["status"] = "in_transit"
-        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
+        robot["path"] = _planned_path_to(
+            robot, task["delivery"], world_state, ignore_reservations=_FLEET_MASTER_ONLY,
+        )
+    if not robot["path"] and list(robot["pos"]) != list(task["pickup"]):
+        robot["path"] = _planned_path_to(
+            robot, task["pickup"], world_state, ignore_reservations=True,
+        )
 
 
 def _route_cost(start: list[int], goal: list[int], wall_set: set) -> int:
