@@ -44,7 +44,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-LEADER_MODEL = os.getenv("LEADER_MODEL", "nvidia/llama-3_3-nemotron-super-49b-v1_5")
+LEADER_MODEL = os.getenv("LEADER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
 WORKER_MODEL = os.getenv("WORKER_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
 STRATEGIST_MODEL = os.getenv(
     "STRATEGIST_MODEL",
@@ -116,11 +116,13 @@ def describe_endpoints() -> str:
         return (
             f"Inference target: LOCAL NIM on {location}\n"
             f"  leader     -> {_leader_base_url()}  ({LEADER_MODEL})\n"
+            f"  worker     -> {_leader_base_url()}  ({WORKER_MODEL})\n"
             f"  strategist -> {_strategist_base_url()}  ({STRATEGIST_MODEL})"
         )
     return (
         "Inference target: NVIDIA CLOUD (build.nvidia.com)\n"
         f"  leader     -> {_CLOUD_URL}  ({LEADER_MODEL})\n"
+        f"  worker     -> {_CLOUD_URL}  ({WORKER_MODEL})\n"
         f"  strategist -> {_CLOUD_URL}  ({STRATEGIST_MODEL})"
     )
 
@@ -156,7 +158,7 @@ def ask_nemotron(
 # ---------------------------------------------------------------------------
 
 def ask_leader(prompt: str) -> str:
-    """Query the leader model (Nemotron Super 49B)."""
+    """Query the fast leader model (Nemotron Nano 9B)."""
     return ask_nemotron(
         prompt,
         model=LEADER_MODEL,

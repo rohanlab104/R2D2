@@ -708,7 +708,7 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
 
     # Model badges
     for role_str, model_str, col in [
-        ("leaders:",    "Nemotron-Super-49B", (220, 0, 255)),
+        ("leaders:",    "Nemotron-Nano-9B",  C_ACCENT),
         ("workers:",    "Nemotron-Nano-9B",   C_ACCENT),
         ("strategist:", "Nemotron-Super-49B", (220, 0, 255)),
     ]:
@@ -774,12 +774,12 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
         bc  = (40, int(160 + pulse * 80), 60)
         pygame.draw.rect(screen, (10, 35, 18), _BTN_DISCONNECT, border_radius=6)
         pygame.draw.rect(screen, bc,            _BTN_DISCONNECT, 2, border_radius=6)
-        lbl = f_btn.render("↑  RECONNECT CLOUD", True, (60, 230, 100))
+        lbl = f_btn.render("LOCAL NIM ACTIVE", True, (60, 230, 100))
     else:
         bc  = (int(140 + pulse * 60), 20, 20)
         pygame.draw.rect(screen, (40, 10, 10), _BTN_DISCONNECT, border_radius=6)
         pygame.draw.rect(screen, bc,            _BTN_DISCONNECT, 2, border_radius=6)
-        lbl = f_btn.render("⚡  DISCONNECT CLOUD", True, (220, 60, 60))
+        lbl = f_btn.render("FORCE LOCAL NIM", True, (220, 60, 60))
     screen.blit(lbl, (
         _BTN_DISCONNECT.x + _BTN_DISCONNECT.w // 2 - lbl.get_width() // 2,
         _BTN_DISCONNECT.y + _BTN_DISCONNECT.h // 2 - lbl.get_height() // 2,
@@ -799,7 +799,7 @@ def draw_disconnect_banner(screen: "pygame.Surface") -> None:
 
     pygame.draw.rect(screen, (r, 12, 12), (0, 0, screen.get_width(), bh))
     f_b  = pygame.font.SysFont("monospace", 13, bold=True)
-    msg  = "CLOUD DISCONNECTED  —  RUNNING LOCALLY ON ASUS ASCENT GX10"
+    msg  = "LOCAL-ONLY MODE - RUNNING ON ASUS ASCENT GX10"
     surf = f_b.render(msg, True, (255, 220, 220))
     screen.blit(surf, (screen.get_width() // 2 - surf.get_width() // 2, 8))
 

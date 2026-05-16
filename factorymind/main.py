@@ -237,7 +237,14 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
 def _station_for_user_command(text: str, world_state: dict) -> dict | None:
     """Return the workstation named in a simple human command, if any."""
     words = set(re.findall(r"[a-z0-9]+", text.lower()))
-    aliases = {
+    wanted = next((name for word, name in _station_aliases().items() if word in words), None)
+    if wanted is None:
+        return None
+    return _station_by_name(wanted, world_state)
+
+
+def _station_aliases() -> dict[str, str]:
+    return {
         "parts": "Parts",
         "part": "Parts",
         "assembly": "Assembly",
@@ -247,13 +254,153 @@ def _station_for_user_command(text: str, world_state: dict) -> dict | None:
         "shipping": "Shipping",
         "ship": "Shipping",
     }
-    wanted = next((name for word, name in aliases.items() if word in words), None)
-    if wanted is None:
-        return None
+
+
+def _station_by_name(name: str, world_state: dict) -> dict | None:
     return next(
-        (ws for ws in world_state.get("workstations", []) if ws.get("name") == wanted),
+        (ws for ws in world_state.get("workstations", []) if ws.get("name") == name),
         None,
     )
+
+
+def _station_mentions_in_order(text: str, world_state: dict) -> list[dict]:
+    """Return distinct workstation mentions in the order the user typed them."""
+    lower = text.lower()
+    mentions: list[tuple[int, str]] = []
+    for alias, canonical in _station_aliases().items():
+        match = re.search(rf"\b{re.escape(alias)}\b", lower)
+        if match:
+            mentions.append((match.start(), canonical))
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for _, name in sorted(mentions):
+        if name in seen:
+            continue
+        station = _station_by_name(name, world_state)
+        if station:
+            ordered.append(station)
+            seen.add(name)
+    return ordered
+
+
+def _requested_task_count(text: str) -> int:
+    words = set(re.findall(r"[a-z0-9]+", text.lower()))
+    word_counts = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+    }
+    for word, count in word_counts.items():
+        if word in words:
+            return count
+    number = re.search(r"\b([1-5])\b", text)
+    return int(number.group(1)) if number else 1
+
+
+def _parse_user_task_request(text: str, world_state: dict) -> tuple[dict, dict, int] | None:
+    """Parse commands like 'move Parts to Assembly' into a real task route."""
+    if _is_go_and_stop_command(text):
+        return None
+    stations = _station_mentions_in_order(text, world_state)
+    if len(stations) < 2:
+        return None
+
+    lower = text.lower()
+    has_task_verb = bool(
+        re.search(r"\b(move|send|route|deliver|carry|transport|take|bring|ship|build)\b", lower)
+    )
+    has_route_word = bool(re.search(r"\b(to|from|into|toward|->)\b", lower))
+    if not (has_task_verb or has_route_word):
+        return None
+
+    # Prefer explicit "from X to Y" if present; otherwise use first mention -> second mention.
+    aliases = "|".join(re.escape(alias) for alias in _station_aliases())
+    explicit = re.search(
+        rf"\bfrom\s+(?P<src>{aliases})\b.*\bto\s+(?P<dst>{aliases})\b",
+        lower,
+    )
+    if explicit:
+        src_name = _station_aliases()[explicit.group("src")]
+        dst_name = _station_aliases()[explicit.group("dst")]
+        pickup = _station_by_name(src_name, world_state)
+        delivery = _station_by_name(dst_name, world_state)
+    else:
+        pickup, delivery = stations[0], stations[1]
+
+    if not pickup or not delivery or pickup["name"] == delivery["name"]:
+        return None
+    return pickup, delivery, _requested_task_count(text)
+
+
+def _create_user_task(world_state: dict, pickup_ws: dict, delivery_ws: dict) -> dict:
+    """Create a high-priority task from a user command."""
+    global _task_counter
+    task = {
+        "id": _task_counter,
+        "status": "open",
+        "pickup": list(pickup_ws["pos"]),
+        "delivery": list(delivery_ws["pos"]),
+        "pickup_name": pickup_ws["name"],
+        "delivery_name": delivery_ws["name"],
+        "assigned_to": None,
+        "source": "user",
+        "priority": 100,
+    }
+    _task_counter += 1
+    return task
+
+
+def _has_active_user_task(world_state: dict) -> bool:
+    return any(
+        t.get("source") == "user" and t.get("status") not in {"done", "cancelled"}
+        for t in world_state.get("tasks", [])
+    )
+
+
+def _apply_user_task_request(
+    text: str,
+    world_state: dict,
+    blackboard: Blackboard,
+) -> bool:
+    """Convert a natural-language task request into structured work robots can execute."""
+    parsed = _parse_user_task_request(text, world_state)
+    if parsed is None:
+        return False
+
+    pickup_ws, delivery_ws, count = parsed
+    _cancel_pending_decisions()
+
+    for robot in world_state.get("robots", []):
+        robot["current_task"] = None
+        robot["path"] = []
+
+    for task in world_state.get("tasks", []):
+        if task.get("status") != "done":
+            task["status"] = "cancelled"
+            task["assigned_to"] = None
+
+    new_tasks = [
+        _create_user_task(world_state, pickup_ws, delivery_ws)
+        for _ in range(count)
+    ]
+    world_state["tasks"].extend(new_tasks)
+    world_state["manual_control"] = False
+    blackboard.post(
+        -1,
+        "STRATEGY",
+        (
+            f"User task accepted: {count} priority route(s) "
+            f"{pickup_ws['name']}->{delivery_ws['name']}."
+        ),
+    )
+    print(
+        f"[command] created {count} user task(s): "
+        f"{pickup_ws['name']}->{delivery_ws['name']}",
+        flush=True,
+    )
+    return True
 
 
 def _is_go_and_stop_command(text: str) -> bool:
@@ -798,7 +945,7 @@ def _print_startup_banner() -> None:
     print(
         f"  AGENTS_USE_MOCK={os.getenv('AGENTS_USE_MOCK', 'false')}  "
         f"ALL_AGENTS_LLM={os.getenv('ALL_AGENTS_LLM', 'true')}  "
-        f"USE_LOCAL_NIM={os.getenv('USE_LOCAL_NIM', 'false')}  "
+        f"USE_LOCAL_NIM={os.getenv('USE_LOCAL_NIM', 'true')}  "
         f"GX10_IP={os.getenv('GX10_IP', 'localhost')}",
         flush=True,
     )
@@ -815,7 +962,7 @@ def _auto_fallback_to_mock_if_endpoints_dead() -> None:
     if os.getenv("AGENTS_USE_MOCK", "false").lower() == "true":
         return  # already in mock mode, nothing to check
 
-    use_local = os.getenv("USE_LOCAL_NIM", "false").lower() == "true"
+    use_local = os.getenv("USE_LOCAL_NIM", "true").lower() == "true"
     if use_local:
         if _local_nim_available(timeout=0.5):
             return
@@ -851,7 +998,7 @@ def main() -> None:
     # --- Init ---
     layout = os.getenv("LAYOUT", OPEN_FLOOR)
     speed_multiplier = 1
-    initial_use_local = os.getenv("USE_LOCAL_NIM", "false").lower() == "true"
+    initial_use_local = os.getenv("USE_LOCAL_NIM", "true").lower() == "true"
     initial_use_mock = os.getenv("AGENTS_USE_MOCK", "false").lower() == "true"
     max_runtime = float(os.getenv("FACTORYMIND_MAX_RUNTIME", "0") or 0)
     world_state = _reset_demo_state(layout, speed_multiplier, "online")
@@ -868,6 +1015,7 @@ def main() -> None:
     # Timers — start at -(interval) so first tick fires immediately on sim start
     sim_elapsed          = 0.0
     last_frame_time      = time.time()
+    run_start_time       = last_frame_time
     last_leader_tick     = -LEADER_TICK_INTERVAL
     last_worker_tick     = -WORKER_TICK_INTERVAL
     last_strategist_tick = 0.0
@@ -988,6 +1136,11 @@ def main() -> None:
                         last_worker_tick = now
                         last_strategist_tick = now
                         continue
+                    if _apply_user_task_request(user_text, world_state, blackboard):
+                        manual_control = False
+                        last_leader_tick = now - LEADER_TICK_INTERVAL
+                        last_worker_tick = now - WORKER_TICK_INTERVAL
+                        last_task_spawn = now
                     manual_control = False
                     # Trigger immediate strategist response to user command
                     if _pending_strategist is None:
@@ -1011,7 +1164,10 @@ def main() -> None:
             if not manual_control:
                 # --- Spawn new tasks ---
                 if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
-                    if _active_task_count(world_state) < TARGET_ACTIVE_TASKS:
+                    if (
+                        not _has_active_user_task(world_state)
+                        and _active_task_count(world_state) < TARGET_ACTIVE_TASKS
+                    ):
                         world_state["tasks"].append(_spawn_task(world_state))
                     last_task_spawn = now
 
@@ -1087,7 +1243,10 @@ def main() -> None:
             R.render(screen, world_state)
         except Exception as exc:
             print(f"[main] render failed: {exc}", file=sys.stderr, flush=True)
-        if max_runtime and sim_elapsed >= max_runtime:
+        if max_runtime and (
+            sim_elapsed >= max_runtime
+            or wall_now - run_start_time >= max_runtime
+        ):
             running = False
         clock.tick(FPS)
 
