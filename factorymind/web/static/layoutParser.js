@@ -7,9 +7,21 @@ export const TILE_COLORS = {
   charger: { hex: "#9333EA", rgb: [147, 51, 234] },
   restricted: { hex: "#DC2626", rgb: [220, 38, 38] },
   worker_spawn: { hex: "#EAB308", rgb: [234, 179, 8] },
+  conveyor_red: { hex: "#7F1D1D", rgb: [127, 29, 29], packageColor: "Red" },
+  conveyor_blue: { hex: "#1E3A8A", rgb: [30, 58, 138], packageColor: "Blue" },
+  conveyor_green: { hex: "#14532D", rgb: [20, 83, 45], packageColor: "Green" },
+  conveyor_yellow: { hex: "#713F12", rgb: [113, 63, 18], packageColor: "Yellow" },
+  conveyor_magenta: { hex: "#581C87", rgb: [88, 28, 135], packageColor: "Magenta" },
+  conveyor_cyan: { hex: "#164E63", rgb: [22, 78, 99], packageColor: "Cyan" },
+  bin_red: { hex: "#FCA5A5", rgb: [252, 165, 165], packageColor: "Red" },
+  bin_blue: { hex: "#93C5FD", rgb: [147, 197, 253], packageColor: "Blue" },
+  bin_green: { hex: "#86EFAC", rgb: [134, 239, 172], packageColor: "Green" },
+  bin_yellow: { hex: "#FEF08A", rgb: [254, 240, 138], packageColor: "Yellow" },
+  bin_magenta: { hex: "#F0ABFC", rgb: [240, 171, 252], packageColor: "Magenta" },
+  bin_cyan: { hex: "#A5F3FC", rgb: [165, 243, 252], packageColor: "Cyan" },
 };
 
-const OBJECT_TILES = new Set(["shelf", "conveyor", "bin", "charger", "restricted", "worker_spawn"]);
+const OBJECT_TILES = new Set(Object.keys(TILE_COLORS).filter((tile) => tile !== "floor"));
 
 export async function parseLayoutImageFile(file, options = {}) {
   const gridWidth = Number(options.gridWidth || 50);
@@ -118,13 +130,13 @@ function extractObjects(grid) {
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const tile = grid[y][x];
-      if (visited[y][x] || !OBJECT_TILES.has(tile) && tile !== "wall") continue;
+      if (visited[y][x] || !OBJECT_TILES.has(tile)) continue;
       const component = floodFill(grid, visited, x, y, tile);
       const object = componentObject(tile, component, counters);
       if (!object) continue;
       if (tile === "shelf") layout.shelves.push(object);
-      else if (tile === "conveyor") layout.conveyors.push(object);
-      else if (tile === "bin") layout.bins.push(object);
+      else if (baseTile(tile) === "conveyor") layout.conveyors.push(object);
+      else if (baseTile(tile) === "bin") layout.bins.push(object);
       else if (tile === "charger") layout.chargers.push(object);
       else if (tile === "worker_spawn") layout.workerSpawns.push(object);
       else layout.obstacles.push(object);
@@ -151,26 +163,35 @@ function floodFill(grid, visited, startX, startY, tile) {
 }
 
 function componentObject(tile, cells, counters) {
+  const kind = baseTile(tile);
   const xs = cells.map((cell) => cell[0]);
   const ys = cells.map((cell) => cell[1]);
   const minX = Math.min(...xs);
   const minY = Math.min(...ys);
   const maxX = Math.max(...xs);
   const maxY = Math.max(...ys);
-  counters[tile] += 1;
+  counters[kind] = (counters[kind] || 0) + 1;
   const base = {
-    id: `${tile}-${counters[tile]}`,
+    id: `${kind}-${counters[kind]}`,
+    tile,
     x: minX,
     y: minY,
     width: maxX - minX + 1,
     depth: maxY - minY + 1,
     cells,
   };
-  if (tile === "conveyor") {
-    return { ...base, spawnIntervalMs: 2500, enabled: true };
+  const packageColor = TILE_COLORS[tile]?.packageColor;
+  if (kind === "conveyor") {
+    return { ...base, packageColor, spawnIntervalMs: 2500, enabled: true };
   }
-  if (tile === "bin") {
-    return { ...base, acceptsType: "auto" };
+  if (kind === "bin") {
+    return { ...base, packageColor, acceptsType: packageColor || "auto" };
   }
   return base;
+}
+
+function baseTile(tile) {
+  if (tile.startsWith("conveyor_")) return "conveyor";
+  if (tile.startsWith("bin_")) return "bin";
+  return tile;
 }

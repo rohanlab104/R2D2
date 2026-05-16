@@ -313,7 +313,7 @@ def _state_from_uploaded_layout(
     worker_spawns = layout.get("workerSpawns") or []
 
     for index, conveyor in enumerate(conveyors):
-        color = colors[index % len(colors)]
+        color = _package_color(conveyor, colors[index % len(colors)])
         pos = _clamp_factory_pos([int(conveyor.get("x", 5)), int(conveyor.get("y", 5))])
         factory = M.S.make_factory(f"Intake-{index + 1}", pos, color, index)
         factory["produce_every"] = _produce_every_for_volume(order_volume)
@@ -322,7 +322,10 @@ def _state_from_uploaded_layout(
         _clear_asset_cells(world_state["wall"], pos, 8, 3)
 
     for index, bin_obj in enumerate(bins):
-        color = colors[index % max(1, min(len(colors), len(conveyors) or len(colors)))]
+        color = _package_color(
+            bin_obj,
+            colors[index % max(1, min(len(colors), len(conveyors) or len(colors)))],
+        )
         pos = _clamp_dropbox_pos([int(bin_obj.get("x", 40)), int(bin_obj.get("y", 8))])
         box = M.S.make_dropbox(f"DropBin-{index + 1}-{color}", pos, color, index)
         world_state["dropboxes"].append(box)
@@ -542,6 +545,12 @@ def _coerce_int(value, minimum: int, maximum: int, fallback: int) -> int:
 
 def _produce_every_for_volume(order_volume: int) -> float:
     return max(0.8, round(8.0 / max(1, order_volume), 2))
+
+
+def _package_color(obj: dict, fallback: str) -> str:
+    candidate = obj.get("packageColor") or obj.get("acceptsType")
+    valid = {item["name"] for item in M.S.PACKAGE_COLORS}
+    return str(candidate) if candidate in valid else fallback
 
 
 def _build_info(world_state: dict) -> dict:

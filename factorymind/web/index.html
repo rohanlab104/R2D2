@@ -206,6 +206,14 @@
           </select>
         </label>
         <div class="build-note">
+          Recommended PNG size: 50x50 pixels. Larger PNGs work, but they are sampled down to a 50x50 grid, so use crisp block colors with no antialiasing.
+          <br><br>
+          Base legend: white floor, black wall, #2563EB shelf, #16A34A generic conveyor, #F97316 generic bin, #9333EA charger, #DC2626 restricted, #EAB308 worker spawn.
+          <br><br>
+          Typed conveyors: Red #7F1D1D, Blue #1E3A8A, Green #14532D, Yellow #713F12, Magenta #581C87, Cyan #164E63.
+          Typed bins: Red #FCA5A5, Blue #93C5FD, Green #86EFAC, Yellow #FEF08A, Magenta #F0ABFC, Cyan #A5F3FC.
+        </div>
+        <div class="build-note">
           Shelves become blocked route cells. Conveyors create intake factories for the selected package type. Drop bins accept that same type, and workers will choose the reachable matching bin with the shortest route.
         </div>
       </div>
@@ -224,6 +232,14 @@
         </label>
         <canvas id="layout-preview" width="320" height="220"></canvas>
         <div id="layout-status">Upload a PNG using the warehouse color map.</div>
+        <div class="build-note">
+          Recommended PNG size: 50x50 pixels. Larger PNGs work, but they are sampled down to a 50x50 grid, so use crisp block colors with no antialiasing.
+          <br><br>
+          Base legend: white floor, black wall, #2563EB shelf, #16A34A generic conveyor, #F97316 generic bin, #9333EA charger, #DC2626 restricted, #EAB308 worker spawn.
+          <br><br>
+          Typed conveyors: Red #7F1D1D, Blue #1E3A8A, Green #14532D, Yellow #713F12, Magenta #581C87, Cyan #164E63.
+          Typed bins: Red #FCA5A5, Blue #93C5FD, Green #86EFAC, Yellow #FEF08A, Magenta #F0ABFC, Cyan #A5F3FC.
+        </div>
         <div class="twin-grid">
           <label class="field">Workers <span id="worker-count-value">3</span>
             <input type="range" id="worker-count" min="1" max="16" value="3">
@@ -951,7 +967,7 @@ document.getElementById("apply-layout").onclick = () => {
   updateLayoutStatus();
   if (!uploadedValidation.valid) return;
   sendAction(buildApplyLayoutAction(uploadedLayout, currentExperimentOptions()));
-  setTab("ops");
+  setTab("build");
 };
 document.getElementById("save-layout-json").onclick = () => {
   if (!uploadedLayout) return;
