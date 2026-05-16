@@ -229,6 +229,43 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
     robot["path"] = a_star(robot["pos"], task["pickup"], wall_set)
 
 
+def _delegate_task_to_nearest_worker(
+    leader: dict,
+    task: dict,
+    world_state: dict,
+    blackboard: Blackboard,
+) -> bool:
+    """Let a leader choose the task while the nearest idle worker executes it."""
+    idle_workers = [
+        r for r in world_state.get("robots", [])
+        if r.get("role") == WORKER and r.get("current_task") is None and not r.get("path")
+    ]
+    if not idle_workers:
+        return False
+
+    worker = min(
+        idle_workers,
+        key=lambda r: (
+            abs(r["pos"][0] - task["pickup"][0]) + abs(r["pos"][1] - task["pickup"][1]),
+            r["id"],
+        ),
+    )
+    _assign_task_to_robot(worker, task, world_state)
+    task["delegated_by"] = leader["id"]
+    route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
+    distance = abs(worker["pos"][0] - task["pickup"][0]) + abs(worker["pos"][1] - task["pickup"][1])
+    blackboard.post(
+        leader["id"],
+        "INTENT",
+        f"Delegating {route} task {task['id']} to W{worker['id']}; worker is {distance} cells from pickup.",
+    )
+    print(
+        f"[leader {leader['id']}] delegated task {task['id']} ({route}) to worker {worker['id']}",
+        flush=True,
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Demo / integration helpers
 # ---------------------------------------------------------------------------
@@ -546,6 +583,7 @@ def _apply_leader_decision(
         )
         if task:
             _assign_task_to_robot(leader, task, world_state)
+            _delegate_task_to_nearest_worker(leader, task, world_state, blackboard)
 
     msg = decision.get("post_message", "")
     if msg:
