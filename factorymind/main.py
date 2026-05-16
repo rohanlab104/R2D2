@@ -16,6 +16,7 @@ import importlib
 import copy
 import os
 import random
+import re
 import socket
 import sys
 import time
@@ -235,7 +236,7 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
 
 def _station_for_user_command(text: str, world_state: dict) -> dict | None:
     """Return the workstation named in a simple human command, if any."""
-    lowered = text.lower()
+    words = set(re.findall(r"[a-z0-9]+", text.lower()))
     aliases = {
         "parts": "Parts",
         "part": "Parts",
@@ -246,7 +247,7 @@ def _station_for_user_command(text: str, world_state: dict) -> dict | None:
         "shipping": "Shipping",
         "ship": "Shipping",
     }
-    wanted = next((name for word, name in aliases.items() if word in lowered), None)
+    wanted = next((name for word, name in aliases.items() if word in words), None)
     if wanted is None:
         return None
     return next(
@@ -257,10 +258,32 @@ def _station_for_user_command(text: str, world_state: dict) -> dict | None:
 
 def _is_go_and_stop_command(text: str) -> bool:
     """Detect direct movement commands that should override autonomous work."""
-    lowered = text.lower()
-    has_motion = any(word in lowered for word in ("go", "move", "send", "park", "route"))
-    has_stop = any(word in lowered for word in ("stop", "hold", "wait", "park"))
+    words = set(re.findall(r"[a-z0-9]+", text.lower()))
+    has_motion = bool(words & {"go", "move", "send", "park", "route"})
+    has_stop = bool(words & {"stop", "hold", "wait", "park"})
     return has_motion and has_stop
+
+
+def _station_hold_targets(station_pos: list[int], world_state: dict, count: int) -> list[list[int]]:
+    """Return nearby legal cells so robots visibly gather around a station."""
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    sx, sy = station_pos
+    offsets = [
+        (0, 0), (1, 0), (0, 1), (-1, 0), (0, -1),
+        (1, 1), (-1, 1), (1, -1), (-1, -1),
+        (2, 0), (0, 2), (-2, 0), (0, -2),
+    ]
+    targets: list[list[int]] = []
+    for dx, dy in offsets:
+        cell = [sx + dx, sy + dy]
+        if not (0 <= cell[0] < GRID_WIDTH and 0 <= cell[1] < GRID_HEIGHT):
+            continue
+        if tuple(cell) in wall_set:
+            continue
+        targets.append(cell)
+        if len(targets) >= count:
+            break
+    return targets or [station_pos]
 
 
 def _apply_go_to_station_and_stop(
@@ -275,10 +298,11 @@ def _apply_go_to_station_and_stop(
 
     _cancel_pending_decisions()
     wall_set = {tuple(c) for c in world_state.get("wall", [])}
-    target = list(station["pos"])
-    for robot in world_state.get("robots", []):
+    robots = world_state.get("robots", [])
+    targets = _station_hold_targets(list(station["pos"]), world_state, len(robots))
+    for index, robot in enumerate(robots):
         robot["current_task"] = None
-        robot["path"] = a_star(robot["pos"], target, wall_set)
+        robot["path"] = a_star(robot["pos"], targets[index % len(targets)], wall_set)
 
     for task in world_state.get("tasks", []):
         if task.get("status") != "done":
@@ -290,6 +314,11 @@ def _apply_go_to_station_and_stop(
         -1,
         "STRATEGY",
         f"Manual command: all robots moving to {station['name']} and holding there.",
+    )
+    print(
+        f"[command] hard stop: routing {len(robots)} robots to {station['name']} "
+        f"hold positions near {station['pos']}",
+        flush=True,
     )
     return True
 
@@ -395,9 +424,11 @@ def _apply_leader_decision(
     msg = decision.get("post_message", "")
     if msg:
         blackboard.post(leader["id"], CLAIM, msg)
+        print(f"[leader {leader['id']}] {msg}", flush=True)
     reasoning = str(decision.get("reasoning", "")).strip()
     if reasoning:
         blackboard.post(leader["id"], "REASONING", reasoning[:140])
+        print(f"[leader {leader['id']} reasoning] {reasoning[:180]}", flush=True)
 
 
 def _apply_worker_decision(
@@ -439,6 +470,7 @@ def _apply_worker_decision(
     msg = decision.get("post_message", "")
     if msg:
         blackboard.post(worker["id"], INTENT, msg)
+        print(f"[worker {worker['id']}] {msg}", flush=True)
     reasoning = str(decision.get("reasoning", "")).strip()
     if reasoning:
         blackboard.post(worker["id"], "REASONING", reasoning[:140])
@@ -478,9 +510,11 @@ def _apply_strategist_decision(
         return
     msg_type = BOTTLENECK if "bottleneck" in directive.lower() else STRATEGY
     blackboard.post(-1, msg_type, directive)
+    print(f"[strategist/{msg_type}] {directive}", flush=True)
     reasoning_text = str(decision.get("reasoning", "")).strip()
     if reasoning_text:
         blackboard.post(-1, "REASONING", reasoning_text[:140])
+        print(f"[strategist reasoning] {reasoning_text[:180]}", flush=True)
     M.record_strategy(
         world_state["layout"],
         directive,
@@ -840,6 +874,7 @@ def main() -> None:
     last_task_spawn      = -TASK_SPAWN_INTERVAL
     last_move_tick       = -MOVE_TICK_INTERVAL
     last_heartbeat       = time.time()
+    heartbeat_seconds    = float(os.getenv("FACTORYMIND_HEARTBEAT_SECONDS", "10"))
     frames_since_beat    = 0
 
     running = True
@@ -854,7 +889,7 @@ def main() -> None:
 
         # --- Heartbeat (proves the main loop is alive) ---
         frames_since_beat += 1
-        if wall_now - last_heartbeat >= 5.0:
+        if heartbeat_seconds > 0 and wall_now - last_heartbeat >= heartbeat_seconds:
             in_flight = (
                 len(_pending_leader)
                 + len(_pending_worker)
