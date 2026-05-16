@@ -312,6 +312,7 @@ def _state_from_uploaded_layout(
     chargers = layout.get("chargers") or []
     worker_spawns = layout.get("workerSpawns") or []
 
+    conveyor_refs = []
     for index, conveyor in enumerate(conveyors):
         color = _package_color(conveyor, colors[index % len(colors)])
         pos = _clamp_factory_pos([int(conveyor.get("x", 5)), int(conveyor.get("y", 5))])
@@ -319,13 +320,19 @@ def _state_from_uploaded_layout(
         factory["produce_every"] = _produce_every_for_volume(order_volume)
         factory["produce_timer"] = 0.6 + index * 0.45
         world_state["factories"].append(factory)
+        conveyor_refs.append({"color": color, "center": _object_center(conveyor)})
         _clear_asset_cells(world_state["wall"], pos, 8, 3)
 
+    unused_conveyor_refs = list(conveyor_refs)
     for index, bin_obj in enumerate(bins):
-        color = _package_color(
-            bin_obj,
-            colors[index % max(1, min(len(colors), len(conveyors) or len(colors)))],
-        )
+        fallback = colors[index % max(1, min(len(colors), len(conveyors) or len(colors)))]
+        color = _explicit_package_color(bin_obj)
+        if color is None:
+            color = _nearest_conveyor_color(bin_obj, unused_conveyor_refs or conveyor_refs, fallback)
+            if unused_conveyor_refs:
+                used_ref = _nearest_conveyor_ref(bin_obj, unused_conveyor_refs)
+                if used_ref:
+                    unused_conveyor_refs.remove(used_ref)
         pos = _clamp_dropbox_pos([int(bin_obj.get("x", 40)), int(bin_obj.get("y", 8))])
         box = M.S.make_dropbox(f"DropBin-{index + 1}-{color}", pos, color, index)
         world_state["dropboxes"].append(box)
@@ -548,9 +555,40 @@ def _produce_every_for_volume(order_volume: int) -> float:
 
 
 def _package_color(obj: dict, fallback: str) -> str:
+    return _explicit_package_color(obj) or fallback
+
+
+def _explicit_package_color(obj: dict) -> str | None:
     candidate = obj.get("packageColor") or obj.get("acceptsType")
     valid = {item["name"] for item in M.S.PACKAGE_COLORS}
-    return str(candidate) if candidate in valid else fallback
+    return str(candidate) if candidate in valid else None
+
+
+def _object_center(obj: dict) -> tuple[float, float]:
+    cells = obj.get("cells") if isinstance(obj, dict) else None
+    if isinstance(cells, list) and cells:
+        xs = [float(cell[0]) for cell in cells if isinstance(cell, list) and len(cell) == 2]
+        ys = [float(cell[1]) for cell in cells if isinstance(cell, list) and len(cell) == 2]
+        if xs and ys:
+            return (sum(xs) / len(xs), sum(ys) / len(ys))
+    x = float(obj.get("x", 0))
+    y = float(obj.get("y", 0))
+    return (x + float(obj.get("width", 1)) / 2.0, y + float(obj.get("depth", 1)) / 2.0)
+
+
+def _nearest_conveyor_color(bin_obj: dict, conveyor_refs: list[dict], fallback: str) -> str:
+    ref = _nearest_conveyor_ref(bin_obj, conveyor_refs)
+    return str(ref["color"]) if ref else fallback
+
+
+def _nearest_conveyor_ref(bin_obj: dict, conveyor_refs: list[dict]) -> dict | None:
+    if not conveyor_refs:
+        return None
+    bx, by = _object_center(bin_obj)
+    return min(
+        conveyor_refs,
+        key=lambda ref: (bx - ref["center"][0]) ** 2 + (by - ref["center"][1]) ** 2,
+    )
 
 
 def _build_info(world_state: dict) -> dict:

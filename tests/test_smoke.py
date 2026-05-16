@@ -13,6 +13,7 @@ from factorymind.main import (
     _move_workers,
 )
 from factorymind.state import create_initial_state
+from factorymind.web_main import _state_from_uploaded_layout
 
 
 def test_autonomous_package_delivery_smoke() -> None:
@@ -80,6 +81,39 @@ def test_builder_stores_rotated_dropbox() -> None:
     )
 
     assert math.isclose(world_state["dropboxes"][-1]["rotation_y"], math.pi / 2)
+
+
+def test_uploaded_generic_bins_match_nearest_conveyor_color() -> None:
+    action = {
+        "type": "apply_layout",
+        "worker_count": 3,
+        "order_volume": 6,
+        "layout": {
+            "id": "shifted-bin-order",
+            "name": "Shifted Bin Order",
+            "grid": [["floor"]],
+            "layout": {
+                "shelves": [],
+                "conveyors": [
+                    {"id": "red", "x": 5, "y": 5, "packageColor": "Red", "cells": [[5, 5]]},
+                    {"id": "blue", "x": 5, "y": 25, "packageColor": "Blue", "cells": [[5, 25]]},
+                    {"id": "green", "x": 5, "y": 45, "packageColor": "Green", "cells": [[5, 45]]},
+                ],
+                "bins": [
+                    {"id": "near-blue", "x": 40, "y": 25, "cells": [[40, 25]]},
+                    {"id": "near-green", "x": 40, "y": 45, "cells": [[40, 45]]},
+                    {"id": "near-red", "x": 40, "y": 5, "cells": [[40, 5]]},
+                ],
+                "chargers": [],
+                "obstacles": [],
+                "workerSpawns": [{"id": "spawn", "x": 24, "y": 42, "cells": [[24, 42]]}],
+            },
+        },
+    }
+
+    world_state = _state_from_uploaded_layout(action, 1, "online", "test", False)
+
+    assert [box["color"] for box in world_state["dropboxes"]] == ["Blue", "Green", "Red"]
 
 
 def test_worker_replans_around_traffic_blocker() -> None:
