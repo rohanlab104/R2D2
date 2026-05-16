@@ -18,6 +18,8 @@ import random
 import socket
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -34,6 +36,7 @@ from factorymind.agents import (
     choose_worker_task,
     leader_decide,
     strategist_decide,
+    worker_decide,
     worker_step,
 )
 from factorymind.state import (
@@ -46,11 +49,31 @@ from factorymind.state import (
 # ---------------------------------------------------------------------------
 FPS = 60
 LEADER_TICK_INTERVAL = 1.5
+WORKER_TICK_INTERVAL = 2.5  # workers think slightly less often than leaders
 STRATEGIST_TICK_INTERVAL = 20.0
 TASK_SPAWN_INTERVAL = 1.2
 MOVE_TICK_INTERVAL = 0.05  # how often robots advance one step
 TARGET_ACTIVE_TASKS = 5
 SPEED_OPTIONS = (1, 2, 4)
+
+# Set ALL_AGENTS_LLM=false to fall back to the rule-based worker dispatcher
+# (cheaper, no per-worker NIM traffic). Default is true so every ball is its
+# own LLM-driven agent.
+_ALL_AGENTS_LLM = os.getenv("ALL_AGENTS_LLM", "true").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# Background inference workers
+#
+# LLM calls (cloud or local NIM) take 0.3-30s per request. Running them on
+# the main thread freezes pygame's event loop and the OS marks the window
+# "Not Responding". We dispatch decisions to a thread pool and apply them
+# whenever they're ready; the main loop keeps rendering at 60 FPS.
+# Pool size = leaders + workers + strategist + a little headroom.
+# ---------------------------------------------------------------------------
+_decision_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="agent")
+_pending_leader: dict[int, Future] = {}
+_pending_worker: dict[int, Future] = {}
+_pending_strategist: Optional[Future] = None
 
 # ---------------------------------------------------------------------------
 # A* pathfinding
@@ -264,6 +287,178 @@ def _strategy_outcome_summary(world_state: dict, reasoning: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Decision application (called from main thread once a future completes)
+# ---------------------------------------------------------------------------
+
+def _apply_leader_decision(
+    leader: dict,
+    decision: dict,
+    world_state: dict,
+    blackboard: Blackboard,
+) -> None:
+    """Mutate world_state and blackboard based on a completed leader decision."""
+    from factorymind.state import CLAIM
+
+    claimed_id = decision.get("claim_task_id")
+    if claimed_id is not None:
+        task = next(
+            (t for t in world_state["tasks"]
+             if t["id"] == claimed_id and t["status"] == "open"
+             and t.get("assigned_to") is None),
+            None,
+        )
+        if task:
+            _assign_task_to_robot(leader, task, world_state)
+
+    msg = decision.get("post_message", "")
+    if msg:
+        blackboard.post(leader["id"], CLAIM, msg)
+
+
+def _apply_worker_decision(
+    worker: dict,
+    decision: dict,
+    world_state: dict,
+    blackboard: Blackboard,
+) -> None:
+    """Mutate state based on a per-worker LLM decision (each ball is an agent)."""
+    from factorymind.state import CLAIM, INTENT
+
+    claimed_id = decision.get("claim_task_id")
+    if claimed_id is not None:
+        task = next(
+            (t for t in world_state["tasks"]
+             if t["id"] == claimed_id and t["status"] == "open"),
+            None,
+        )
+        if task:
+            assigned_to = task.get("assigned_to")
+            if assigned_to in (None, worker["id"]):
+                _assign_task_to_robot(worker, task, world_state)
+            else:
+                # Take over from a leader only if we're closer to the pickup.
+                leader = next(
+                    (r for r in world_state["robots"] if r["id"] == assigned_to),
+                    None,
+                )
+                worker_dist = abs(worker["pos"][0] - task["pickup"][0]) + \
+                              abs(worker["pos"][1] - task["pickup"][1])
+                leader_dist = (
+                    abs(leader["pos"][0] - task["pickup"][0]) +
+                    abs(leader["pos"][1] - task["pickup"][1])
+                    if leader else 10**9
+                )
+                if worker_dist < leader_dist:
+                    _assign_task_to_robot(worker, task, world_state)
+
+    msg = decision.get("post_message", "")
+    if msg:
+        blackboard.post(worker["id"], INTENT, msg)
+
+
+def _assign_idle_workers(world_state: dict, blackboard: Blackboard) -> None:
+    """Rule-based worker dispatch — runs every leader tick when ALL_AGENTS_LLM=false."""
+    idle_workers = [
+        r for r in world_state["robots"]
+        if r["role"] == WORKER and r.get("current_task") is None and not r.get("path")
+    ]
+    for worker in idle_workers:
+        task_id = choose_worker_task(worker, world_state, blackboard)
+        if task_id is None:
+            continue
+        task = next(
+            (t for t in world_state["tasks"]
+             if t["id"] == task_id and t["status"] == "open"),
+            None,
+        )
+        if task:
+            _assign_task_to_robot(worker, task, world_state)
+
+
+def _apply_strategist_decision(
+    decision: dict,
+    world_state: dict,
+    blackboard: Blackboard,
+) -> None:
+    """Post strategist directive and persist it for future runs."""
+    from factorymind.state import BOTTLENECK, STRATEGY
+
+    directive = decision.get("directive", "").strip()
+    if not (decision.get("should_post") and directive):
+        return
+    if _is_duplicate_directive(blackboard, directive):
+        return
+    msg_type = BOTTLENECK if "bottleneck" in directive.lower() else STRATEGY
+    blackboard.post(-1, msg_type, directive)
+    M.record_strategy(
+        world_state["layout"],
+        directive,
+        _strategy_outcome_summary(world_state, str(decision.get("reasoning", ""))),
+    )
+
+
+def _drain_completed_decisions(world_state: dict, blackboard: Blackboard) -> None:
+    """Apply any leader/worker/strategist futures that finished since the last frame."""
+    global _pending_strategist
+
+    robot_lookup = {r["id"]: r for r in world_state["robots"]}
+
+    for rid in list(_pending_leader.keys()):
+        fut = _pending_leader[rid]
+        if not fut.done():
+            continue
+        del _pending_leader[rid]
+        leader = robot_lookup.get(rid)
+        if leader is None or leader.get("role") != LEADER:
+            continue
+        try:
+            decision = fut.result()
+        except Exception as exc:
+            print(f"[main] leader {rid} decision failed: {exc}", file=sys.stderr)
+            continue
+        _apply_leader_decision(leader, decision, world_state, blackboard)
+
+    for rid in list(_pending_worker.keys()):
+        fut = _pending_worker[rid]
+        if not fut.done():
+            continue
+        del _pending_worker[rid]
+        worker = robot_lookup.get(rid)
+        if worker is None or worker.get("role") != WORKER:
+            continue
+        try:
+            decision = fut.result()
+        except Exception as exc:
+            print(f"[main] worker {rid} decision failed: {exc}", file=sys.stderr)
+            continue
+        _apply_worker_decision(worker, decision, world_state, blackboard)
+
+    if _pending_strategist is not None and _pending_strategist.done():
+        fut = _pending_strategist
+        _pending_strategist = None
+        try:
+            decision = fut.result()
+        except Exception as exc:
+            print(f"[main] strategist decision failed: {exc}", file=sys.stderr)
+        else:
+            _apply_strategist_decision(decision, world_state, blackboard)
+
+
+def _cancel_pending_decisions() -> None:
+    """Drop in-flight futures (e.g. on layout reset) so stale results don't apply."""
+    global _pending_strategist
+    for fut in _pending_leader.values():
+        fut.cancel()
+    _pending_leader.clear()
+    for fut in _pending_worker.values():
+        fut.cancel()
+    _pending_worker.clear()
+    if _pending_strategist is not None:
+        _pending_strategist.cancel()
+        _pending_strategist = None
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -285,6 +480,7 @@ def main() -> None:
     sim_elapsed          = 0.0
     last_frame_time      = time.time()
     last_leader_tick     = 0.0
+    last_worker_tick     = 0.0
     last_strategist_tick = 0.0
     last_task_spawn      = 0.0
     last_move_tick       = 0.0
@@ -305,6 +501,7 @@ def main() -> None:
                 action = R.get_button_click(event.pos)
                 if action == "disconnect":
                     from factorymind.state import STRATEGY
+                    _cancel_pending_decisions()
                     if world_state["connection_status"] == "online":
                         _set_inference_mode(True)
                         world_state["connection_status"] = "offline"
@@ -335,6 +532,7 @@ def main() -> None:
                             "Demo reconnect: inference mode restored to startup configuration.",
                         )
                 elif action == "layout_open":
+                    _cancel_pending_decisions()
                     world_state = _reset_demo_state(
                         OPEN_FLOOR,
                         speed_multiplier,
@@ -342,8 +540,9 @@ def main() -> None:
                     )
                     blackboard.clear()
                     sim_elapsed = 0.0
-                    last_leader_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
+                    last_leader_tick = last_worker_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
                 elif action == "layout_bottleneck":
+                    _cancel_pending_decisions()
                     world_state = _reset_demo_state(
                         BOTTLENECK_BRIDGE,
                         speed_multiplier,
@@ -351,8 +550,9 @@ def main() -> None:
                     )
                     blackboard.clear()
                     sim_elapsed = 0.0
-                    last_leader_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
+                    last_leader_tick = last_worker_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
                 elif action == "reset":
+                    _cancel_pending_decisions()
                     world_state = _reset_demo_state(
                         world_state["layout"],
                         speed_multiplier,
@@ -360,10 +560,13 @@ def main() -> None:
                     )
                     blackboard.clear()
                     sim_elapsed = 0.0
-                    last_leader_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
+                    last_leader_tick = last_worker_tick = last_strategist_tick = last_task_spawn = last_move_tick = 0.0
                 elif action == "speedup":
                     speed_multiplier = _cycle_speed(speed_multiplier)
                     world_state["speed_multiplier"] = speed_multiplier
+
+        # --- Apply any LLM decisions that finished since last frame ---
+        _drain_completed_decisions(world_state, blackboard)
 
         # --- Spawn new tasks ---
         if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
@@ -371,69 +574,45 @@ def main() -> None:
                 world_state["tasks"].append(_spawn_task(world_state))
             last_task_spawn = now
 
-        # --- Leader ticks ---
+        # --- Leader ticks (dispatch async LLM calls) ---
         if now - last_leader_tick >= LEADER_TICK_INTERVAL:
-            leaders = [r for r in world_state["robots"] if r["role"] == LEADER]
-            for leader in leaders:
-                decision = leader_decide(leader, world_state, blackboard)
-
-                # Claim a task
-                claimed_id = decision.get("claim_task_id")
-                if claimed_id is not None:
-                    task = next(
-                        (t for t in world_state["tasks"]
-                         if t["id"] == claimed_id and t["status"] == "open"
-                         and t.get("assigned_to") is None),
-                        None,
-                    )
-                    if task:
-                        _assign_task_to_robot(leader, task, world_state)
-
-                # Post to blackboard
-                msg = decision.get("post_message", "")
-                if msg:
-                    from factorymind.state import CLAIM
-                    blackboard.post(leader["id"], CLAIM, msg)
-
-                idle_workers = [
-                    r for r in world_state["robots"]
-                    if r["role"] == WORKER and r.get("current_task") is None and not r.get("path")
-                ]
-                for worker in idle_workers:
-                    task_id = choose_worker_task(worker, world_state, blackboard)
-                    if task_id is None:
-                        continue
-                    task = next(
-                        (t for t in world_state["tasks"]
-                         if t["id"] == task_id and t["status"] == "open"),
-                        None,
-                    )
-                    if task:
-                        _assign_task_to_robot(worker, task, world_state)
-
+            for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
+                if leader["id"] in _pending_leader:
+                    continue  # previous decision still in flight; don't pile up
+                _pending_leader[leader["id"]] = _decision_executor.submit(
+                    leader_decide, leader, world_state, blackboard,
+                )
             last_leader_tick = now
 
-        # --- Strategist tick ---
-        if now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL:
+        # --- Worker ticks: each ball is its own LLM-driven agent ---
+        if now - last_worker_tick >= WORKER_TICK_INTERVAL:
+            if _ALL_AGENTS_LLM:
+                workers = [r for r in world_state["robots"] if r["role"] == WORKER]
+                for worker in workers:
+                    if worker["id"] in _pending_worker:
+                        continue
+                    if worker.get("current_task") is not None:
+                        continue  # busy executing a claim — let it finish
+                    _pending_worker[worker["id"]] = _decision_executor.submit(
+                        worker_decide, worker, world_state, blackboard,
+                    )
+            else:
+                _assign_idle_workers(world_state, blackboard)
+            last_worker_tick = now
+
+        # --- Strategist tick (one in flight at a time) ---
+        if (
+            now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
+            and _pending_strategist is None
+        ):
             state_description = M.describe_world_state(world_state)
             retrieved = M.retrieve_strategies(
                 world_state["layout"],
                 state_description=state_description,
             )
-            decision = strategist_decide(world_state, blackboard, retrieved)
-            directive = decision.get("directive", "").strip()
-            if decision.get("should_post") and directive and not _is_duplicate_directive(blackboard, directive):
-                from factorymind.state import BOTTLENECK, STRATEGY
-                msg_type = BOTTLENECK if "bottleneck" in directive.lower() else STRATEGY
-                blackboard.post(-1, msg_type, directive)
-                M.record_strategy(
-                    world_state["layout"],
-                    directive,
-                    _strategy_outcome_summary(
-                        world_state,
-                        str(decision.get("reasoning", "")),
-                    ),
-                )
+            _pending_strategist = _decision_executor.submit(
+                strategist_decide, world_state, blackboard, retrieved,
+            )
             last_strategist_tick = now
 
         # --- Movement tick ---
@@ -465,6 +644,8 @@ def main() -> None:
             running = False
         clock.tick(FPS)
 
+    _cancel_pending_decisions()
+    _decision_executor.shutdown(wait=False, cancel_futures=True)
     pygame.quit()
     sys.exit(0)
 
