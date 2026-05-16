@@ -39,7 +39,6 @@ from factorymind.agents import (
     leader_decide,
     strategist_decide,
     worker_decide,
-    worker_step,
 )
 from factorymind.state import (
     LEADER, WORKER, OPEN_FLOOR, BOTTLENECK_BRIDGE,
@@ -209,6 +208,77 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
         )
 
         robot["path"] = []
+
+
+def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> None:
+    """Move robots one step with simple agent reservations to avoid collisions.
+
+    Each robot proposes its next cell from its own path. If two robots want the
+    same cell, or two robots would swap cells head-on, one waits and posts a
+    brief blackboard message. This keeps path execution distributed while still
+    making coordination visible.
+    """
+    robots = world_state.get("robots", [])
+    current = {r["id"]: tuple(r["pos"]) for r in robots}
+    proposals = {
+        r["id"]: tuple(r["path"][0])
+        for r in robots
+        if r.get("path")
+    }
+    if not proposals:
+        return
+
+    denied: set[int] = set()
+
+    by_cell: dict[tuple[int, int], list[int]] = {}
+    for rid, cell in proposals.items():
+        by_cell.setdefault(cell, []).append(rid)
+    for cell, ids in by_cell.items():
+        if len(ids) <= 1:
+            continue
+        winner = min(ids)
+        denied.update(rid for rid in ids if rid != winner)
+
+    for rid, target in proposals.items():
+        if rid in denied:
+            continue
+        for other_id, other_target in proposals.items():
+            if other_id <= rid or other_id in denied:
+                continue
+            if target == current.get(other_id) and other_target == current.get(rid):
+                denied.add(max(rid, other_id))
+
+    moving_away = set(proposals.keys()) - denied
+    for rid, target in proposals.items():
+        if rid in denied:
+            continue
+        blocker = next(
+            (
+                other
+                for other in robots
+                if other["id"] != rid
+                and tuple(other["pos"]) == target
+                and other["id"] not in moving_away
+            ),
+            None,
+        )
+        if blocker is not None:
+            denied.add(rid)
+
+    now = time.time()
+    for robot in robots:
+        rid = robot["id"]
+        if rid in denied:
+            if now - robot.get("last_yield_post", 0.0) > 1.0:
+                blackboard.post(
+                    rid,
+                    "INTENT",
+                    f"R{rid} yielding one step to avoid a route conflict.",
+                )
+                robot["last_yield_post"] = now
+            continue
+        if rid in proposals:
+            _advance_robot(robot, world_state, blackboard)
 
 
 def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
@@ -474,6 +544,8 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     if _is_go_and_stop_command(text):
         return []
 
+    worker_count = max(1, sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER))
+    remaining = worker_count
     requests: list[tuple[dict, dict, int]] = []
     clauses = [
         clause.strip()
@@ -483,7 +555,14 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     for clause in clauses:
         parsed = _parse_user_task_request(clause, world_state)
         if parsed is not None:
-            requests.append(parsed)
+            pickup, delivery, count = parsed
+            if re.search(r"\b(rest|remaining|others)\b", clause, flags=re.IGNORECASE):
+                count = max(1, remaining)
+            elif re.search(r"\b(all|everyone|everybody)\b", clause, flags=re.IGNORECASE):
+                count = worker_count
+            count = max(1, min(count, worker_count))
+            remaining = max(0, remaining - count)
+            requests.append((pickup, delivery, count))
 
     if requests:
         return requests
@@ -1036,12 +1115,7 @@ def _precompute_timeline(duration: float) -> list[dict]:
         if now - last_move_tick >= MOVE_TICK_INTERVAL:
             move_steps = min(int((now - last_move_tick) // MOVE_TICK_INTERVAL), 4)
             for _ in range(max(1, move_steps)):
-                for robot in world_state["robots"]:
-                    if robot["role"] == WORKER:
-                        next_pos = worker_step(robot, world_state, blackboard)
-                        if robot.get("path") and next_pos != robot["path"][0]:
-                            robot["path"].insert(0, next_pos)
-                    _advance_robot(robot, world_state, blackboard)
+                _advance_robots_coordinated(world_state, blackboard)
             last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
 
         world_state["speed_multiplier"] = speed_multiplier
@@ -1402,12 +1476,7 @@ def main() -> None:
             if now - last_move_tick >= MOVE_TICK_INTERVAL:
                 move_steps = min(int((now - last_move_tick) // MOVE_TICK_INTERVAL), 4)
                 for _ in range(max(1, move_steps)):
-                    for robot in world_state["robots"]:
-                        if robot["role"] == WORKER:
-                            next_pos = worker_step(robot, world_state, blackboard)
-                            if robot.get("path") and next_pos != robot["path"][0]:
-                                robot["path"].insert(0, next_pos)
-                        _advance_robot(robot, world_state, blackboard)
+                    _advance_robots_coordinated(world_state, blackboard)
                 last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
 
             # --- Stats ---
