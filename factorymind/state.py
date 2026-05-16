@@ -45,16 +45,71 @@ _WORKSTATIONS_BASE = [
     {"name": "Shipping", "pos": [4,  45], "color": [220, 200, 50]},
 ]
 
-# 8 spawn slots arranged in a 4×2 block at grid centre (22–25, 23–24)
+STATION_QUOTA_NAMES: tuple[str, ...] = ("Parts", "Assembly", "QA", "Shipping")
+
+
+def empty_station_quotas() -> dict[str, dict[str, int]]:
+    """Per-station targets from chat ('5 tasks for Parts' counts toward Parts)."""
+    return {name: {"target": 0, "completed": 0} for name in STATION_QUOTA_NAMES}
+
+# Legacy centre cluster (fallback only).
 _SPAWN_POSITIONS: list[list[int]] = [
     [22, 23], [23, 23], [24, 23], [25, 23],
     [22, 24], [23, 24], [24, 24], [25, 24],
+]
+
+# Workers start spread across the floor (one robot per cell).
+_DISPERSED_WORKER_SPAWNS: list[list[int]] = [
+    [11, 11], [17, 9], [9, 17], [14, 14],
+    [37, 11], [41, 16], [34, 9], [39, 14],
+    [37, 39], [41, 35], [34, 42], [39, 37],
+    [11, 39], [16, 41], [9, 35], [14, 37],
+    [24, 12], [24, 36], [12, 24], [38, 24],
 ]
 
 # Leaders sit off the warehouse floor visually, acting like dispatch/control agents.
 _LEADER_POSITIONS: list[list[int]] = [
     [2, 24], [2, 26],
 ]
+
+
+def _blocked_cells(layout: str) -> set[tuple[int, int]]:
+    """Grid cells robots must not spawn on (walls + workstation footprints)."""
+    blocked: set[tuple[int, int]] = {tuple(c) for c in _make_wall(layout)}
+    for ws in _WORKSTATIONS_BASE:
+        wx, wy = ws["pos"]
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                x, y = wx + dx, wy + dy
+                if 0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT:
+                    blocked.add((x, y))
+    return blocked
+
+
+def _worker_spawn_positions(count: int, layout: str) -> list[list[int]]:
+    """Return ``count`` unique spawn cells spread around the factory floor."""
+    if count <= 0:
+        return []
+    blocked = _blocked_cells(layout)
+    spawns: list[list[int]] = []
+    for cell in _DISPERSED_WORKER_SPAWNS:
+        if tuple(cell) in blocked:
+            continue
+        spawns.append(list(cell))
+        if len(spawns) >= count:
+            return spawns
+    # Fill any remainder on a coarse grid scan (still dispersed).
+    for y in range(8, GRID_HEIGHT - 8, 4):
+        for x in range(8, GRID_WIDTH - 8, 4):
+            if (x, y) in blocked or [x, y] in spawns:
+                continue
+            spawns.append([x, y])
+            if len(spawns) >= count:
+                return spawns
+    # Last resort: legacy centre slots.
+    while len(spawns) < count:
+        spawns.append(list(_SPAWN_POSITIONS[len(spawns) % len(_SPAWN_POSITIONS)]))
+    return spawns[:count]
 
 
 def _make_workstations(layout: str) -> list[dict]:
@@ -81,8 +136,8 @@ def _make_wall(layout: str) -> list[list[int]]:
 
 def create_initial_state(
     layout: str,
-    num_leaders: int = 1,
-    num_workers: int = 4,
+    num_leaders: int | None = None,
+    num_workers: int | None = None,
 ) -> dict:
     """Create and return a fresh world_state dict for the given layout.
 
@@ -102,8 +157,16 @@ def create_initial_state(
         "tick":        0,
     }
     """
+    import os
+
+    if num_leaders is None:
+        num_leaders = int(os.getenv("NUM_LEADERS", "1"))
+    if num_workers is None:
+        num_workers = int(os.getenv("NUM_WORKERS", "12"))
+
     robots: list[dict] = []
     robot_id = 0
+    worker_spawns = _worker_spawn_positions(num_workers, layout)
 
     for _ in range(num_leaders):
         sp = _LEADER_POSITIONS[robot_id % len(_LEADER_POSITIONS)]
@@ -117,8 +180,8 @@ def create_initial_state(
         })
         robot_id += 1
 
-    for _ in range(num_workers):
-        sp = _SPAWN_POSITIONS[(robot_id - num_leaders) % len(_SPAWN_POSITIONS)]
+    for i in range(num_workers):
+        sp = worker_spawns[i % len(worker_spawns)]
         robots.append({
             "id": robot_id,
             "role": WORKER,
@@ -154,6 +217,8 @@ def create_initial_state(
         "connection_status": "online",
         # When True the leader is the OpenClaw-style autonomous fleet manager.
         "fleet_mode": False,
+        "spawn_positions": [list(r["spawn_pos"]) for r in robots],
+        "station_quotas": empty_station_quotas(),
         "tick": 0,
     }
 

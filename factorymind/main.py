@@ -44,6 +44,7 @@ from factorymind.agents import (
 from factorymind.state import (
     LEADER, WORKER, OPEN_FLOOR, BOTTLENECK_BRIDGE,
     GRID_WIDTH, GRID_HEIGHT,
+    STATION_QUOTA_NAMES, empty_station_quotas,
 )
 
 # ---------------------------------------------------------------------------
@@ -318,6 +319,10 @@ def _complete_task_delivery(
         f"task-{task['id']} {task.get('pickup_name','?')}→{task.get('delivery_name','?')} done",
         route_time=route_time,
     )
+    pickup_name = str(task.get("pickup_name", ""))
+    quotas = world_state.get("station_quotas") or {}
+    if pickup_name in quotas:
+        quotas[pickup_name]["completed"] = quotas[pickup_name].get("completed", 0) + 1
 
     robot["path"] = []
     pos = robot["pos"]
@@ -971,6 +976,96 @@ def _requested_task_count(text: str) -> int:
     return max(1, min(count, _FLEET_TASK_COUNT_LIMIT))
 
 
+def _count_from_token(token: str) -> int:
+    """Parse a numeric or word count from a regex capture group."""
+    token = (token or "").strip().lower()
+    if not token:
+        return 1
+    if token.isdigit():
+        return max(1, min(int(token), _FLEET_TASK_COUNT_LIMIT))
+    return max(1, min(_COUNT_WORDS.get(token, 1), _FLEET_TASK_COUNT_LIMIT))
+
+
+# Matches: "do 5 tasks for Parts", "5 for assembly", "2 deliveries from QA"
+_STATION_QUOTA_CLAUSE_RE = re.compile(
+    r"(?:\bdo\s+)?"
+    r"(?P<count>\d{1,4}|one|two|three|four|five|six|seven|eight)\s*"
+    r"(?:tasks?|deliveries?|jobs?|trips?|runs?)?\s*"
+    r"(?:for|at|from|on)\s+"
+    r"(?P<alias>parts?|part|assembly|assemble\w*|qa|quality|shipping|ship)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_station_quota_clause(
+    clause: str,
+    world_state: dict,
+) -> tuple[dict, dict, int] | None:
+    """Parse 'N tasks for Station' when delivery is the default downstream stop."""
+    if _is_go_and_stop_command(clause):
+        return None
+    match = _STATION_QUOTA_CLAUSE_RE.search(clause)
+    if not match:
+        return None
+    canonical = _station_aliases().get(match.group("alias").lower())
+    if not canonical:
+        return None
+    pickup = _station_by_name(canonical, world_state)
+    delivery = _default_downstream_station(canonical, world_state) if pickup else None
+    if not pickup or not delivery:
+        return None
+    count = _count_from_token(match.group("count"))
+    return pickup, delivery, count
+
+
+def _parse_station_quota_requests(
+    text: str,
+    world_state: dict,
+) -> list[tuple[dict, dict, int]]:
+    """Parse multi-station counts like '5 tasks for Parts and 2 for Assembly'."""
+    if _is_go_and_stop_command(text):
+        return []
+    requests: list[tuple[dict, dict, int]] = []
+    for match in _STATION_QUOTA_CLAUSE_RE.finditer(text):
+        clause = match.group(0)
+        parsed = _parse_station_quota_clause(clause, world_state)
+        if parsed:
+            requests.append(parsed)
+    return requests
+
+
+def _reset_station_quota_targets(world_state: dict) -> None:
+    """Clear user-requested per-station targets (completed counts are kept until reset)."""
+    world_state["station_quotas"] = empty_station_quotas()
+
+
+def _apply_station_quota_targets(
+    world_state: dict,
+    requests: list[tuple[dict, dict, int]],
+) -> None:
+    """Record how many pickups the user asked for at each station."""
+    quotas = world_state.setdefault("station_quotas", empty_station_quotas())
+    for pickup_ws, _delivery_ws, count in requests:
+        name = pickup_ws.get("name", "")
+        if name not in quotas:
+            continue
+        quotas[name]["target"] = quotas[name].get("target", 0) + count
+
+
+def _station_quota_in_flight(world_state: dict, station_name: str) -> int:
+    """Tasks still queued or active with this pickup station."""
+    total = 0
+    for task in world_state.get("task_queue", []) or []:
+        if task.get("pickup_name") == station_name and task.get("status") != "done":
+            total += 1
+    for task in world_state.get("tasks", []) or []:
+        if task.get("pickup_name") == station_name and task.get("status") in (
+            "open", "in_transit", "queued",
+        ):
+            total += 1
+    return total
+
+
 def _parse_user_task_request(text: str, world_state: dict) -> tuple[dict, dict, int] | None:
     """Parse commands like 'move Parts to Assembly' into a real task route."""
     if _is_go_and_stop_command(text):
@@ -1016,6 +1111,11 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     if _is_go_and_stop_command(text):
         return []
 
+    # Reliable local parse for "5 tasks for Parts and 2 for Assembly".
+    quota_requests = _parse_station_quota_requests(text, world_state)
+    if quota_requests:
+        return quota_requests
+
     if os.getenv("USE_LLM_TASK_INTERPRETER", "true").lower() == "true":
         interpreted = _interpret_user_task_requests(text, world_state)
         if interpreted:
@@ -1031,6 +1131,8 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     ]
     for clause in clauses:
         parsed = _parse_user_task_request(clause, world_state)
+        if parsed is None:
+            parsed = _parse_station_quota_clause(clause, world_state)
         if parsed is not None:
             pickup, delivery, count = parsed
             if re.search(r"\b(rest|remaining|others)\b", clause, flags=re.IGNORECASE):
@@ -1258,11 +1360,13 @@ def _apply_user_task_request(
     # user just said "do 100 deliveries"). A "+100" prefix can be wired up
     # later if additive enqueue is preferred.
     world_state["task_queue"] = []
+    _reset_station_quota_targets(world_state)
 
     routes: list[tuple[dict, dict]] = []
     route_summaries: list[str] = []
 
     if requests:
+        _apply_station_quota_targets(world_state, requests)
         for pickup_ws, delivery_ws, count in requests:
             routes.extend([(pickup_ws, delivery_ws)] * count)
             route_summaries.append(f"{count}x {pickup_ws['name']}->{delivery_ws['name']}")
@@ -1484,6 +1588,42 @@ def _reset_demo_state(layout: str, speed_multiplier: int, connection_status: str
     world_state["connection_status"] = connection_status
     world_state["manual_control"] = False
     return world_state
+
+
+def _seed_startup_fleet(world_state: dict, blackboard: Blackboard) -> int:
+    """Queue and dispatch initial delivery tasks so workers spread out immediately."""
+    if os.getenv("FACTORYMIND_AUTO_START", "true").lower() not in ("true", "1", "yes"):
+        return 0
+
+    num_workers = sum(
+        1 for r in world_state.get("robots", []) if r.get("role") == WORKER
+    )
+    if num_workers == 0:
+        return 0
+
+    default_tasks = max(num_workers * 2, 20)
+    task_count = int(os.getenv("FACTORYMIND_STARTUP_TASKS", str(default_tasks)))
+    routes = _generate_fleet_routes(world_state, task_count)
+    enqueued = _enqueue_fleet_tasks(world_state, blackboard, routes, source="startup")
+
+    # Assign one task per idle worker right away (repeat until queue or workers exhausted).
+    for _ in range(num_workers + 4):
+        if _fleet_dispatch_step(world_state, blackboard) == 0:
+            break
+
+    blackboard.post(
+        -1,
+        "STRATEGY",
+        f"Fleet live: {num_workers} workers dispersed, {enqueued} deliveries queued.",
+    )
+    return enqueued
+
+
+def _bootstrap_demo_run(world_state: dict, blackboard: Blackboard) -> None:
+    """Auto-start movement and fleet tasks when the demo loads or resets."""
+    global _sim_started
+    if _seed_startup_fleet(world_state, blackboard) > 0:
+        _sim_started = True
 
 
 def _cycle_speed(speed_multiplier: int) -> int:
@@ -2006,10 +2146,9 @@ def main() -> None:
     blackboard.post(
         -1,
         "STRATEGY",
-        "FactoryMind ready — type 'do 100 deliveries' for an autonomous fleet run, "
-        "or 'take Parts to QA' for a single task.",
+        "FactoryMind ready — workers auto-dispatch on load; chat can add more tasks.",
     )
-    _sim_started = False
+    _bootstrap_demo_run(world_state, blackboard)
     manual_control = False
 
     print("[main] initializing pygame display...", flush=True)
@@ -2101,13 +2240,7 @@ def main() -> None:
                 # Re-bind NemoClaw to the fresh world_state so policy stats
                 # accrue against the active simulation.
                 nemoclaw.activate(blackboard=blackboard, world_state=world_state)
-                blackboard.post(
-                    -1,
-                    "STRATEGY",
-                    "Simulation reset — type 'do 100 deliveries' for a fleet run "
-                    "or 'take Parts to QA' for a single task.",
-                )
-                _sim_started = False
+                _bootstrap_demo_run(world_state, blackboard)
                 manual_control = False
                 sim_elapsed = 0.0
                 last_leader_tick = -LEADER_TICK_INTERVAL

@@ -987,6 +987,29 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
             screen.blit(ss, (tx + tw // 2 - ss.get_width() // 2, y + 39))
     y += th + 7
 
+    # ── Per-station task quotas (done / target) ───────────────────────────
+    quotas = world_state.get("station_quotas") or {}
+    hdr = f_caps.render("STATION TASKS (done / target)", True, C_DIM)
+    screen.blit(hdr, (x0, y))
+    y += hdr.get_height() + 4
+    abbrev = {"Parts": "PRT", "Assembly": "ASM", "QA": "QA", "Shipping": "SHP"}
+    row_w = (W - PAD * 2 - 6) // 2
+    for i, name in enumerate(("Parts", "Assembly", "QA", "Shipping")):
+        q = quotas.get(name, {})
+        done = q.get("completed", 0)
+        target = q.get("target", 0)
+        label = abbrev.get(name, name[:3].upper())
+        val = f"{done}/{target}" if target > 0 else (str(done) if done else "0/0")
+        col = i % 2
+        row = i // 2
+        tx = x0 + col * (row_w + 6)
+        ty = y + row * 16
+        ls = f_small.render(f"{label}", True, C_DIM)
+        vs = f_small.render(val, True, C_ACCENT if target and done < target else C_TEXT)
+        screen.blit(ls, (tx, ty))
+        screen.blit(vs, (tx + 34, ty))
+    y += 36
+
     # ── Mode toggle: CURSOR | BUILDER ─────────────────────────────────────
     mbw = (W - PAD * 2 - 8) // 2
     _BTN_MODE_CURSOR  = pygame.Rect(x0,          y, mbw, 26)

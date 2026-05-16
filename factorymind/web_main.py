@@ -144,10 +144,9 @@ def run() -> None:
     blackboard.post(-1, "POLICY", f"OpenClaw runtime active: {engine.describe()}")
     blackboard.post(
         -1, "STRATEGY",
-        "FactoryMind 3D ready — type 'do 100 deliveries' for an autonomous fleet run, "
-        "or 'take Parts to QA' for a single task.",
+        "FactoryMind 3D ready — workers auto-dispatch on load; chat can add more tasks.",
     )
-    M._sim_started = False
+    M._bootstrap_demo_run(world_state, blackboard)
     manual_control = False
 
     url = web_server.serve_in_background(host=host, port=port)
@@ -223,12 +222,7 @@ def run() -> None:
                     )
                     blackboard.clear()
                     nemoclaw.activate(blackboard=blackboard, world_state=world_state)
-                    blackboard.post(
-                        -1, "STRATEGY",
-                        "Simulation reset — type 'do 100 deliveries' for a fleet run "
-                        "or 'take Parts to QA' for a single task.",
-                    )
-                    M._sim_started = False
+                    M._bootstrap_demo_run(world_state, blackboard)
                     manual_control = False
                     sim_elapsed = 0.0
                     timers["last_leader_tick"] = -M.LEADER_TICK_INTERVAL

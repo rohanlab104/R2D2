@@ -132,6 +132,9 @@ Rules:
 - If the user says "rest", use "rest".
 - If pickup is vague, infer the mentioned station, the station with highest backlog, or the upstream station implied by the request.
 - If delivery is vague, use this default flow: Parts -> Assembly -> QA -> Shipping.
+- Multi-station counts: "do 5 tasks for Parts and 2 for Assembly" means two task groups:
+  {{"count": 5, "pickup": "Parts", "delivery": "Assembly"}}, {{"count": 2, "pickup": "Assembly", "delivery": "QA"}}.
+- "N tasks for X" without a destination always uses pickup=X and delivery=the next station in the flow.
 - If the user asks to "clear out" Shipping or move finished goods, deliver Shipping -> Parts only when restocking or recycling is implied; otherwise use Shipping as the destination.
 - If the user asks to optimize, speed up, reduce traffic, rebalance, or make robots smarter, set intent "optimize" and include strategy/constraints. Add tasks only if a pickup/delivery can be inferred.
 - Use assumptions to record guesses you made from vague language.
