@@ -15,7 +15,6 @@ import heapq
 import importlib
 import copy
 import os
-import random
 import re
 import socket
 import sys
@@ -53,15 +52,13 @@ FPS = 60
 LEADER_TICK_INTERVAL = 1.5
 WORKER_TICK_INTERVAL = 2.5  # workers think slightly less often than leaders
 STRATEGIST_TICK_INTERVAL = 20.0
-TASK_SPAWN_INTERVAL = 1.2
 MOVE_TICK_INTERVAL = 0.05  # how often robots advance one step
-TARGET_ACTIVE_TASKS = 5
 SPEED_OPTIONS = (1, 2, 3, 4)
 
-# Set ALL_AGENTS_LLM=false to fall back to the rule-based worker dispatcher
-# (cheaper, no per-worker NIM traffic). Default is true so every ball is its
-# own LLM-driven agent.
-_ALL_AGENTS_LLM = os.getenv("ALL_AGENTS_LLM", "true").lower() == "true"
+# Set ALL_AGENTS_LLM=true if you want every worker to make its own model call.
+# Default is false: leaders/strategist use the LLM, while workers assist only
+# after a leader claim. This is faster and keeps the chain of command visible.
+_ALL_AGENTS_LLM = os.getenv("ALL_AGENTS_LLM", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Background inference workers
@@ -137,11 +134,16 @@ def a_star(start: list[int], goal: list[int], wall_set: set) -> list[list[int]]:
 
 _task_counter = 0
 
-def _spawn_task(world_state: dict) -> dict:
-    """Create a random pickup-to-delivery task between two different workstations."""
+
+def _create_task(
+    world_state: dict,
+    pickup_ws: dict,
+    delivery_ws: dict,
+    *,
+    source: str,
+) -> dict:
+    """Create a concrete pickup-to-delivery task from selected workstations."""
     global _task_counter
-    stations = world_state["workstations"]
-    pickup_ws, delivery_ws = random.sample(stations, 2)
     task = {
         "id": _task_counter,
         "status": "open",
@@ -150,6 +152,7 @@ def _spawn_task(world_state: dict) -> dict:
         "pickup_name": pickup_ws["name"],
         "delivery_name": delivery_ws["name"],
         "assigned_to": None,
+        "source": source,
     }
     _task_counter += 1
     return task
@@ -184,7 +187,7 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
         task["status"] = "in_transit"
         robot["path"] = a_star(pos, task["delivery"], wall_set)
 
-    # If at delivery — task done, return to spawn
+    # If at delivery — task done, then stop until the next user task.
     elif pos == task["delivery"] and task["status"] == "in_transit":
         route_time = round(time.time() - task.get("started_at", time.time()), 2)
         task["status"] = "done"
@@ -204,11 +207,7 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
             route_time=route_time,
         )
 
-        spawn = robot.get("spawn_pos")
-        if spawn and spawn != pos:
-            robot["path"] = a_star(pos, spawn, wall_set)
-        else:
-            robot["path"] = []
+        robot["path"] = []
 
 
 def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
@@ -249,10 +248,13 @@ def _station_aliases() -> dict[str, str]:
         "part": "Parts",
         "assembly": "Assembly",
         "assemble": "Assembly",
+        "assembled": "Assembly",
         "qa": "QA",
         "quality": "QA",
+        "check": "QA",
         "shipping": "Shipping",
         "ship": "Shipping",
+        "shipment": "Shipping",
     }
 
 
@@ -336,27 +338,9 @@ def _parse_user_task_request(text: str, world_state: dict) -> tuple[dict, dict, 
 
 def _create_user_task(world_state: dict, pickup_ws: dict, delivery_ws: dict) -> dict:
     """Create a high-priority task from a user command."""
-    global _task_counter
-    task = {
-        "id": _task_counter,
-        "status": "open",
-        "pickup": list(pickup_ws["pos"]),
-        "delivery": list(delivery_ws["pos"]),
-        "pickup_name": pickup_ws["name"],
-        "delivery_name": delivery_ws["name"],
-        "assigned_to": None,
-        "source": "user",
-        "priority": 100,
-    }
-    _task_counter += 1
+    task = _create_task(world_state, pickup_ws, delivery_ws, source="user")
+    task["priority"] = 100
     return task
-
-
-def _has_active_user_task(world_state: dict) -> bool:
-    return any(
-        t.get("source") == "user" and t.get("status") not in {"done", "cancelled"}
-        for t in world_state.get("tasks", [])
-    )
 
 
 def _apply_user_task_request(
@@ -468,10 +452,6 @@ def _apply_go_to_station_and_stop(
         flush=True,
     )
     return True
-
-def _active_task_count(world_state: dict) -> int:
-    """Return tasks still visible as work in the demo."""
-    return sum(1 for t in world_state["tasks"] if t.get("status") not in {"done", "cancelled"})
 
 
 def _reset_demo_state(layout: str, speed_multiplier: int, connection_status: str) -> dict:
@@ -778,7 +758,6 @@ def _precompute_timeline(duration: float) -> list[dict]:
     last_leader_tick = 0.0
     last_worker_tick = 0.0
     last_strategist_tick = 0.0
-    last_task_spawn = 0.0
     last_move_tick = 0.0
     next_snapshot = 0.0
     timeline: list[dict] = []
@@ -792,11 +771,6 @@ def _precompute_timeline(duration: float) -> list[dict]:
     while sim_elapsed <= duration:
         now = sim_elapsed
         _drain_completed_decisions(world_state, blackboard)
-
-        if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
-            if _active_task_count(world_state) < TARGET_ACTIVE_TASKS:
-                world_state["tasks"].append(_spawn_task(world_state))
-            last_task_spawn = now
 
         dispatched = False
         if now - last_leader_tick >= LEADER_TICK_INTERVAL:
@@ -944,12 +918,12 @@ def _print_startup_banner() -> None:
         print(f"  (could not describe inference endpoints: {exc})", flush=True)
     print(
         f"  AGENTS_USE_MOCK={os.getenv('AGENTS_USE_MOCK', 'false')}  "
-        f"ALL_AGENTS_LLM={os.getenv('ALL_AGENTS_LLM', 'true')}  "
+        f"ALL_AGENTS_LLM={os.getenv('ALL_AGENTS_LLM', 'false')}  "
         f"USE_LOCAL_NIM={os.getenv('USE_LOCAL_NIM', 'true')}  "
         f"GX10_IP={os.getenv('GX10_IP', 'localhost')}",
         flush=True,
     )
-    print("  thread pool: 12 workers (each ball has its own LLM future)", flush=True)
+    print("  thread pool: 12 workers (leaders/strategist use async LLM futures)", flush=True)
     print("=" * 72, flush=True)
 
 
@@ -1003,7 +977,11 @@ def main() -> None:
     max_runtime = float(os.getenv("FACTORYMIND_MAX_RUNTIME", "0") or 0)
     world_state = _reset_demo_state(layout, speed_multiplier, "online")
     blackboard = Blackboard()
-    blackboard.post(-1, "STRATEGY", "FactoryMind ready — type a command below to begin production.")
+    blackboard.post(
+        -1,
+        "STRATEGY",
+        "FactoryMind ready — type a delivery like 'take Parts to QA' to create leader-owned work.",
+    )
     _sim_started = False
     manual_control = False
 
@@ -1019,7 +997,6 @@ def main() -> None:
     last_leader_tick     = -LEADER_TICK_INTERVAL
     last_worker_tick     = -WORKER_TICK_INTERVAL
     last_strategist_tick = 0.0
-    last_task_spawn      = -TASK_SPAWN_INTERVAL
     last_move_tick       = -MOVE_TICK_INTERVAL
     last_heartbeat       = time.time()
     heartbeat_seconds    = float(os.getenv("FACTORYMIND_HEARTBEAT_SECONDS", "10"))
@@ -1094,14 +1071,17 @@ def main() -> None:
                 _cancel_pending_decisions()
                 world_state = _reset_demo_state(OPEN_FLOOR, speed_multiplier, world_state["connection_status"])
                 blackboard.clear()
-                blackboard.post(-1, "STRATEGY", "Simulation reset — type a command to begin production.")
+                blackboard.post(
+                    -1,
+                    "STRATEGY",
+                    "Simulation reset — type a delivery like 'take Parts to QA' to begin.",
+                )
                 _sim_started = False
                 manual_control = False
                 sim_elapsed = 0.0
                 last_leader_tick = -LEADER_TICK_INTERVAL
                 last_worker_tick = -WORKER_TICK_INTERVAL
                 last_strategist_tick = 0.0
-                last_task_spawn = -TASK_SPAWN_INTERVAL
                 last_move_tick = -MOVE_TICK_INTERVAL
 
             elif result == "speedup":
@@ -1140,7 +1120,8 @@ def main() -> None:
                         manual_control = False
                         last_leader_tick = now - LEADER_TICK_INTERVAL
                         last_worker_tick = now - WORKER_TICK_INTERVAL
-                        last_task_spawn = now
+                        last_strategist_tick = now
+                        continue
                     manual_control = False
                     # Trigger immediate strategist response to user command
                     if _pending_strategist is None:
@@ -1162,15 +1143,6 @@ def main() -> None:
         # --- Sim logic: only runs while started ---
         if _sim_started:
             if not manual_control:
-                # --- Spawn new tasks ---
-                if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
-                    if (
-                        not _has_active_user_task(world_state)
-                        and _active_task_count(world_state) < TARGET_ACTIVE_TASKS
-                    ):
-                        world_state["tasks"].append(_spawn_task(world_state))
-                    last_task_spawn = now
-
                 # --- Leader ticks (dispatch async LLM calls) ---
                 if now - last_leader_tick >= LEADER_TICK_INTERVAL:
                     for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:

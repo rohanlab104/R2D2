@@ -98,8 +98,9 @@ Factory context:
 - Recent blackboard: {recent_messages}
 
 Rules:
-- Choose at most one task. Prefer the unassigned task whose pickup is closest to you.
+- Choose at most one task, and only from tasks already assigned to a LEADER.
 - You may take over a leader-claimed task only if its leader is farther from the pickup than you (the candidate list includes "pickup_distance" for each).
+- Do not claim unassigned work. Leaders choose the work; workers only assist leader-owned tasks.
 - In BOTTLENECK_BRIDGE, avoid tasks whose route crosses y=25 if a recent BOTTLENECK or STRATEGY message says so.
 - If nothing is worth grabbing, set claim_task_id to null and stay put.
 - post_message must be short, specific, and reference the chosen task id, e.g. "W4 grabbing task 12 (Parts->QA), 4 cells to pickup."
@@ -266,7 +267,7 @@ def worker_decide(robot: dict, world_state: dict, blackboard: Blackboard) -> dic
 
     from factorymind import inference
 
-    candidate_tasks = _candidate_tasks(world_state, include_assigned=True)
+    candidate_tasks = _leader_claimed_tasks(world_state)
     recent = blackboard.read_recent(6)
     prompt = WORKER_PROMPT_TEMPLATE.format(
         robot_id=robot["id"],
@@ -303,14 +304,14 @@ def worker_step(worker_robot: dict, world_state: dict, blackboard: Blackboard) -
 def choose_worker_task(worker_robot: dict, world_state: dict, blackboard: Blackboard) -> Optional[int]:
     """Choose an open task for an idle worker using blackboard-aware heuristics.
 
-    Workers prefer the nearest unassigned pickup. If a leader has claimed a task
-    but this worker is closer to pickup, the worker may assist by taking it over.
-    Recent bottleneck messages penalize cross-bridge traffic.
+    Workers only assist leader-claimed tasks. If this worker is closer to pickup
+    than the leader who claimed it, the worker may take over the route. Recent
+    bottleneck messages penalize cross-bridge traffic.
     """
     if worker_robot.get("current_task") is not None or worker_robot.get("path"):
         return None
 
-    tasks = _candidate_tasks(world_state, include_assigned=True)
+    tasks = _leader_claimed_tasks(world_state)
     if not tasks:
         return None
 
@@ -324,12 +325,11 @@ def choose_worker_task(worker_robot: dict, world_state: dict, blackboard: Blackb
         assigned_to = task.get("assigned_to")
         worker_dist = _manhattan(worker_robot["pos"], task["pickup"])
 
-        if assigned_to is not None:
-            leader = leaders.get(assigned_to)
-            if not leader:
-                continue
-            if worker_dist >= _manhattan(leader["pos"], task["pickup"]):
-                continue
+        leader = leaders.get(assigned_to)
+        if not leader:
+            continue
+        if worker_dist >= _manhattan(leader["pos"], task["pickup"]):
+            continue
 
         score = worker_dist
         if task["id"] in claimed_ids:
@@ -450,6 +450,19 @@ def _candidate_tasks(world_state: dict, include_assigned: bool = False) -> list[
     return tasks
 
 
+def _leader_claimed_tasks(world_state: dict) -> list[dict]:
+    """Return open tasks currently owned by a leader, for worker assist logic."""
+    leader_ids = {
+        r.get("id")
+        for r in world_state.get("robots", [])
+        if r.get("role") == LEADER
+    }
+    return [
+        task for task in world_state.get("tasks", [])
+        if task.get("status") == "open" and task.get("assigned_to") in leader_ids
+    ]
+
+
 def _manhattan(a: list[int], b: list[int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
@@ -557,7 +570,7 @@ def _normalize_strategist_decision(parsed: dict) -> dict:
 
 def _normalize_worker_decision(parsed: dict, robot: dict, world_state: dict) -> dict:
     """Validate worker LLM output against the live task list."""
-    candidates = _candidate_tasks(world_state, include_assigned=True)
+    candidates = _leader_claimed_tasks(world_state)
     candidate_ids = {t["id"] for t in candidates}
     claim_id = parsed.get("claim_task_id")
     if claim_id not in candidate_ids:
