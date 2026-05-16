@@ -69,6 +69,8 @@ C_MSG: dict[str, tuple[int, int, int]] = {
     "ERROR":      (255, 200, 0),     # yellow
     "RETRY":      (255, 140, 0),     # orange
     "USER":       (255, 255, 255),   # white
+    # NemoClaw / OpenClaw policy events.
+    "POLICY":     (0,   255, 200),   # mint — visible against dark UI
 }
 C_MSG_DEFAULT = (140, 140, 160)
 
@@ -209,9 +211,14 @@ def render(screen: "pygame.Surface", world_state: dict) -> None:
     screen.fill(C_BG)
     wall_set = {tuple(c) for c in world_state.get("wall", [])}
 
+    draw_factory_apron(screen)                       # margin scenery (under everything)
     draw_grid(screen)
+    draw_factory_floor_extras(screen)                # aisles + extra designated zones (visual)
+    draw_factory_interior_structures(screen, wall_set)  # buildings / machinery under walls
+    draw_designated_zones(screen, world_state)       # colored floor patches per WS
+    draw_charging_area(screen, world_state)          # central dispatch / charging zone
     draw_walls(screen, wall_set)
-    draw_builder_overlay(screen, world_state)   # preview sits above walls, below robots
+    draw_builder_overlay(screen, world_state)        # preview sits above walls, below robots
     draw_spawn_points(screen, world_state)
     draw_workstations(screen, world_state.get("workstations", []))
     draw_robots(screen, world_state.get("robots", []))
@@ -358,6 +365,377 @@ def _send_chat() -> Optional[dict]:
     if text:
         return {"type": "user_prompt", "text": text}
     return None
+
+
+# ---------------------------------------------------------------------------
+# Factory environment — apron, zones, charging area, and decorative props
+# ---------------------------------------------------------------------------
+
+# Cached random props so they don't jitter every frame.
+_DECOR_CACHE: list[tuple] = []
+
+
+def _grid_bounds() -> tuple[int, int, int, int]:
+    """Return (left, top, right, bottom) pixel bounds of the playable grid."""
+    from factorymind.state import GRID_WIDTH, GRID_HEIGHT
+    return (
+        GRID_OFFSET_X,
+        GRID_OFFSET_Y,
+        GRID_OFFSET_X + GRID_WIDTH * CELL_SIZE,
+        GRID_OFFSET_Y + GRID_HEIGHT * CELL_SIZE,
+    )
+
+
+def _build_decor() -> list[tuple]:
+    """Generate a fixed set of decorative props in the margins around the grid.
+
+    Each entry is ``(kind, cx, cy, rot_deg)`` and is drawn purely for atmosphere.
+    Props live OUTSIDE the playable area so they never affect pathfinding.
+    """
+    import random
+    rng = random.Random(1337)
+    left, top, right, bottom = _grid_bounds()
+
+    # Margin strips between the grid and the side panel / window edges.
+    strip_left   = (4, top, left - 8, bottom)            # left of grid
+    strip_right  = (right + 4, top, PANEL_X - 4, bottom) # right of grid (before panel)
+    strip_top    = (left, 4, right, top - 8)             # above grid
+    strip_bottom = (left, bottom + 4, right, WINDOW_H - 4)
+
+    props: list[tuple] = []
+
+    def scatter(strip, count):
+        x0, y0, x1, y1 = strip
+        if x1 - x0 < 14 or y1 - y0 < 14:
+            return
+        for _ in range(count):
+            cx = rng.randint(x0 + 6, x1 - 6)
+            cy = rng.randint(y0 + 6, y1 - 6)
+            r  = rng.random()
+            kind = "pallet" if r < 0.45 else "drum" if r < 0.8 else "cone"
+            props.append((kind, cx, cy, rng.randint(0, 359)))
+
+    scatter(strip_left,   8)
+    scatter(strip_right,  6)
+    scatter(strip_top,    7)
+    scatter(strip_bottom, 9)
+
+    # A pair of "trucks" parked at top-right and bottom-left corners.
+    if right + 38 < PANEL_X:
+        props.append(("truck", right + 24, bottom - 38, 0))
+    if left - 32 > 8:
+        props.append(("truck", left - 24, top + 32, 180))
+
+    return props
+
+
+def _draw_pallet(screen: "pygame.Surface", cx: int, cy: int) -> None:
+    """Tiny stacked-crate pallet sprite (~12x10 px)."""
+    # Wood pallet base
+    pygame.draw.rect(screen, (77, 47, 21),  pygame.Rect(cx - 7, cy + 3, 14, 3))
+    pygame.draw.rect(screen, (50, 30, 14),  pygame.Rect(cx - 7, cy + 3, 14, 3), 1)
+    # Stacked crates
+    pygame.draw.rect(screen, (107, 70, 38), pygame.Rect(cx - 6, cy - 1, 6, 4))
+    pygame.draw.rect(screen, (50, 30, 14),  pygame.Rect(cx - 6, cy - 1, 6, 4), 1)
+    pygame.draw.rect(screen, (140, 50, 50), pygame.Rect(cx,     cy - 1, 6, 4))
+    pygame.draw.rect(screen, (60, 18, 18),  pygame.Rect(cx,     cy - 1, 6, 4), 1)
+    # Top crate
+    pygame.draw.rect(screen, (107, 70, 38), pygame.Rect(cx - 4, cy - 5, 8, 4))
+    pygame.draw.rect(screen, (50, 30, 14),  pygame.Rect(cx - 4, cy - 5, 8, 4), 1)
+
+
+def _draw_drum(screen: "pygame.Surface", cx: int, cy: int) -> None:
+    """Small green oil drum sprite."""
+    pygame.draw.ellipse(screen, (15, 60, 15),  pygame.Rect(cx - 4, cy - 5, 8, 10))
+    pygame.draw.ellipse(screen, (40, 110, 40), pygame.Rect(cx - 4, cy - 5, 8, 10), 1)
+    pygame.draw.line(screen, (8, 35, 8), (cx - 4, cy), (cx + 3, cy), 1)
+    pygame.draw.ellipse(screen, (10, 40, 10), pygame.Rect(cx - 4, cy - 5, 8, 3))
+
+
+def _draw_cone(screen: "pygame.Surface", cx: int, cy: int) -> None:
+    """Hazard cone sprite."""
+    pygame.draw.polygon(screen, (255, 120, 24),
+                        [(cx, cy - 6), (cx + 4, cy + 3), (cx - 4, cy + 3)])
+    pygame.draw.polygon(screen, (180, 70, 10),
+                        [(cx, cy - 6), (cx + 4, cy + 3), (cx - 4, cy + 3)], 1)
+    pygame.draw.rect(screen, (255, 255, 255), pygame.Rect(cx - 3, cy - 1, 6, 1))
+    pygame.draw.rect(screen, (50, 50, 60),    pygame.Rect(cx - 5, cy + 3, 10, 2))
+
+
+def _draw_truck(screen: "pygame.Surface", cx: int, cy: int, flipped: bool) -> None:
+    """Boxy delivery truck sprite (~46x18 px)."""
+    body_color = (200, 175, 60)
+    cab_color  = (160, 130, 35)
+    if flipped:
+        # Trailer on the right, cab on the left (top-left corner truck).
+        pygame.draw.rect(screen, body_color, pygame.Rect(cx - 4,  cy - 6, 30, 14))
+        pygame.draw.rect(screen, (60, 40, 10), pygame.Rect(cx - 4, cy - 6, 30, 14), 1)
+        pygame.draw.rect(screen, cab_color,  pygame.Rect(cx - 18, cy - 5, 14, 13))
+        pygame.draw.rect(screen, (60, 40, 10), pygame.Rect(cx - 18, cy - 5, 14, 13), 1)
+        # Windshield
+        pygame.draw.rect(screen, (140, 200, 240), pygame.Rect(cx - 16, cy - 3, 4, 6))
+        # Wheels
+        for wx in (cx - 14, cx - 6, cx + 4, cx + 18):
+            pygame.draw.circle(screen, (15, 15, 20), (wx, cy + 8), 3)
+    else:
+        # Trailer on the left, cab on the right (bottom-right corner truck).
+        pygame.draw.rect(screen, body_color, pygame.Rect(cx - 26, cy - 6, 30, 14))
+        pygame.draw.rect(screen, (60, 40, 10), pygame.Rect(cx - 26, cy - 6, 30, 14), 1)
+        pygame.draw.rect(screen, cab_color,  pygame.Rect(cx + 4,  cy - 5, 14, 13))
+        pygame.draw.rect(screen, (60, 40, 10), pygame.Rect(cx + 4, cy - 5, 14, 13), 1)
+        pygame.draw.rect(screen, (140, 200, 240), pygame.Rect(cx + 12, cy - 3, 4, 6))
+        for wx in (cx - 18, cx - 8, cx + 6, cx + 16):
+            pygame.draw.circle(screen, (15, 15, 20), (wx, cy + 8), 3)
+
+
+def draw_factory_apron(screen: "pygame.Surface") -> None:
+    """Background scenery in the margins around the grid + decorative props."""
+    global _DECOR_CACHE
+    left, top, right, bottom = _grid_bounds()
+
+    # Concrete apron bands surrounding the grid.
+    apron_color = (16, 16, 28)
+    pygame.draw.rect(screen, apron_color, pygame.Rect(0, 0, WINDOW_W - (WINDOW_W - PANEL_X), top))
+    pygame.draw.rect(screen, apron_color, pygame.Rect(0, bottom, PANEL_X, WINDOW_H - bottom))
+    pygame.draw.rect(screen, apron_color, pygame.Rect(0, top, left, bottom - top))
+    pygame.draw.rect(screen, apron_color, pygame.Rect(right, top, PANEL_X - right, bottom - top))
+
+    # Painted shop-floor border highlight along the grid edge.
+    pygame.draw.rect(screen, (28, 28, 50),
+                     pygame.Rect(left - 2, top - 2, right - left + 4, bottom - top + 4), 2)
+
+    # Hazard chevrons in each corner of the playable floor.
+    chev_y = (255, 200, 40)
+    for (x0, y0, dx, dy) in [
+        (left - 1, top - 1,  1,  1),
+        (right - 8, top - 1, -1, 1),
+        (left - 1, bottom - 8, 1, -1),
+        (right - 8, bottom - 8, -1, -1),
+    ]:
+        for i in range(0, 9, 3):
+            pygame.draw.line(screen, chev_y,
+                             (x0 + i * dx, y0), (x0, y0 + i * dy), 1)
+
+    # Corner pillars (between the apron and the wall corners).
+    for (cx, cy) in [
+        (left - 14, top - 14), (right + 14, top - 14),
+        (left - 14, bottom + 14), (right + 14, bottom + 14),
+    ]:
+        if 4 <= cx <= PANEL_X - 4 and 4 <= cy <= WINDOW_H - 4:
+            pygame.draw.rect(screen, (42, 42, 68),
+                             pygame.Rect(cx - 7, cy - 7, 14, 14))
+            pygame.draw.rect(screen, (90, 90, 130),
+                             pygame.Rect(cx - 7, cy - 7, 14, 14), 1)
+            # Hazard cap
+            pygame.draw.rect(screen, (255, 176, 0),
+                             pygame.Rect(cx - 8, cy - 8, 16, 3))
+
+    # Cached decorative props.
+    if not _DECOR_CACHE:
+        _DECOR_CACHE = _build_decor()
+    for kind, cx, cy, rot in _DECOR_CACHE:
+        if kind == "pallet":
+            _draw_pallet(screen, cx, cy)
+        elif kind == "drum":
+            _draw_drum(screen, cx, cy)
+        elif kind == "cone":
+            _draw_cone(screen, cx, cy)
+        elif kind == "truck":
+            _draw_truck(screen, cx, cy, flipped=(rot == 180))
+
+
+def draw_designated_zones(screen: "pygame.Surface", world_state: dict) -> None:
+    """Translucent colored floor patches + hazard chevron borders per workstation."""
+    from factorymind.state import GRID_WIDTH, GRID_HEIGHT
+    zone_half = 4   # 8x8 cell zone
+    for ws in world_state.get("workstations", []):
+        x, y  = ws["pos"]
+        color = tuple(ws["color"])
+        cx_g  = max(zone_half, min(GRID_WIDTH  - zone_half, x))
+        cy_g  = max(zone_half, min(GRID_HEIGHT - zone_half, y))
+        px = GRID_OFFSET_X + (cx_g - zone_half) * CELL_SIZE
+        py = GRID_OFFSET_Y + (cy_g - zone_half) * CELL_SIZE
+        size = zone_half * 2 * CELL_SIZE
+
+        # Zone tint
+        s = pygame.Surface((size, size), pygame.SRCALPHA)
+        s.fill((*color, 36))
+        screen.blit(s, (px, py))
+
+        # Hazard chevron border
+        border = pygame.Surface((size, size), pygame.SRCALPHA)
+        chev = (255, 214, 51, 130)
+        pygame.draw.rect(border, chev, pygame.Rect(0, 0, size, 4))
+        pygame.draw.rect(border, chev, pygame.Rect(0, size - 4, size, 4))
+        pygame.draw.rect(border, chev, pygame.Rect(0, 0, 4, size))
+        pygame.draw.rect(border, chev, pygame.Rect(size - 4, 0, 4, size))
+        screen.blit(border, (px, py))
+
+        # Zone name painted on the floor
+        font = pygame.font.SysFont("monospace", 11, bold=True)
+        lbl  = font.render(ws["name"].upper() + " AREA", True, color)
+        screen.blit(lbl, (px + 6, py + 6))
+
+
+def _cell_block_rect(gx0: int, gy0: int, gx1: int, gy1: int) -> "pygame.Rect":
+    """Pixel rectangle covering grid cells [gx0,gx1) × [gy0,gy1)."""
+    return pygame.Rect(
+        GRID_OFFSET_X + gx0 * CELL_SIZE,
+        GRID_OFFSET_Y + gy0 * CELL_SIZE,
+        (gx1 - gx0) * CELL_SIZE,
+        (gy1 - gy0) * CELL_SIZE,
+    )
+
+
+def draw_factory_floor_extras(screen: "pygame.Surface") -> None:
+    """Painted shop-floor lanes and extra designated areas (no pathfinding impact)."""
+    from factorymind.state import GRID_WIDTH, GRID_HEIGHT
+    left, top, right, bottom = _grid_bounds()
+
+    # ── Main forklift aisles (center cross) ───────────────────────────────
+    axle = (218, 186, 52)
+    vx = GRID_OFFSET_X + (GRID_WIDTH // 2) * CELL_SIZE + CELL_SIZE // 2
+    pygame.draw.line(screen, axle, (vx, top), (vx, bottom), 2)
+    hy = GRID_OFFSET_Y + (GRID_HEIGHT // 2) * CELL_SIZE + CELL_SIZE // 2
+    pygame.draw.line(screen, axle, (left, hy), (right, hy), 2)
+    # Dashed lane spine (alternating dark gaps on the vertical)
+    for y in range(top + 4, bottom - 2, 12):
+        pygame.draw.line(screen, (90, 78, 28), (vx - 1, y), (vx - 1, y + 5), 1)
+    for x in range(left + 4, right - 2, 12):
+        pygame.draw.line(screen, (90, 78, 28), (x, hy - 1), (x + 5, hy - 1), 1)
+
+    # ── Additional designated floor areas ─────────────────────────────────
+    zones = [
+        ("STAGING / WIP",     (215, 175, 70),  (255, 200, 75), 29, 29, 41, 41),
+        ("BUFFER LANE",       (68,  92, 130), (180, 210, 255), 18, 32, 27, 41),
+        ("TOOL CRIB",         (72, 110, 82),  (140, 220, 150),  8, 18, 16, 27),
+    ]
+    font = pygame.font.SysFont("monospace", 10, bold=True)
+    for name, fill_rgb, border_rgb, gx0, gy0, gx1, gy1 in zones:
+        r = _cell_block_rect(gx0, gy0, gx1, gy1)
+        s = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
+        s.fill((*fill_rgb, 28))
+        screen.blit(s, r.topleft)
+        pygame.draw.rect(screen, border_rgb, r, 2)
+        # Hatch hint on two edges
+        for i in range(0, r.w, 10):
+            pygame.draw.line(screen, _dim(border_rgb, 120),
+                             (r.x + i, r.y), (r.x + i + 6, r.y + 6), 1)
+        lbl = font.render(name, True, border_rgb)
+        screen.blit(lbl, (r.x + 6, r.y + 5))
+
+
+def _draw_conveyor_belt(screen: "pygame.Surface", gx0: int, gy: int, gx1: int) -> None:
+    """Low-profile conveyor strip along a row of cells."""
+    r = _cell_block_rect(gx0, gy, gx1, gy + 1)
+    pygame.draw.rect(screen, (35, 35, 52), r.inflate(0, -6))
+    pygame.draw.rect(screen, (70, 72, 98), r.inflate(0, -6), 1)
+    for x in range(r.x + 2, r.right - 2, 7):
+        pygame.draw.line(screen, (110, 112, 140), (x, r.y + 4), (x + 4, r.y + 8), 1)
+
+
+def _draw_machine_cell(screen: "pygame.Surface", gx: int, gy: int,
+                       base: tuple[int, int, int],
+                       accent: tuple[int, int, int]) -> None:
+    """Small CNC / compressor footprint (2×2 cells)."""
+    r = _cell_block_rect(gx, gy, gx + 2, gy + 2).inflate(-4, -4)
+    pygame.draw.rect(screen, base, r, border_radius=3)
+    pygame.draw.rect(screen, accent, r, 2, border_radius=3)
+    cx, cy = r.centerx, r.centery
+    pygame.draw.circle(screen, accent, (cx, cy), 5)
+    pygame.draw.rect(screen, _dim(base, 200), (r.x + 4, r.y + 3, r.w - 8, 4))
+
+
+def draw_factory_interior_structures(
+    screen: "pygame.Surface",
+    wall_set: set[tuple[int, int]],
+) -> None:
+    """Warehouse modules, racks, and floor obstacles — visual only; not in ``wall``."""
+    # Low office / subassembly bays (footprints sit behind workstation art).
+    modules = [
+        (18, 8,  26, 16, (34, 38, 58)),
+        (31, 17, 41, 25, (38, 34, 56)),
+        (9,  33, 18, 42, (30, 36, 54)),
+    ]
+    for gx0, gy0, gx1, gy1, fill in modules:
+        r = _cell_block_rect(gx0, gy0, gx1, gy1)
+        pygame.draw.rect(screen, fill, r)
+        hi = tuple(min(255, c + 45) for c in fill)
+        pygame.draw.line(screen, hi, (r.x + 3, r.y + 5), (r.right - 4, r.y + 5), 2)
+        pygame.draw.rect(screen, _dim(hi, 160), r, 2)
+        # Roof louvre lines
+        for yy in range(r.y + 12, r.bottom - 6, 9):
+            pygame.draw.line(screen, _dim(fill, 90), (r.x + 4, yy), (r.right - 5, yy), 1)
+
+    # Tall rack silhouette along two north–south aisles (thin columns).
+    rack_xs = [11, 37]
+    for gx in rack_xs:
+        for gz in range(6, 44, 3):
+            if (gx, gz) in wall_set:
+                continue
+            px = GRID_OFFSET_X + gx * CELL_SIZE + CELL_SIZE // 2
+            py_top = GRID_OFFSET_Y + gz * CELL_SIZE + 2
+            pygame.draw.line(screen, (48, 50, 72), (px, py_top),
+                             (px, py_top + CELL_SIZE - 6), 3)
+            pygame.draw.line(screen, (85, 88, 115), (px - 4, py_top + 3),
+                             (px + 4, py_top + 3), 1)
+
+    _draw_conveyor_belt(screen, 20, 14, 29)
+    _draw_machine_cell(screen, 33, 9, (40, 42, 62), (0, 212, 255))
+    _draw_machine_cell(screen, 14, 37, (48, 44, 58), (255, 140, 60))
+
+    # Floor hazard islands (tape + barrel clusters)
+    for (cx, cy) in [(24, 22), (40, 32)]:
+        cell = pygame.Rect(
+            GRID_OFFSET_X + cx * CELL_SIZE + 3,
+            GRID_OFFSET_Y + cy * CELL_SIZE + 3,
+            CELL_SIZE - 6, CELL_SIZE - 6,
+        )
+        pygame.draw.rect(screen, (55, 45, 22), cell, border_radius=2)
+        pygame.draw.rect(screen, (210, 170, 40), cell, 1, border_radius=2)
+        _draw_drum(screen, cell.centerx, cell.centery - 2)
+
+
+def draw_charging_area(screen: "pygame.Surface", world_state: dict) -> None:
+    """Cyan dispatch/charging zone + dock pixels at each spawn cell."""
+    spawns = world_state.get("spawn_positions", [])
+    if not spawns:
+        return
+    xs = [s[0] for s in spawns]
+    ys = [s[1] for s in spawns]
+    pad_x, pad_y = 3, 3
+    minx, maxx = min(xs) - pad_x, max(xs) + pad_x + 1
+    miny, maxy = min(ys) - pad_y, max(ys) + pad_y + 1
+    px = GRID_OFFSET_X + minx * CELL_SIZE
+    py = GRID_OFFSET_Y + miny * CELL_SIZE
+    w  = (maxx - minx) * CELL_SIZE
+    h  = (maxy - miny) * CELL_SIZE
+
+    # Soft cyan zone fill
+    s = pygame.Surface((w, h), pygame.SRCALPHA)
+    s.fill((0, 212, 255, 55))
+    screen.blit(s, (px, py))
+
+    # Dashed cyan border for the dispatch perimeter
+    dash = (0, 212, 255)
+    for off in range(0, w, 8):
+        pygame.draw.rect(screen, dash, pygame.Rect(px + off, py, 4, 2))
+        pygame.draw.rect(screen, dash, pygame.Rect(px + off, py + h - 2, 4, 2))
+    for off in range(0, h, 8):
+        pygame.draw.rect(screen, dash, pygame.Rect(px, py + off, 2, 4))
+        pygame.draw.rect(screen, dash, pygame.Rect(px + w - 2, py + off, 2, 4))
+
+    # Floor label
+    font = pygame.font.SysFont("monospace", 10, bold=True)
+    lbl  = font.render("CHARGING / DISPATCH", True, (180, 240, 255))
+    screen.blit(lbl, (px + 4, py + 3))
+
+    # Charging dock blips at each spawn cell.
+    for sx, sy in spawns:
+        dx = GRID_OFFSET_X + sx * CELL_SIZE + 2
+        dy = GRID_OFFSET_Y + sy * CELL_SIZE + CELL_SIZE - 5
+        pygame.draw.rect(screen, (10, 50, 75),  pygame.Rect(dx, dy, 4, 4))
+        pygame.draw.rect(screen, (0, 212, 255), pygame.Rect(dx, dy, 4, 1))
 
 
 # ---------------------------------------------------------------------------

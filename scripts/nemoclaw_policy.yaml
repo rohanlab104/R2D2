@@ -46,6 +46,46 @@ process:
     - "curl"
     - "wget"
 
+# Agents: names + permitted actions. The leader is the autonomous OpenClaw
+# fleet manager — every dispatch it makes is gated by this engine.
+agents:
+  leader:
+    role: "autonomous_fleet_manager"
+    autonomous: true
+    actions:
+      allow:
+        - "delegate_task"        # assign a queued task to an idle worker
+        - "fleet_dispatch_tick"  # one tick of the autonomous loop
+        - "post_strategy"        # write to the blackboard
+      deny:
+        - "exec_shell"
+        - "modify_walls"
+  worker:
+    role: "task_executor"
+    autonomous: false
+    actions:
+      allow:
+        - "execute_task"
+        - "move"
+        - "post_intent"
+      deny:
+        - "delegate_task"
+        - "exec_shell"
+  strategist:
+    role: "advisor"
+    autonomous: false
+    actions:
+      allow:
+        - "post_strategy"
+        - "raise_bottleneck"
+      deny:
+        - "delegate_task"
+        - "exec_shell"
+
+# Default mode: log everything but do not refuse calls. Flip
+# NEMOCLAW_ENFORCE=true (or set enforce: true here) to refuse denied actions.
+enforce: false
+
 # Logging: capture every policy decision for the demo
 logging:
   path: "./logs/nemoclaw.log"

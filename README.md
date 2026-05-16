@@ -47,7 +47,42 @@ Same simulation as `factorymind.main`, rendered in 3D in a browser instead of py
 # then open http://<gx10-ip>:8080  (or http://localhost:8080 on the GX10 itself)
 ```
 
-`scripts/run_web.sh` runs `python -m factorymind.web_main`, which serves a static Three.js page on port 8080 and a JSON snapshot of `world_state` at `/state.json`. The browser polls 10 Hz and posts chat prompts / button clicks back to `/action`. No new Python deps — the HTTP bridge is stdlib `http.server`.
+`scripts/run_web.sh` runs `python -m factorymind.web_main`, which serves a static Three.js page on port 8080 and a JSON snapshot of `world_state` at `/state.json`. The browser polls 10 Hz and posts chat prompts / button clicks back to `/action`.
+
+### Autonomous fleet (OpenClaw leader)
+
+Type any of these into chat and the leader becomes an autonomous fleet manager that delegates one task at a time to the closest free worker:
+
+```text
+do 100 deliveries
+queue 50 tasks
+take Parts to QA 25 times
+move 80 Parts to Shipping
+```
+
+How it works:
+
+1. The chat parser fills `world_state["task_queue"]` with the requested number of routes (random Parts→Assembly→QA→Shipping cycle if no stations were named).
+2. Every loop iteration, `_fleet_dispatch_step` in `factorymind/main.py` picks the **closest idle worker** for the next queued task and assigns it. Workers stream out one-by-one as they finish.
+3. The leader stays parked at its dispatch position — it does **not** carry tasks itself in fleet mode. It is the brain; workers are the body.
+4. Each delegation is gated by **NemoClaw** (see below). The HUD shows the live queue size, the running allow/deny counter, and every dispatch as a `POLICY` line in the agent log.
+
+### NemoClaw / OpenClaw policy runtime
+
+`factorymind/nemoclaw.py` is the in-process policy engine that gates every autonomous decision the leader makes (and every outbound LLM call). The policy lives in `scripts/nemoclaw_policy.yaml`:
+
+* **`network`** — only `127.0.0.1:8000` and `127.0.0.1:8001` (the local NIM endpoints) are allowed; everything else, including `build.nvidia.com`, is on the deny list. Calls are routed through `inference.py`'s `_nemoclaw_gate`, so flipping `NEMOCLAW_ENFORCE=true` makes the simulation fall back to mock agents if the only reachable endpoint is the cloud.
+* **`agents`** — names each role (`leader`, `worker`, `strategist`) and the actions it may take. The leader is marked `autonomous: true` with `delegate_task` and `fleet_dispatch_tick` in its allow list; `exec_shell` and `modify_walls` are explicitly denied. Every fleet dispatch calls `engine.check_action("leader", "delegate_task", ...)`, so denials show up live in the agent log.
+* **`logging`** — every allow/deny is appended to `logs/nemoclaw.log` with timestamp, actor, action, target, and reason.
+
+Modes:
+
+```bash
+NEMOCLAW_ENFORCE=false   # default — log every decision but never refuse
+NEMOCLAW_ENFORCE=true    # refuse denied actions; simulation falls back to mock
+```
+
+The `scripts/run_with_nemoclaw.sh` wrapper is still there for **outer** sandboxing — if a real `nemoclaw` binary or `firejail` is installed it will exec under that. The in-process engine here is the **inner** loop the leader is "based on".
 
 ### Where does inference happen?
 

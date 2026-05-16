@@ -32,6 +32,7 @@ import pygame
 from factorymind import state as S
 from factorymind import render as R
 from factorymind import memory as M
+from factorymind import nemoclaw
 from factorymind.agents import (
     Blackboard,
     choose_worker_task,
@@ -264,6 +265,95 @@ def _create_task(
 # Robot movement helpers
 # ---------------------------------------------------------------------------
 
+def _is_workstation_cell(pos: list[int], world_state: dict) -> bool:
+    """True when ``pos`` matches any workstation tile in the current layout."""
+    for ws in world_state.get("workstations", []):
+        if list(ws.get("pos", [])) == list(pos):
+            return True
+    return False
+
+
+def _park_robot_at_spawn(robot: dict, world_state: dict) -> None:
+    """Route an idle robot away from a workstation tile back to its spawn slot.
+
+    Without this, a worker that finishes at e.g. Shipping sits on the
+    delivery cell forever; the next worker arriving at Shipping is then
+    blocked by the move-coordinator's "cell occupied by a non-moving robot"
+    check and the fleet deadlocks at the tail of the queue. Returning home
+    keeps workstation tiles free for whoever is inbound next.
+    """
+    spawn = robot.get("spawn_pos")
+    if not spawn:
+        return
+    if list(robot.get("pos", [])) == list(spawn):
+        return
+    # Use plain (non-cooperative) A* so an idle worker can't itself deadlock
+    # against the reservations of others; this is a low-priority repositioning.
+    robot["path"] = _planned_path_to(
+        robot, list(spawn), world_state, ignore_reservations=True
+    )
+
+
+def _complete_task_delivery(
+    robot: dict,
+    task: dict,
+    world_state: dict,
+    blackboard: "Blackboard",
+) -> None:
+    """Mark a task finished when the robot is already at the delivery cell."""
+    route_time = round(time.time() - task.get("started_at", time.time()), 2)
+    task["status"] = "done"
+    robot["current_task"] = None
+
+    world_state["stats"]["completed"] += 1
+    world_state["stats"]["last_route_time"] = route_time
+    count = world_state["stats"]["completed"]
+    prev_avg = world_state["stats"].get("avg_route_time", route_time)
+    world_state["stats"]["avg_route_time"] = round(
+        (prev_avg * (count - 1) + route_time) / count, 2
+    )
+
+    blackboard.post(
+        robot["id"], "COMPLETE",
+        f"task-{task['id']} {task.get('pickup_name','?')}→{task.get('delivery_name','?')} done",
+        route_time=route_time,
+    )
+
+    robot["path"] = []
+    pos = robot["pos"]
+    if (
+        not world_state.get("task_queue")
+        and _is_workstation_cell(pos, world_state)
+    ):
+        _park_robot_at_spawn(robot, world_state)
+
+
+def _reconcile_stationary_task_progress(
+    robot: dict,
+    world_state: dict,
+    blackboard: "Blackboard",
+) -> None:
+    """When A* returns an empty path (already at goal), advance task state without moving.
+
+    Otherwise robots assigned e.g. Shipping→Parts while still standing on
+    Shipping never get a movement tick and hold the fleet deadlocked.
+    """
+    if robot.get("path"):
+        return
+    task_id = robot.get("current_task")
+    if task_id is None:
+        return
+    task = next((t for t in world_state["tasks"] if t["id"] == task_id), None)
+    if task is None:
+        return
+    pos = list(robot["pos"])
+    if task["status"] == "open" and pos == list(task["pickup"]):
+        task["status"] = "in_transit"
+        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
+    if task["status"] == "in_transit" and pos == list(task["delivery"]):
+        _complete_task_delivery(robot, task, world_state, blackboard)
+
+
 def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> None:
     """Move robot one cell along its pre-computed path, completing tasks as needed."""
     path = robot.get("path", [])
@@ -283,31 +373,13 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
 
     pos = robot["pos"]
     # If at pickup and task not yet in transit
-    if pos == task["pickup"] and task["status"] == "open":
+    if list(pos) == list(task["pickup"]) and task["status"] == "open":
         task["status"] = "in_transit"
         robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
 
     # If at delivery — task done, then stop until the next user task.
-    elif pos == task["delivery"] and task["status"] == "in_transit":
-        route_time = round(time.time() - task.get("started_at", time.time()), 2)
-        task["status"] = "done"
-        robot["current_task"] = None
-
-        world_state["stats"]["completed"] += 1
-        world_state["stats"]["last_route_time"] = route_time
-        count = world_state["stats"]["completed"]
-        prev_avg = world_state["stats"].get("avg_route_time", route_time)
-        world_state["stats"]["avg_route_time"] = round(
-            (prev_avg * (count - 1) + route_time) / count, 2
-        )
-
-        blackboard.post(
-            robot["id"], "COMPLETE",
-            f"task-{task['id']} {task.get('pickup_name','?')}→{task.get('delivery_name','?')} done",
-            route_time=route_time,
-        )
-
-        robot["path"] = []
+    elif list(pos) == list(task["delivery"]) and task["status"] == "in_transit":
+        _complete_task_delivery(robot, task, world_state, blackboard)
 
 
 def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> None:
@@ -319,6 +391,8 @@ def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> 
     making coordination visible.
     """
     robots = world_state.get("robots", [])
+    for robot in robots:
+        _reconcile_stationary_task_progress(robot, world_state, blackboard)
     current = {r["id"]: tuple(r["pos"]) for r in robots}
     proposals = {
         r["id"]: tuple(r["path"][0])
@@ -397,6 +471,13 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
     task["started_at"] = time.time()
     robot["current_task"] = task["id"]
     robot["path"] = _planned_path_to(robot, task["pickup"], world_state)
+    if (
+        not robot["path"]
+        and list(robot["pos"]) == list(task["pickup"])
+        and task["status"] == "open"
+    ):
+        task["status"] = "in_transit"
+        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
 
 
 def _route_cost(start: list[int], goal: list[int], wall_set: set) -> int:
@@ -580,6 +661,191 @@ def _dispatch_batch_to_workers(
 
 
 # ---------------------------------------------------------------------------
+# Autonomous fleet dispatcher
+#
+# When the user enqueues a batch ("do 100 deliveries"), the leader runs an
+# autonomous loop that delegates one task at a time to the closest idle
+# worker. Each delegation is gated by NemoClaw — so the leader is, quite
+# literally, an OpenClaw-based autonomous agent.
+# ---------------------------------------------------------------------------
+
+_FLEET_ROUTE_FLOW = ("Parts", "Assembly", "QA", "Shipping")
+
+
+def _enqueue_fleet_tasks(
+    world_state: dict,
+    blackboard: Blackboard,
+    routes: list[tuple[dict, dict]],
+    *,
+    source: str = "user",
+) -> int:
+    """Append `routes` to the leader's task queue; returns count enqueued."""
+    if not routes:
+        return 0
+    queue = world_state.setdefault("task_queue", [])
+    for pickup_ws, delivery_ws in routes:
+        task = _create_task(world_state, pickup_ws, delivery_ws, source=source)
+        task["status"] = "queued"
+        task["priority"] = 100
+        queue.append(task)
+    stats = world_state.setdefault("stats", {})
+    stats["queued_total"] = stats.get("queued_total", 0) + len(routes)
+    world_state["fleet_mode"] = True
+    blackboard.post(
+        -1,
+        "STRATEGY",
+        f"OpenClaw leader queued {len(routes)} task(s); fleet dispatch active "
+        f"(queue={len(queue)}, completed={stats.get('completed', 0)}).",
+    )
+    return len(routes)
+
+
+def _generate_fleet_routes(
+    world_state: dict,
+    count: int,
+    *,
+    pickup_ws: dict | None = None,
+    delivery_ws: dict | None = None,
+) -> list[tuple[dict, dict]]:
+    """Return a list of (pickup, delivery) routes for the leader to queue.
+
+    If both endpoints are given, every route is identical — the leader just
+    needs N workers to make that same trip. Otherwise we cycle through the
+    natural Parts->Assembly->QA->Shipping flow so all stations stay busy.
+    """
+    stations = {ws["name"]: ws for ws in world_state.get("workstations", [])}
+    if pickup_ws and delivery_ws:
+        return [(pickup_ws, delivery_ws)] * max(0, count)
+
+    flow = [stations[name] for name in _FLEET_ROUTE_FLOW if name in stations]
+    if len(flow) < 2:
+        # Should never happen with the default layout, but be defensive.
+        return []
+
+    routes: list[tuple[dict, dict]] = []
+    for i in range(max(0, count)):
+        src = flow[i % len(flow)]
+        dst = flow[(i + 1) % len(flow)]
+        routes.append((src, dst))
+    return routes
+
+
+def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
+    """One tick of the autonomous fleet loop.
+
+    Drains as many queued tasks as there are idle workers, picking the closest
+    free worker for each. Every assignment passes through NemoClaw; if the
+    engine denies (and is in enforce mode) the assignment is skipped and the
+    denial is logged. Returns the number of tasks actually dispatched.
+    """
+    queue: list[dict] = world_state.get("task_queue", []) or []
+    if not queue:
+        return 0
+
+    leaders = [r for r in world_state.get("robots", []) if r.get("role") == LEADER]
+    if not leaders:
+        return 0
+    leader = leaders[0]
+
+    idle_workers = [
+        r for r in world_state.get("robots", [])
+        if r.get("role") == WORKER
+        and r.get("current_task") is None
+        and not r.get("path")
+    ]
+    if not idle_workers:
+        return 0
+
+    engine = nemoclaw.get_engine()
+    if engine is not None:
+        tick_decision = engine.check_action(
+            "leader",
+            "fleet_dispatch_tick",
+            extra={"queue_len": len(queue), "idle_workers": len(idle_workers)},
+        )
+        try:
+            engine.enforce_decision(tick_decision)
+        except nemoclaw.PolicyDenied:
+            return 0
+
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    dispatched = 0
+
+    while queue and idle_workers:
+        task = queue[0]
+        scored = sorted(
+            idle_workers,
+            key=lambda r: (
+                _estimate_task_cost(r, task, wall_set, world_state),
+                r["id"],
+            ),
+        )
+        if not scored:
+            break
+        worker = scored[0]
+        cost = _estimate_task_cost(worker, task, wall_set, world_state)
+        if cost >= 10**6:
+            # No reachable worker for this task right now — don't pop, retry next tick.
+            break
+
+        # NemoClaw gate per delegation.
+        if engine is not None:
+            decision = engine.check_action(
+                "leader",
+                "delegate_task",
+                target=f"task-{task['id']} {task.get('pickup_name','?')}->{task.get('delivery_name','?')} -> W{worker['id']}",
+                extra={"cost": cost, "queue_remaining": len(queue) - 1},
+            )
+            try:
+                engine.enforce_decision(decision)
+            except nemoclaw.PolicyDenied:
+                queue.pop(0)
+                blackboard.post(
+                    leader["id"],
+                    "POLICY",
+                    f"OpenClaw leader: NemoClaw denied delegate_task {task['id']} -> W{worker['id']}; dropped.",
+                )
+                continue
+
+        # Move task from queue to active list and assign.
+        queue.pop(0)
+        idle_workers.remove(worker)
+        task["status"] = "open"
+        if task not in world_state.setdefault("tasks", []):
+            world_state["tasks"].append(task)
+        _assign_task_to_robot(worker, task, world_state)
+        task["delegated_by"] = leader["id"]
+        task["estimated_route_cost"] = cost
+
+        route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
+        blackboard.post(
+            leader["id"],
+            "CLAIM",
+            f"OpenClaw leader: delegating {route} task {task['id']} to W{worker['id']} "
+            f"(cost={cost}, queue_remaining={len(queue)}).",
+        )
+        blackboard.post(
+            worker["id"],
+            "INTENT",
+            f"W{worker['id']} accepting fleet assignment {route} task {task['id']} (cost={cost}).",
+        )
+        print(
+            f"[fleet leader {leader['id']}] dispatched task {task['id']} ({route}) -> "
+            f"worker {worker['id']} cost={cost} queue_remaining={len(queue)}",
+            flush=True,
+        )
+        dispatched += 1
+
+    if dispatched and not queue:
+        blackboard.post(
+            leader["id"],
+            "STRATEGY",
+            "OpenClaw leader: fleet queue drained; awaiting completions before idling.",
+        )
+    return dispatched
+
+
+# ---------------------------------------------------------------------------
 # Demo / integration helpers
 # ---------------------------------------------------------------------------
 
@@ -690,13 +956,19 @@ def _count_requested_in_text(text: str, default: int = 1) -> int | str:
     for word, count in _COUNT_WORDS.items():
         if re.search(rf"\b{word}\b", lower):
             return count
-    number = re.search(r"\b([1-8])\b", lower)
+    # NEW: support fleet-scale numbers (e.g. "do 100 deliveries").
+    number = re.search(r"\b(\d{1,4})\b", lower)
     return int(number.group(1)) if number else default
+
+
+_FLEET_TASK_COUNT_LIMIT = 500
 
 
 def _requested_task_count(text: str) -> int:
     count = _count_requested_in_text(text)
-    return count if isinstance(count, int) else 1
+    if not isinstance(count, int):
+        return 1
+    return max(1, min(count, _FLEET_TASK_COUNT_LIMIT))
 
 
 def _parse_user_task_request(text: str, world_state: dict) -> tuple[dict, dict, int] | None:
@@ -765,8 +1037,13 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
                 count = max(1, remaining)
             elif re.search(r"\b(all|everyone|everybody)\b", clause, flags=re.IGNORECASE):
                 count = worker_count
-            count = max(1, min(count, worker_count))
-            remaining = max(0, remaining - count)
+            # Fleet mode: allow large queue requests (e.g. "100 deliveries");
+            # only clamp small "5 workers"-style asks to the worker count.
+            if count <= worker_count:
+                count = max(1, count)
+            else:
+                count = min(count, _FLEET_TASK_COUNT_LIMIT)
+            remaining = max(0, remaining - min(count, remaining))
             requests.append((pickup, delivery, count))
 
     if requests:
@@ -833,8 +1110,13 @@ def _interpret_user_task_requests(text: str, world_state: dict) -> list[tuple[di
                 count = int(raw_count)
             except (TypeError, ValueError):
                 count = 1
-        count = max(1, min(count, worker_count))
-        remaining = max(0, remaining - count)
+        # Match the non-LLM clause parser: small counts cap at worker pool
+        # size; large counts are fleet-scale and only clamp to the safety max.
+        if count <= worker_count:
+            count = max(1, count)
+        else:
+            count = min(count, _FLEET_TASK_COUNT_LIMIT)
+        remaining = max(0, remaining - min(count, remaining))
         requests.append((pickup, delivery, count))
 
     if requests:
@@ -919,18 +1201,50 @@ def _create_user_task(world_state: dict, pickup_ws: dict, delivery_ws: dict) -> 
     return task
 
 
+def _parse_bulk_fleet_request(text: str, world_state: dict) -> int:
+    """Detect 'do 100 tasks' / '50 deliveries' style fleet commands.
+
+    Returns the requested task count, or 0 if the text does not look like a
+    bulk fleet request. Used as a fallback when no specific stations were
+    named — we then auto-generate a Parts->Assembly->QA->Shipping cycle.
+    """
+    lower = text.lower()
+    has_bulk_word = bool(
+        re.search(
+            r"\b(task|tasks|delivery|deliveries|run|runs|trip|trips|job|jobs|drop|drops|order|orders)\b",
+            lower,
+        )
+    )
+    if not has_bulk_word:
+        return 0
+    number = re.search(r"\b(\d{1,4})\b", lower)
+    if not number:
+        return 0
+    return max(1, min(int(number.group(1)), _FLEET_TASK_COUNT_LIMIT))
+
+
 def _apply_user_task_request(
     text: str,
     world_state: dict,
     blackboard: Blackboard,
 ) -> bool:
-    """Convert a natural-language task request into structured work robots can execute."""
+    """Convert a natural-language task request into queued fleet work.
+
+    Tasks are pushed onto ``world_state["task_queue"]`` rather than dispatched
+    all at once. The autonomous OpenClaw leader then drains the queue one
+    task at a time, sending each to whichever worker is closest and free.
+    """
     requests = _parse_user_task_requests(text, world_state)
+    bulk_count = 0
     if not requests:
-        return False
+        # Fallback: bare numeric request like "do 100 tasks" with no stations.
+        bulk_count = _parse_bulk_fleet_request(text, world_state)
+        if bulk_count <= 0:
+            return False
 
     _cancel_pending_decisions()
 
+    # Drop any in-flight assignments; queued work will replace them.
     for robot in world_state.get("robots", []):
         robot["current_task"] = None
         robot["path"] = []
@@ -940,29 +1254,40 @@ def _apply_user_task_request(
             task["status"] = "cancelled"
             task["assigned_to"] = None
 
-    new_tasks: list[dict] = []
-    route_summaries: list[str] = []
-    for pickup_ws, delivery_ws, count in requests:
-        new_tasks.extend(
-            _create_user_task(world_state, pickup_ws, delivery_ws)
-            for _ in range(count)
-        )
-        route_summaries.append(f"{count}x {pickup_ws['name']}->{delivery_ws['name']}")
+    # Reset the queue for this command (additive feels surprising when the
+    # user just said "do 100 deliveries"). A "+100" prefix can be wired up
+    # later if additive enqueue is preferred.
+    world_state["task_queue"] = []
 
-    world_state["tasks"].extend(new_tasks)
-    dispatched = _dispatch_batch_to_workers(new_tasks, world_state, blackboard)
+    routes: list[tuple[dict, dict]] = []
+    route_summaries: list[str] = []
+
+    if requests:
+        for pickup_ws, delivery_ws, count in requests:
+            routes.extend([(pickup_ws, delivery_ws)] * count)
+            route_summaries.append(f"{count}x {pickup_ws['name']}->{delivery_ws['name']}")
+    else:
+        # Bulk fleet request: rotate through the whole flow.
+        routes = _generate_fleet_routes(world_state, bulk_count)
+        route_summaries.append(f"{bulk_count}x cycle({'->'.join(_FLEET_ROUTE_FLOW)})")
+
+    enqueued = _enqueue_fleet_tasks(world_state, blackboard, routes, source="user")
+    dispatched = _fleet_dispatch_step(world_state, blackboard)
     world_state["manual_control"] = False
     summary = "; ".join(route_summaries)
     blackboard.post(
         -1,
         "STRATEGY",
         (
-            f"User task accepted: {summary}; "
-            f"{dispatched} worker(s) dispatched now."
+            f"OpenClaw fleet accepted: {summary}; queued={enqueued}, "
+            f"first wave dispatched={dispatched}, queue_remaining="
+            f"{len(world_state.get('task_queue', []))}."
         ),
     )
     print(
-        f"[command] created {len(new_tasks)} user task(s): {summary}",
+        f"[command] queued {enqueued} fleet task(s) ({summary}); "
+        f"first dispatch={dispatched}; "
+        f"queue_remaining={len(world_state.get('task_queue', []))}",
         flush=True,
     )
     return True
@@ -1234,7 +1559,12 @@ def _apply_leader_decision(
     from factorymind.state import CLAIM
 
     claimed_id = decision.get("claim_task_id")
-    if claimed_id is not None:
+    fleet_mode = bool(world_state.get("fleet_mode") or world_state.get("task_queue"))
+    if claimed_id is not None and not fleet_mode:
+        # Outside fleet mode the leader may still grab a single task itself
+        # (legacy behavior for "take Parts to QA" with no queue). In fleet
+        # mode the OpenClaw dispatcher owns assignment and the leader stays
+        # parked at its dispatch position to think.
         task = next(
             (t for t in world_state["tasks"]
              if t["id"] == claimed_id and t["status"] == "open"
@@ -1671,10 +2001,13 @@ def main() -> None:
     max_runtime = float(os.getenv("FACTORYMIND_MAX_RUNTIME", "0") or 0)
     world_state = _reset_demo_state(layout, speed_multiplier, "online")
     blackboard = Blackboard()
+    engine = nemoclaw.activate(blackboard=blackboard, world_state=world_state)
+    blackboard.post(-1, "POLICY", f"OpenClaw runtime active: {engine.describe()}")
     blackboard.post(
         -1,
         "STRATEGY",
-        "FactoryMind ready — type a delivery like 'take Parts to QA' to create leader-owned work.",
+        "FactoryMind ready — type 'do 100 deliveries' for an autonomous fleet run, "
+        "or 'take Parts to QA' for a single task.",
     )
     _sim_started = False
     manual_control = False
@@ -1765,10 +2098,14 @@ def main() -> None:
                 _cancel_pending_decisions()
                 world_state = _reset_demo_state(OPEN_FLOOR, speed_multiplier, world_state["connection_status"])
                 blackboard.clear()
+                # Re-bind NemoClaw to the fresh world_state so policy stats
+                # accrue against the active simulation.
+                nemoclaw.activate(blackboard=blackboard, world_state=world_state)
                 blackboard.post(
                     -1,
                     "STRATEGY",
-                    "Simulation reset — type a delivery like 'take Parts to QA' to begin.",
+                    "Simulation reset — type 'do 100 deliveries' for a fleet run "
+                    "or 'take Parts to QA' for a single task.",
                 )
                 _sim_started = False
                 manual_control = False
@@ -1882,12 +2219,18 @@ def main() -> None:
                     )
                     last_strategist_tick = now
 
+            # --- Autonomous fleet dispatch (cheap; runs every loop iteration) ---
+            if world_state.get("task_queue"):
+                _fleet_dispatch_step(world_state, blackboard)
+
             # --- Movement tick ---
             if now - last_move_tick >= MOVE_TICK_INTERVAL:
                 move_steps = min(int((now - last_move_tick) // MOVE_TICK_INTERVAL), 4)
                 for _ in range(max(1, move_steps)):
                     _advance_robots_coordinated(world_state, blackboard)
                 last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
+                if world_state.get("task_queue"):
+                    _fleet_dispatch_step(world_state, blackboard)
 
             # --- Stats ---
             elapsed = sim_elapsed

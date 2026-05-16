@@ -86,6 +86,7 @@
   .type-REASONING  { color: var(--strategy); }
   .type-ERROR      { color: var(--error); }
   .type-USER       { color: #fff; font-weight: 700; }
+  .type-POLICY     { color: #00ffc8; font-weight: 600; }
   #chat-row { display: flex; gap: 6px; }
   #chat-input {
     flex: 1;
@@ -157,6 +158,16 @@
       <div class="value" id="s-last">--</div>
       <div class="sub" id="s-avg"></div>
     </div>
+    <div class="tile">
+      <div class="label">FLEET QUEUE</div>
+      <div class="value" id="s-queue">0</div>
+      <div class="sub" id="s-queue-total"></div>
+    </div>
+    <div class="tile">
+      <div class="label">NEMOCLAW</div>
+      <div class="value" id="s-claw">--</div>
+      <div class="sub" id="s-claw-mode"></div>
+    </div>
   </div>
 
   <div class="row">
@@ -177,7 +188,7 @@
   <div id="log"></div>
 
   <div id="chat-row">
-    <input id="chat-input" placeholder="Give the agents a task…" autocomplete="off" />
+    <input id="chat-input" placeholder="e.g. 'do 100 deliveries' or 'take Parts to QA'…" autocomplete="off" />
     <button id="send-btn">SEND</button>
   </div>
 </div>
@@ -211,17 +222,17 @@ stage.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x06060e);
-scene.fog = new THREE.Fog(0x06060e, GRID * 1.2, GRID * 3.2);
+scene.fog = new THREE.Fog(0x06060e, GRID * 1.6, GRID * 4.0);
 
-const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 800);
-camera.position.set(GRID * 0.95, GRID * 1.0, GRID * 1.45);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
+camera.position.set(GRID * 1.05, GRID * 1.1, GRID * 1.6);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(GRID / 2, 0, GRID / 2);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.minDistance = 12;
-controls.maxDistance = 180;
+controls.maxDistance = 220;
 controls.maxPolarAngle = Math.PI * 0.49;
 
 // Lights
@@ -243,29 +254,515 @@ const rim = new THREE.DirectionalLight(0x4488ff, 0.45);
 rim.position.set(-30, 60, -40);
 scene.add(rim);
 
-// Floor
+// ---------------------------------------------------------------------------
+// Factory environment — built once at startup. Everything outside the playable
+// 0..GRID area is purely decorative and never affects pathfinding.
+// ---------------------------------------------------------------------------
+const PAD = 14;                 // outer concrete apron beyond playable area
+const WALL_H = 4.0;             // perimeter wall height
+const PERIM_OFFSET = 1.5;       // perimeter wall sits just outside the floor
+
+// Polished factory floor (slightly lighter, glossy concrete).
 {
   const geo = new THREE.PlaneGeometry(GRID, GRID, 1, 1);
   geo.rotateX(-Math.PI / 2);
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x14142a, metalness: 0.15, roughness: 0.85,
+    color: 0x1a1a30, metalness: 0.2, roughness: 0.75,
   });
   const floor = new THREE.Mesh(geo, mat);
   floor.position.set(GRID / 2, 0, GRID / 2);
   floor.receiveShadow = true;
   scene.add(floor);
 
-  const grid = new THREE.GridHelper(GRID, 50, 0x2a2a52, 0x16162a);
+  const grid = new THREE.GridHelper(GRID, 50, 0x2a2a52, 0x18182e);
   grid.position.set(GRID / 2, 0.02, GRID / 2);
   scene.add(grid);
+}
 
-  // bordering rim
-  const rimGeo = new THREE.BoxGeometry(GRID + 1, 0.4, GRID + 1);
-  const rimMat = new THREE.MeshStandardMaterial({ color: 0x1a1a36, roughness: 0.6 });
+// Outer concrete apron (the area the buildings sit on).
+{
+  const geo = new THREE.PlaneGeometry(GRID + PAD * 2, GRID + PAD * 2);
+  geo.rotateX(-Math.PI / 2);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x0c0c16, metalness: 0.05, roughness: 0.95,
+  });
+  const apron = new THREE.Mesh(geo, mat);
+  apron.position.set(GRID / 2, -0.12, GRID / 2);
+  apron.receiveShadow = true;
+  scene.add(apron);
+
+  // Painted rim around the playable floor (slight "shop floor" highlight).
+  const rimGeo = new THREE.BoxGeometry(GRID + 1, 0.18, GRID + 1);
+  const rimMat = new THREE.MeshStandardMaterial({ color: 0x1f1f3a, roughness: 0.55 });
   const rimMesh = new THREE.Mesh(rimGeo, rimMat);
-  rimMesh.position.set(GRID / 2, -0.2, GRID / 2);
+  rimMesh.position.set(GRID / 2, -0.06, GRID / 2);
   rimMesh.receiveShadow = true;
   scene.add(rimMesh);
+}
+
+// ---------------------------------------------------------------------------
+// Reusable prop builders
+// ---------------------------------------------------------------------------
+const matWallSteel = new THREE.MeshStandardMaterial({
+  color: 0x1c1c30, roughness: 0.65, metalness: 0.45,
+});
+const matWallPanel = new THREE.MeshStandardMaterial({
+  color: 0x252540, roughness: 0.6, metalness: 0.5,
+});
+const matPillar = new THREE.MeshStandardMaterial({
+  color: 0x2a2a44, roughness: 0.55, metalness: 0.55,
+});
+const matHazard = new THREE.MeshStandardMaterial({
+  color: 0xffb000, emissive: 0xffb000, emissiveIntensity: 0.55, roughness: 0.4,
+});
+const matTruss = new THREE.MeshStandardMaterial({
+  color: 0x3a3a55, roughness: 0.5, metalness: 0.7,
+});
+const matLightStrip = new THREE.MeshBasicMaterial({ color: 0xfff4d8 });
+const matCrateRed = new THREE.MeshStandardMaterial({
+  color: 0x9a3030, roughness: 0.85, metalness: 0.05,
+});
+const matCrateWood = new THREE.MeshStandardMaterial({
+  color: 0x6b4626, roughness: 0.95, metalness: 0.02,
+});
+const matDrum = new THREE.MeshStandardMaterial({
+  color: 0x1f5a1f, roughness: 0.45, metalness: 0.6,
+});
+const matDrumLid = new THREE.MeshStandardMaterial({
+  color: 0x0d2a0d, roughness: 0.7, metalness: 0.4,
+});
+const matCone = new THREE.MeshStandardMaterial({
+  color: 0xff7a18, emissive: 0xff5a00, emissiveIntensity: 0.4, roughness: 0.5,
+});
+const matCharger = new THREE.MeshStandardMaterial({
+  color: 0x10324a, roughness: 0.4, metalness: 0.7,
+  emissive: 0x00d4ff, emissiveIntensity: 0.35,
+});
+const matChargerCap = new THREE.MeshBasicMaterial({ color: 0x00d4ff });
+const matTruckBody = new THREE.MeshStandardMaterial({
+  color: 0xe6c84a, roughness: 0.55, metalness: 0.35,
+});
+const matTruckCab = new THREE.MeshStandardMaterial({
+  color: 0xb89a30, roughness: 0.5, metalness: 0.4,
+});
+const matTruckTire = new THREE.MeshStandardMaterial({
+  color: 0x101018, roughness: 0.95, metalness: 0.05,
+});
+
+function makeFloorLabel(text, color = "#ffffff", scale = 4.0) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 512; canvas.height = 128;
+  const ctx = canvas.getContext("2d");
+  ctx.font = "bold 88px ui-monospace, Menlo, monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.shadowColor = "rgba(0,0,0,0.8)";
+  ctx.shadowBlur = 12;
+  ctx.fillText(text, 256, 70);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.MeshBasicMaterial({
+    map: tex, transparent: true, depthWrite: false,
+  });
+  const geo = new THREE.PlaneGeometry(scale, scale * (canvas.height / canvas.width));
+  geo.rotateX(-Math.PI / 2);
+  return new THREE.Mesh(geo, mat);
+}
+
+function makePalletStack(count = 3, crateMat = matCrateWood) {
+  const g = new THREE.Group();
+  // Wooden pallet base
+  const palletMat = new THREE.MeshStandardMaterial({ color: 0x4d2f15, roughness: 0.95 });
+  const pallet = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.2, 2.0), palletMat);
+  pallet.position.y = 0.1;
+  pallet.castShadow = true; pallet.receiveShadow = true;
+  g.add(pallet);
+  // Stacked crates
+  for (let i = 0; i < count; i++) {
+    const c = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.9, 1.6), crateMat);
+    c.position.set(
+      (Math.random() - 0.5) * 0.15,
+      0.2 + 0.45 + i * 0.95,
+      (Math.random() - 0.5) * 0.15,
+    );
+    c.rotation.y = (Math.random() - 0.5) * 0.15;
+    c.castShadow = true; c.receiveShadow = true;
+    g.add(c);
+  }
+  return g;
+}
+
+function makeDrum() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 1.1, 18), matDrum);
+  body.position.y = 0.55;
+  body.castShadow = true; body.receiveShadow = true;
+  g.add(body);
+  const lid = new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.46, 0.06, 18), matDrumLid);
+  lid.position.y = 1.13;
+  g.add(lid);
+  // Faint horizontal band
+  const band = new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.46, 0.08, 18), matDrumLid);
+  band.position.y = 0.55;
+  g.add(band);
+  return g;
+}
+
+function makeCone() {
+  const g = new THREE.Group();
+  const base = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.08, 0.6), matDrumLid);
+  base.position.y = 0.04;
+  base.castShadow = true;
+  g.add(base);
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.7, 14), matCone);
+  cone.position.y = 0.43;
+  cone.castShadow = true;
+  g.add(cone);
+  const stripe = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.27, 0.08, 14),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  stripe.position.y = 0.45;
+  g.add(stripe);
+  return g;
+}
+
+function makeCornerPillar(x, z) {
+  const g = new THREE.Group();
+  const shaft = new THREE.Mesh(new THREE.BoxGeometry(1.6, WALL_H + 1.2, 1.6), matPillar);
+  shaft.position.set(x, (WALL_H + 1.2) / 2, z);
+  shaft.castShadow = true; shaft.receiveShadow = true;
+  g.add(shaft);
+  // Hazard cap
+  const hat = new THREE.Mesh(new THREE.BoxGeometry(1.85, 0.35, 1.85), matHazard);
+  hat.position.set(x, WALL_H + 1.2, z);
+  g.add(hat);
+  // Hazard skirt
+  const skirt = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.4, 1.8), matHazard);
+  skirt.position.set(x, 0.2, z);
+  g.add(skirt);
+  return g;
+}
+
+function makeTruck(x, z, rotY = 0) {
+  const g = new THREE.Group();
+  // Trailer
+  const trailer = new THREE.Mesh(new THREE.BoxGeometry(6.5, 2.4, 2.6), matTruckBody);
+  trailer.position.set(0, 1.5, 0);
+  trailer.castShadow = true; trailer.receiveShadow = true;
+  g.add(trailer);
+  // Cab
+  const cab = new THREE.Mesh(new THREE.BoxGeometry(2.4, 2.0, 2.4), matTruckCab);
+  cab.position.set(4.4, 1.3, 0);
+  cab.castShadow = true; cab.receiveShadow = true;
+  g.add(cab);
+  // Windshield
+  const wind = new THREE.Mesh(new THREE.BoxGeometry(0.05, 1.0, 1.9),
+    new THREE.MeshStandardMaterial({
+      color: 0x88c8ff, transparent: true, opacity: 0.55,
+      roughness: 0.1, metalness: 0.6,
+    }));
+  wind.position.set(5.6, 1.7, 0);
+  g.add(wind);
+  // Tires
+  for (const [tx, tz] of [[-2.2, 1.45], [-2.2, -1.45], [1.0, 1.45], [1.0, -1.45], [4.0, 1.45], [4.0, -1.45]]) {
+    const t = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 0.5, 16), matTruckTire);
+    t.rotation.x = Math.PI / 2;
+    t.position.set(tx, 0.5, tz);
+    g.add(t);
+  }
+  g.position.set(x, 0, z);
+  g.rotation.y = rotY;
+  return g;
+}
+
+// ---------------------------------------------------------------------------
+// Build perimeter, pillars, trusses, and scattered outdoor props
+// ---------------------------------------------------------------------------
+{
+  const half = GRID / 2;
+  const wallSpan = GRID + PERIM_OFFSET * 2 + 4;
+
+  // Four perimeter walls (with gaps left near the corners as bay openings).
+  // We render each side as two segments around a central gap to suggest a
+  // loading-dock door near the corner workstations.
+  const segLen = (GRID + PERIM_OFFSET * 2) / 2 - 4;
+
+  function makeSeg(w, h, d, x, y, z) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), matWallSteel);
+    m.position.set(x, y, z);
+    m.castShadow = true; m.receiveShadow = true;
+    scene.add(m);
+    return m;
+  }
+
+  // North (z = -PERIM_OFFSET)
+  makeSeg(segLen, WALL_H, 0.6, half - segLen / 2 - 4, WALL_H / 2, -PERIM_OFFSET);
+  makeSeg(segLen, WALL_H, 0.6, half + segLen / 2 + 4, WALL_H / 2, -PERIM_OFFSET);
+  // South
+  makeSeg(segLen, WALL_H, 0.6, half - segLen / 2 - 4, WALL_H / 2, GRID + PERIM_OFFSET);
+  makeSeg(segLen, WALL_H, 0.6, half + segLen / 2 + 4, WALL_H / 2, GRID + PERIM_OFFSET);
+  // West
+  makeSeg(0.6, WALL_H, segLen, -PERIM_OFFSET, WALL_H / 2, half - segLen / 2 - 4);
+  makeSeg(0.6, WALL_H, segLen, -PERIM_OFFSET, WALL_H / 2, half + segLen / 2 + 4);
+  // East
+  makeSeg(0.6, WALL_H, segLen, GRID + PERIM_OFFSET, WALL_H / 2, half - segLen / 2 - 4);
+  makeSeg(0.6, WALL_H, segLen, GRID + PERIM_OFFSET, WALL_H / 2, half + segLen / 2 + 4);
+
+  // Corner pillars (just outside the playable area, between wall segments).
+  scene.add(makeCornerPillar(-PERIM_OFFSET,        -PERIM_OFFSET));
+  scene.add(makeCornerPillar(GRID + PERIM_OFFSET,  -PERIM_OFFSET));
+  scene.add(makeCornerPillar(-PERIM_OFFSET,        GRID + PERIM_OFFSET));
+  scene.add(makeCornerPillar(GRID + PERIM_OFFSET,  GRID + PERIM_OFFSET));
+
+  // Overhead trusses with light strips spanning the bay.
+  for (let z = 6; z < GRID; z += 12) {
+    const truss = new THREE.Mesh(
+      new THREE.BoxGeometry(GRID + 4, 0.22, 0.5),
+      matTruss,
+    );
+    truss.position.set(GRID / 2, WALL_H + 0.6, z);
+    truss.castShadow = false;
+    scene.add(truss);
+
+    const strip = new THREE.Mesh(
+      new THREE.BoxGeometry(GRID, 0.05, 0.18),
+      matLightStrip,
+    );
+    strip.position.set(GRID / 2, WALL_H + 0.45, z);
+    scene.add(strip);
+  }
+
+  // Decorative props scattered OUTSIDE the playable area only — never in 0..GRID.
+  // A tiny deterministic PRNG so the layout is stable across reloads.
+  let _seed = 1337;
+  const rand = () => { _seed = (_seed * 9301 + 49297) % 233280; return _seed / 233280; };
+
+  const outsidePoints = [
+    // West strip (parts side)
+    { x: -5, z: 6 },  { x: -7, z: 12 }, { x: -5, z: 18 },
+    { x: -6, z: 30 }, { x: -7, z: 38 }, { x: -5, z: 44 },
+    // East strip (assembly / qa side)
+    { x: GRID + 5, z: 7 },  { x: GRID + 7, z: 13 },
+    { x: GRID + 5, z: 26 }, { x: GRID + 7, z: 33 }, { x: GRID + 5, z: 41 },
+    // North strip
+    { x: 10, z: -5 }, { x: 18, z: -7 }, { x: 30, z: -5 }, { x: 40, z: -7 },
+    // South strip
+    { x: 12, z: GRID + 6 }, { x: 22, z: GRID + 7 },
+    { x: 32, z: GRID + 5 }, { x: 41, z: GRID + 6 },
+  ];
+
+  for (const p of outsidePoints) {
+    const r = rand();
+    let prop;
+    if (r < 0.4) {
+      prop = makePalletStack(1 + Math.floor(rand() * 3),
+        rand() < 0.5 ? matCrateRed : matCrateWood);
+    } else if (r < 0.7) {
+      prop = makeDrum();
+      // Cluster 2-3 drums together
+      const cluster = new THREE.Group();
+      cluster.add(prop);
+      const n = 1 + Math.floor(rand() * 3);
+      for (let i = 0; i < n; i++) {
+        const d = makeDrum();
+        d.position.set((rand() - 0.5) * 1.6, 0, (rand() - 0.5) * 1.6);
+        cluster.add(d);
+      }
+      prop = cluster;
+    } else {
+      prop = makeCone();
+    }
+    prop.position.x += p.x;
+    prop.position.z += p.z;
+    prop.rotation.y = rand() * Math.PI * 2;
+    scene.add(prop);
+  }
+
+  // Parked truck near Shipping (bottom-left corner outside the wall).
+  scene.add(makeTruck(-7.5, GRID + 8, Math.PI * 0.15));
+  // Smaller delivery van near Parts (top-left corner outside the wall).
+  const van = makeTruck(-8, -6, -Math.PI * 0.85);
+  van.scale.set(0.78, 0.85, 0.85);
+  scene.add(van);
+}
+
+// ---------------------------------------------------------------------------
+// Interior shop floor — cross aisles, extra designated zones, modules (visual
+// only; pathfinding still uses world.wall).
+// ---------------------------------------------------------------------------
+{
+  const matZoneStaging = new THREE.MeshBasicMaterial({
+    color: 0xd7af46, transparent: true, opacity: 0.15, depthWrite: false,
+  });
+  const matZoneBuffer = new THREE.MeshBasicMaterial({
+    color: 0x5c7aae, transparent: true, opacity: 0.14, depthWrite: false,
+  });
+  const matZoneTool = new THREE.MeshBasicMaterial({
+    color: 0x5eaa72, transparent: true, opacity: 0.12, depthWrite: false,
+  });
+  const matAisle = new THREE.MeshBasicMaterial({
+    color: 0xdab234, transparent: true, opacity: 0.5, depthWrite: false,
+  });
+  const matModule = new THREE.MeshStandardMaterial({
+    color: 0x28283e, roughness: 0.62, metalness: 0.42,
+  });
+  const matModuleTrim = new THREE.MeshStandardMaterial({
+    color: 0x4a4a6a, roughness: 0.5, metalness: 0.55,
+  });
+  const matRack = new THREE.MeshStandardMaterial({
+    color: 0x3a3c55, roughness: 0.55, metalness: 0.6,
+  });
+
+  function addFloorZone(gx0, gz0, gx1, gz1, mat, label, textColor) {
+    const cx = (gx0 + gx1) / 2;
+    const cz = (gz0 + gz1) / 2;
+    const w = gx1 - gx0;
+    const d = gz1 - gz0;
+    const geo = new THREE.PlaneGeometry(w, d);
+    geo.rotateX(-Math.PI / 2);
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(cx, 0.035, cz);
+    scene.add(m);
+
+    const edgeMat = new THREE.MeshBasicMaterial({
+      color: 0xffc028, transparent: true, opacity: 0.38, depthWrite: false,
+    });
+    const t = 0.2;
+    for (const [dx, dz, sw, sd] of [
+      [0, -d / 2, w, t],
+      [0,  d / 2, w, t],
+      [-w / 2, 0, t, d],
+      [ w / 2, 0, t, d],
+    ]) {
+      const g = new THREE.PlaneGeometry(sw, sd);
+      g.rotateX(-Math.PI / 2);
+      const e = new THREE.Mesh(g, edgeMat);
+      e.position.set(cx + dx, 0.045, cz + dz);
+      scene.add(e);
+    }
+
+    if (label) {
+      const lbl = makeFloorLabel(label, textColor, Math.min(w, d) * 0.5);
+      lbl.position.set(cx, 0.055, cz);
+      scene.add(lbl);
+    }
+  }
+
+  addFloorZone(29, 29, 41, 41, matZoneStaging, "STAGING / WIP", "#ffd65c");
+  addFloorZone(18, 32, 27, 41, matZoneBuffer, "BUFFER LANE", "#b8d8ff");
+  addFloorZone(8, 18, 16, 27, matZoneTool, "TOOL CRIB", "#9cf0b0");
+
+  const aisleT = 0.15;
+  const vStrip = new THREE.Mesh(
+    new THREE.PlaneGeometry(aisleT, GRID),
+    matAisle,
+  );
+  vStrip.rotation.x = -Math.PI / 2;
+  vStrip.position.set(GRID / 2 + 0.5, 0.04, GRID / 2);
+  scene.add(vStrip);
+
+  const hStrip = new THREE.Mesh(
+    new THREE.PlaneGeometry(GRID, aisleT),
+    matAisle,
+  );
+  hStrip.rotation.x = -Math.PI / 2;
+  hStrip.position.set(GRID / 2, 0.04, GRID / 2 + 0.5);
+  scene.add(hStrip);
+
+  function addModule(gx0, gz0, gx1, gz1, h = 3.15) {
+    const w = gx1 - gx0;
+    const d = gz1 - gz0;
+    const cx = (gx0 + gx1) / 2;
+    const cz = (gz0 + gz1) / 2;
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(w * 0.9, h, d * 0.9),
+      matModule,
+    );
+    body.position.set(cx, h / 2, cz);
+    body.castShadow = true;
+    body.receiveShadow = true;
+    scene.add(body);
+
+    const lip = new THREE.Mesh(
+      new THREE.BoxGeometry(w * 0.94, 0.14, d * 0.94),
+      matModuleTrim,
+    );
+    lip.position.set(cx, h - 0.06, cz);
+    lip.castShadow = true;
+    scene.add(lip);
+  }
+
+  addModule(18, 8, 26, 16);
+  addModule(31, 17, 41, 25);
+  addModule(9, 33, 18, 42);
+
+  for (const gx of [11, 37]) {
+    for (let gz = 6; gz < 44; gz += 3) {
+      const post = new THREE.Mesh(
+        new THREE.BoxGeometry(0.2, 2.35, 0.2),
+        matRack,
+      );
+      post.position.set(gx + 0.5, 1.18, gz + 0.5);
+      post.castShadow = true;
+      scene.add(post);
+      const beam = new THREE.Mesh(
+        new THREE.BoxGeometry(0.48, 0.1, 0.48),
+        matRack,
+      );
+      beam.position.set(gx + 0.5, 2.38, gz + 0.5);
+      scene.add(beam);
+    }
+  }
+
+  const conveyor = new THREE.Mesh(
+    new THREE.BoxGeometry(9, 0.32, 1.1),
+    new THREE.MeshStandardMaterial({
+      color: 0x2a2c40, roughness: 0.72, metalness: 0.38,
+    }),
+  );
+  conveyor.position.set(24.5, 0.18, 14.5);
+  conveyor.castShadow = true;
+  conveyor.receiveShadow = true;
+  scene.add(conveyor);
+
+  function addMachinePod(cx, cz, accent) {
+    const g = new THREE.Group();
+    const base = new THREE.Mesh(
+      new THREE.BoxGeometry(1.9, 1.05, 1.9),
+      new THREE.MeshStandardMaterial({ color: 0x3c3e58, roughness: 0.55, metalness: 0.52 }),
+    );
+    base.position.y = 0.52;
+    base.castShadow = true;
+    g.add(base);
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(0.4, 0.07, 10, 24),
+      new THREE.MeshStandardMaterial({
+        color: accent, emissive: accent, emissiveIntensity: 0.55,
+        metalness: 0.45, roughness: 0.32,
+      }),
+    );
+    ring.rotation.x = Math.PI / 2;
+    ring.position.set(0, 1.02, 0);
+    g.add(ring);
+    g.position.set(cx, 0, cz);
+    scene.add(g);
+  }
+  addMachinePod(34, 10, 0x00d4ff);
+  addMachinePod(15, 38, 0xff8c00);
+
+  for (const [gx, gz] of [[24, 22], [40, 32]]) {
+    const pad = new THREE.Mesh(
+      new THREE.BoxGeometry(0.9, 0.05, 0.9),
+      new THREE.MeshStandardMaterial({ color: 0x4a3a18, roughness: 0.82 }),
+    );
+    pad.position.set(gx + 0.5, 0.038, gz + 0.5);
+    pad.receiveShadow = true;
+    scene.add(pad);
+    const drum = makeDrum();
+    drum.position.set(gx + 0.5, 0, gz + 0.5);
+    drum.scale.setScalar(0.52);
+    scene.add(drum);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,53 +832,479 @@ function syncWalls(world) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Workstation builders — one signature shape per station type, so the demo
+// reads as a real factory (warehouse / gantry / clean room / loading dock).
+// All visuals stay within the workstation's footprint so they never block
+// the robots' A* paths.
+// ---------------------------------------------------------------------------
+function _buildBaseAndLabel(group, ws, tint, hex) {
+  // Painted floor base
+  const base = new THREE.Mesh(
+    new THREE.BoxGeometry(3, 0.18, 3),
+    new THREE.MeshStandardMaterial({ color: 0x14142a, roughness: 0.8, metalness: 0.3 }),
+  );
+  base.position.y = 0.09;
+  base.receiveShadow = true;
+  group.add(base);
+
+  // Hazard chevron edges (yellow stripes around the base)
+  for (const [dx, dz, sx, sz] of [
+    [ 0, -1.5, 3.0, 0.18],
+    [ 0,  1.5, 3.0, 0.18],
+    [-1.5, 0,  0.18, 3.0],
+    [ 1.5, 0,  0.18, 3.0],
+  ]) {
+    const stripe = new THREE.Mesh(
+      new THREE.BoxGeometry(sx, 0.04, sz),
+      new THREE.MeshStandardMaterial({
+        color: 0xffc028, emissive: 0xffc028, emissiveIntensity: 0.4,
+      }),
+    );
+    stripe.position.set(dx, 0.19, dz);
+    group.add(stripe);
+  }
+
+  // Suspended sign on a thin pole
+  const pole = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.08, 0.08, 4.2, 10),
+    matPillar,
+  );
+  pole.position.set(-1.3, 2.1, -1.3);
+  group.add(pole);
+
+  const lbl = makeLabelSprite(ws.name.toUpperCase(), hex, 1.5);
+  lbl.position.set(0, 4.0, 0);
+  group.add(lbl);
+}
+
+function _buildPartsWarehouse(group, tint, hex) {
+  // Backdrop wall (red shipping container vibe)
+  const back = new THREE.Mesh(
+    new THREE.BoxGeometry(3.0, 2.6, 0.4),
+    new THREE.MeshStandardMaterial({
+      color: tint, emissive: tint, emissiveIntensity: 0.18,
+      roughness: 0.6, metalness: 0.35,
+    }),
+  );
+  back.position.set(0, 1.4, -1.3);
+  back.castShadow = true; back.receiveShadow = true;
+  group.add(back);
+
+  // Container ribs
+  for (let i = -1; i <= 1; i++) {
+    const rib = new THREE.Mesh(
+      new THREE.BoxGeometry(0.12, 2.6, 0.45),
+      new THREE.MeshStandardMaterial({ color: 0x2a0a0a, roughness: 0.7 }),
+    );
+    rib.position.set(i * 0.9, 1.4, -1.3);
+    group.add(rib);
+  }
+
+  // Roof beam
+  const roof = new THREE.Mesh(
+    new THREE.BoxGeometry(3.0, 0.18, 1.2),
+    new THREE.MeshStandardMaterial({ color: 0x202036, roughness: 0.6, metalness: 0.5 }),
+  );
+  roof.position.set(0, 2.8, -0.8);
+  group.add(roof);
+
+  // Stacked crates inside the bay
+  for (const [x, z, h] of [[-0.85, 0.4, 0.0], [0.85, 0.4, 0.0], [0, 0.6, 0.85]]) {
+    const c = new THREE.Mesh(
+      new THREE.BoxGeometry(0.85, 0.7, 0.85),
+      matCrateWood,
+    );
+    c.position.set(x, 0.55 + h, z);
+    c.rotation.y = (Math.random() - 0.5) * 0.2;
+    c.castShadow = true; c.receiveShadow = true;
+    group.add(c);
+  }
+  // Top accent light
+  const beacon = new THREE.Mesh(
+    new THREE.SphereGeometry(0.18, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xff5050 }),
+  );
+  beacon.position.set(0, 3.05, -0.8);
+  group.add(beacon);
+}
+
+function _buildAssemblyGantry(group, tint, hex) {
+  // Two pillars + horizontal beam (gantry crane)
+  for (const x of [-1.25, 1.25]) {
+    const pillar = new THREE.Mesh(
+      new THREE.BoxGeometry(0.35, 3.0, 0.35),
+      matPillar,
+    );
+    pillar.position.set(x, 1.5, 0);
+    pillar.castShadow = true;
+    group.add(pillar);
+  }
+  const beam = new THREE.Mesh(
+    new THREE.BoxGeometry(3.2, 0.3, 0.45),
+    new THREE.MeshStandardMaterial({
+      color: tint, emissive: tint, emissiveIntensity: 0.5,
+      roughness: 0.4, metalness: 0.6,
+    }),
+  );
+  beam.position.set(0, 3.0, 0);
+  beam.castShadow = true;
+  group.add(beam);
+
+  // Hanging articulated arm
+  const arm1 = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.12, 0.12, 1.0, 12),
+    new THREE.MeshStandardMaterial({ color: 0x6a6a90, metalness: 0.7, roughness: 0.4 }),
+  );
+  arm1.position.set(0.4, 2.4, 0);
+  group.add(arm1);
+
+  const arm2 = new THREE.Mesh(
+    new THREE.BoxGeometry(0.16, 0.16, 0.9),
+    new THREE.MeshStandardMaterial({ color: 0x808099, metalness: 0.7, roughness: 0.4 }),
+  );
+  arm2.position.set(0.4, 1.95, 0.4);
+  arm2.rotation.x = -0.6;
+  group.add(arm2);
+
+  const grip = new THREE.Mesh(
+    new THREE.BoxGeometry(0.32, 0.18, 0.32),
+    new THREE.MeshStandardMaterial({
+      color: tint, emissive: tint, emissiveIntensity: 0.7,
+    }),
+  );
+  grip.position.set(0.4, 1.5, 0.7);
+  group.add(grip);
+
+  // Workbench under the gantry
+  const bench = new THREE.Mesh(
+    new THREE.BoxGeometry(2.4, 0.2, 1.2),
+    new THREE.MeshStandardMaterial({ color: 0x1a1a30, roughness: 0.6, metalness: 0.5 }),
+  );
+  bench.position.set(0, 0.8, -0.4);
+  bench.castShadow = true; bench.receiveShadow = true;
+  group.add(bench);
+
+  // Spinning beacon on the beam
+  const beacon = new THREE.Mesh(
+    new THREE.SphereGeometry(0.14, 10, 8),
+    new THREE.MeshBasicMaterial({ color: 0x80b8ff }),
+  );
+  beacon.position.set(-1.2, 3.25, 0);
+  group.add(beacon);
+}
+
+function _buildQACleanRoom(group, tint, hex) {
+  // White-ish booth with translucent green windows
+  const wallMat = new THREE.MeshStandardMaterial({
+    color: 0xc8d0d8, roughness: 0.4, metalness: 0.2,
+  });
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: tint, emissive: tint, emissiveIntensity: 0.45,
+    transparent: true, opacity: 0.55, roughness: 0.1, metalness: 0.6,
+  });
+
+  // Solid back wall
+  const back = new THREE.Mesh(new THREE.BoxGeometry(3.0, 2.6, 0.18), wallMat);
+  back.position.set(0, 1.4, -1.35);
+  back.castShadow = true; back.receiveShadow = true;
+  group.add(back);
+
+  // Side walls
+  for (const x of [-1.4, 1.4]) {
+    const side = new THREE.Mesh(new THREE.BoxGeometry(0.18, 2.6, 2.6), wallMat);
+    side.position.set(x, 1.4, -0.05);
+    side.castShadow = true; side.receiveShadow = true;
+    group.add(side);
+  }
+
+  // Front glass (two panels with a gap = doorway)
+  for (const x of [-0.9, 0.9]) {
+    const glass = new THREE.Mesh(new THREE.BoxGeometry(1.0, 2.0, 0.12), glassMat);
+    glass.position.set(x, 1.2, 1.2);
+    group.add(glass);
+  }
+
+  // Roof slab
+  const roof = new THREE.Mesh(
+    new THREE.BoxGeometry(3.0, 0.18, 2.6),
+    new THREE.MeshStandardMaterial({ color: 0x15233a, roughness: 0.6 }),
+  );
+  roof.position.set(0, 2.7, -0.05);
+  roof.castShadow = true;
+  group.add(roof);
+
+  // Inspection scanner inside
+  const scanBase = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.4, 0.5, 0.4, 18),
+    new THREE.MeshStandardMaterial({ color: 0x202040, roughness: 0.5, metalness: 0.6 }),
+  );
+  scanBase.position.set(0, 0.4, -0.5);
+  group.add(scanBase);
+
+  const scanArm = new THREE.Mesh(
+    new THREE.BoxGeometry(0.12, 1.2, 0.12),
+    new THREE.MeshStandardMaterial({ color: 0x808099, metalness: 0.7 }),
+  );
+  scanArm.position.set(0, 1.2, -0.5);
+  group.add(scanArm);
+
+  const scanHead = new THREE.Mesh(
+    new THREE.BoxGeometry(0.5, 0.3, 0.5),
+    new THREE.MeshStandardMaterial({
+      color: tint, emissive: tint, emissiveIntensity: 0.9,
+    }),
+  );
+  scanHead.position.set(0, 1.95, -0.5);
+  group.add(scanHead);
+
+  // Green status beacon
+  const beacon = new THREE.Mesh(
+    new THREE.SphereGeometry(0.14, 10, 8),
+    new THREE.MeshBasicMaterial({ color: 0x44ff77 }),
+  );
+  beacon.position.set(1.2, 2.9, 1.0);
+  group.add(beacon);
+}
+
+function _buildShippingDock(group, tint, hex) {
+  // Loading dock platform
+  const platform = new THREE.Mesh(
+    new THREE.BoxGeometry(3.0, 0.8, 2.6),
+    new THREE.MeshStandardMaterial({ color: 0x2a2a3e, roughness: 0.7, metalness: 0.4 }),
+  );
+  platform.position.set(0, 0.5, -0.2);
+  platform.castShadow = true; platform.receiveShadow = true;
+  group.add(platform);
+
+  // Striped dock edge
+  const edge = new THREE.Mesh(
+    new THREE.BoxGeometry(3.05, 0.18, 0.4),
+    new THREE.MeshStandardMaterial({
+      color: tint, emissive: tint, emissiveIntensity: 0.7, roughness: 0.4,
+    }),
+  );
+  edge.position.set(0, 0.95, 1.05);
+  group.add(edge);
+
+  // Bay door (yellow rolling door)
+  const door = new THREE.Mesh(
+    new THREE.BoxGeometry(2.4, 2.2, 0.18),
+    new THREE.MeshStandardMaterial({
+      color: tint, emissive: tint, emissiveIntensity: 0.35,
+      roughness: 0.5, metalness: 0.4,
+    }),
+  );
+  door.position.set(0, 2.0, -1.3);
+  door.castShadow = true; door.receiveShadow = true;
+  group.add(door);
+
+  // Door horizontal slats
+  for (let y = 1.1; y < 3.0; y += 0.3) {
+    const slat = new THREE.Mesh(
+      new THREE.BoxGeometry(2.4, 0.06, 0.22),
+      new THREE.MeshStandardMaterial({ color: 0x4a3a10, roughness: 0.7 }),
+    );
+    slat.position.set(0, y, -1.3);
+    group.add(slat);
+  }
+
+  // Frame
+  for (const [w, h, x, y] of [
+    [0.22, 2.6, -1.3, 1.4],
+    [0.22, 2.6,  1.3, 1.4],
+    [2.8,  0.22, 0.0, 3.1],
+  ]) {
+    const f = new THREE.Mesh(
+      new THREE.BoxGeometry(w, h, 0.4),
+      new THREE.MeshStandardMaterial({ color: 0x1a1a2e, roughness: 0.6 }),
+    );
+    f.position.set(x, y, -1.3);
+    group.add(f);
+  }
+
+  // Crate ready to ship on the platform
+  const crate = new THREE.Mesh(
+    new THREE.BoxGeometry(1.0, 0.9, 1.0),
+    matCrateWood,
+  );
+  crate.position.set(-0.6, 1.35, -0.1);
+  crate.castShadow = true;
+  group.add(crate);
+
+  // Hand truck / dolly
+  const dolly = new THREE.Mesh(
+    new THREE.BoxGeometry(0.7, 0.05, 0.8),
+    new THREE.MeshStandardMaterial({ color: 0x303048, metalness: 0.7, roughness: 0.3 }),
+  );
+  dolly.position.set(0.7, 0.92, -0.3);
+  group.add(dolly);
+
+  // Yellow beacon
+  const beacon = new THREE.Mesh(
+    new THREE.SphereGeometry(0.14, 10, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffd633 }),
+  );
+  beacon.position.set(0, 3.3, -1.3);
+  group.add(beacon);
+}
+
+const _STATION_BUILDERS = {
+  Parts:    _buildPartsWarehouse,
+  Assembly: _buildAssemblyGantry,
+  QA:       _buildQACleanRoom,
+  Shipping: _buildShippingDock,
+};
+
 function syncWorkstations(world) {
   for (const ws of world.workstations ?? []) {
     if (wsMeshes.has(ws.name)) continue;
     const group = new THREE.Group();
     const tint = new THREE.Color(`rgb(${ws.color[0]},${ws.color[1]},${ws.color[2]})`);
+    const hex  = `rgb(${ws.color[0]},${ws.color[1]},${ws.color[2]})`;
 
-    // Base platform
-    const base = new THREE.Mesh(
-      new THREE.BoxGeometry(3, 0.4, 3),
-      new THREE.MeshStandardMaterial({ color: 0x12122a, roughness: 0.7, metalness: 0.4 }),
-    );
-    base.position.y = 0.2;
-    base.castShadow = true; base.receiveShadow = true;
-    group.add(base);
-
-    // Equipment block
-    const eq = new THREE.Mesh(
-      new THREE.BoxGeometry(2.4, 1.6, 2.4),
-      new THREE.MeshStandardMaterial({
-        color: tint, emissive: tint, emissiveIntensity: 0.35,
-        roughness: 0.35, metalness: 0.55,
-      }),
-    );
-    eq.position.y = 1.2;
-    eq.castShadow = true; eq.receiveShadow = true;
-    group.add(eq);
-
-    // Top accent
-    const top = new THREE.Mesh(
-      new THREE.BoxGeometry(1.4, 0.25, 1.4),
-      new THREE.MeshStandardMaterial({
-        color: tint, emissive: tint, emissiveIntensity: 1.0,
-      }),
-    );
-    top.position.y = 2.15;
-    group.add(top);
-
-    // Floating label
-    const lbl = makeLabelSprite(ws.name.toUpperCase(), `rgb(${ws.color[0]},${ws.color[1]},${ws.color[2]})`, 1.4);
-    lbl.position.set(0, 3.4, 0);
-    group.add(lbl);
+    _buildBaseAndLabel(group, ws, tint, hex);
+    const builder = _STATION_BUILDERS[ws.name];
+    if (builder) builder(group, tint, hex);
 
     const w = gridToWorld(ws.pos[0], ws.pos[1]);
     group.position.set(w.x, 0, w.z);
     scene.add(group);
     wsMeshes.set(ws.name, group);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Designated zones — colored floor patches + painted floor labels around each
+// workstation. Built once when the world data first arrives.
+// ---------------------------------------------------------------------------
+const ZONE_HALF = 4;             // 8x8 painted area (stays inside the grid)
+let _zonesBuilt = false;
+function syncDesignatedZones(world) {
+  if (_zonesBuilt) return;
+  if (!world.workstations || world.workstations.length === 0) return;
+  for (const ws of world.workstations) {
+    const c = ws.color;
+    const tint = new THREE.Color(`rgb(${c[0]},${c[1]},${c[2]})`);
+
+    // Colored zone tint on the floor.
+    const zoneGeo = new THREE.PlaneGeometry(ZONE_HALF * 2, ZONE_HALF * 2);
+    zoneGeo.rotateX(-Math.PI / 2);
+    const zoneMat = new THREE.MeshBasicMaterial({
+      color: tint, transparent: true, opacity: 0.16, depthWrite: false,
+    });
+    const zone = new THREE.Mesh(zoneGeo, zoneMat);
+    const w = gridToWorld(ws.pos[0], ws.pos[1]);
+    // Clamp the zone so it stays within the playable area.
+    const zx = Math.min(Math.max(w.x, ZONE_HALF), GRID - ZONE_HALF);
+    const zz = Math.min(Math.max(w.z, ZONE_HALF), GRID - ZONE_HALF);
+    zone.position.set(zx, 0.04, zz);
+    scene.add(zone);
+
+    // Hazard chevron border around the zone.
+    const stripeMat = new THREE.MeshBasicMaterial({
+      color: 0xffd633, transparent: true, opacity: 0.55, depthWrite: false,
+    });
+    for (const [dx, dz, sw, sd] of [
+      [0, -ZONE_HALF, ZONE_HALF * 2, 0.32],
+      [0,  ZONE_HALF, ZONE_HALF * 2, 0.32],
+      [-ZONE_HALF, 0, 0.32, ZONE_HALF * 2],
+      [ ZONE_HALF, 0, 0.32, ZONE_HALF * 2],
+    ]) {
+      const sg = new THREE.PlaneGeometry(sw, sd);
+      sg.rotateX(-Math.PI / 2);
+      const s = new THREE.Mesh(sg, stripeMat);
+      s.position.set(zx + dx, 0.05, zz + dz);
+      scene.add(s);
+    }
+
+    // Floor label, offset toward the interior so it's visible from above.
+    const interiorOffsetX = (zx > GRID / 2 ? -1 : 1) * (ZONE_HALF - 1.6);
+    const interiorOffsetZ = (zz > GRID / 2 ? -1 : 1) * (ZONE_HALF - 1.6);
+    const lbl = makeFloorLabel(ws.name.toUpperCase(),
+      `rgb(${c[0]},${c[1]},${c[2]})`, 5.5);
+    lbl.position.set(zx + interiorOffsetX, 0.07, zz + interiorOffsetZ);
+    scene.add(lbl);
+  }
+  _zonesBuilt = true;
+}
+
+// ---------------------------------------------------------------------------
+// Charging / dispatch area — sits over the spawn cells in the middle of the
+// floor. Built once when spawn_positions first arrive.
+// ---------------------------------------------------------------------------
+let _chargingBuilt = false;
+function syncChargingArea(world) {
+  if (_chargingBuilt) return;
+  const spawns = world.spawn_positions ?? [];
+  if (spawns.length === 0) return;
+
+  // Compute bounding box around the spawn block.
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const sp of spawns) {
+    minX = Math.min(minX, sp[0]);
+    maxX = Math.max(maxX, sp[0]);
+    minZ = Math.min(minZ, sp[1]);
+    maxZ = Math.max(maxZ, sp[1]);
+  }
+  const cx = (minX + maxX) / 2 + 0.5;
+  const cz = (minZ + maxZ) / 2 + 0.5;
+  const w  = (maxX - minX) + 4;
+  const h  = (maxZ - minZ) + 4;
+
+  // Floor patch
+  const patchGeo = new THREE.PlaneGeometry(w, h);
+  patchGeo.rotateX(-Math.PI / 2);
+  const patch = new THREE.Mesh(patchGeo, new THREE.MeshBasicMaterial({
+    color: 0x00d4ff, transparent: true, opacity: 0.10, depthWrite: false,
+  }));
+  patch.position.set(cx, 0.04, cz);
+  scene.add(patch);
+
+  // Hazard stripe border
+  const stripeMat = new THREE.MeshBasicMaterial({
+    color: 0x00d4ff, transparent: true, opacity: 0.45, depthWrite: false,
+  });
+  for (const [dx, dz, sw, sd] of [
+    [0, -h / 2, w, 0.26],
+    [0,  h / 2, w, 0.26],
+    [-w / 2, 0, 0.26, h],
+    [ w / 2, 0, 0.26, h],
+  ]) {
+    const sg = new THREE.PlaneGeometry(sw, sd);
+    sg.rotateX(-Math.PI / 2);
+    const s = new THREE.Mesh(sg, stripeMat);
+    s.position.set(cx + dx, 0.05, cz + dz);
+    scene.add(s);
+  }
+
+  // Floor label
+  const lbl = makeFloorLabel("CHARGING / DISPATCH", "#9bf0ff", 7.0);
+  lbl.position.set(cx, 0.07, cz - h / 2 - 0.2);
+  scene.add(lbl);
+
+  // Charging dock posts at each spawn cell.
+  for (const sp of spawns) {
+    const wp = gridToWorld(sp[0], sp[1]);
+    const dock = new THREE.Group();
+    const post = new THREE.Mesh(
+      new THREE.BoxGeometry(0.32, 0.7, 0.32),
+      matCharger,
+    );
+    post.position.y = 0.35;
+    post.castShadow = true;
+    dock.add(post);
+    const cap = new THREE.Mesh(
+      new THREE.BoxGeometry(0.4, 0.05, 0.4),
+      matChargerCap,
+    );
+    cap.position.y = 0.72;
+    dock.add(cap);
+    // Position next to the spawn cell so it doesn't clip the robot.
+    dock.position.set(wp.x - 0.45, 0, wp.z - 0.45);
+    scene.add(dock);
+  }
+  _chargingBuilt = true;
 }
 
 function syncRobots(world) {
@@ -533,6 +1456,22 @@ function updateHUD(world, info) {
   document.getElementById("s-avg").textContent       =
     stats.avg_route_time != null ? `avg ${stats.avg_route_time.toFixed(1)}s` : "";
 
+  const queue = (world.task_queue || []).length;
+  const queuedTotal = stats.queued_total ?? 0;
+  document.getElementById("s-queue").textContent = queue;
+  document.getElementById("s-queue-total").textContent =
+    queuedTotal > 0 ? `${queuedTotal} requested` : "";
+
+  const claw = (info && info.nemoclaw) || null;
+  if (claw) {
+    document.getElementById("s-claw").textContent = `${claw.allow}/${claw.deny}`;
+    document.getElementById("s-claw-mode").textContent =
+      (claw.enforce ? "ENFORCE" : "log-only") + " · " + (claw.policy || "");
+  } else {
+    document.getElementById("s-claw").textContent = "--";
+    document.getElementById("s-claw-mode").textContent = "inactive";
+  }
+
   const speed = world.speed_multiplier ?? 1;
   document.getElementById("btn-speed").textContent = `SPEED ${speed}x →`;
 
@@ -602,6 +1541,8 @@ async function pollState() {
     const world = data.world ?? {};
     syncWalls(world);
     syncWorkstations(world);
+    syncDesignatedZones(world);
+    syncChargingArea(world);
     syncRobots(world);
     syncTasks(world);
     syncPaths(world);

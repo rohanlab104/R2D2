@@ -40,6 +40,8 @@ import sys
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from . import nemoclaw
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -150,19 +152,35 @@ def describe_endpoints() -> str:
 # Core call
 # ---------------------------------------------------------------------------
 
+def _nemoclaw_gate(client: OpenAI, *, actor: str) -> None:
+    """Run NemoClaw's network policy on the active client base URL."""
+    engine = nemoclaw.get_engine()
+    if engine is None:
+        return
+    base_url = str(getattr(client, "base_url", "") or "")
+    if not base_url:
+        return
+    decision = engine.check_network(base_url, actor=actor)
+    engine.enforce_decision(decision)
+
+
 def ask_nemotron(
     prompt: str,
     model: str,
     max_tokens: int = 512,
     *,
     client: OpenAI | None = None,
+    nemoclaw_actor: str = "system",
 ) -> str:
     """Send a single-turn prompt to the specified Nemotron model.
 
     Returns the raw text content of the first choice. Raises on HTTP errors
-    so callers can decide whether to fall back.
+    so callers can decide whether to fall back. When the NemoClaw policy
+    engine is active and ``NEMOCLAW_ENFORCE`` is on, requests to denied
+    hosts raise :class:`nemoclaw.PolicyDenied` *before* any HTTP traffic.
     """
     active = client or _leader_client
+    _nemoclaw_gate(active, actor=nemoclaw_actor)
     response = active.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -183,6 +201,7 @@ def ask_leader(prompt: str) -> str:
         model=LEADER_MODEL,
         max_tokens=256,
         client=_leader_client,
+        nemoclaw_actor="leader",
     )
 
 
@@ -193,6 +212,7 @@ def ask_worker(prompt: str) -> str:
         model=WORKER_MODEL,
         max_tokens=256,
         client=_worker_client,
+        nemoclaw_actor="worker",
     )
 
 
@@ -203,6 +223,7 @@ def ask_task_interpreter(prompt: str) -> str:
         model=TASK_INTERPRETER_MODEL,
         max_tokens=384,
         client=_leader_client,
+        nemoclaw_actor="leader",
     )
 
 
@@ -213,6 +234,7 @@ def ask_strategist(prompt: str) -> str:
         model=STRATEGIST_MODEL,
         max_tokens=512,
         client=_strategist_client,
+        nemoclaw_actor="strategist",
     )
 
 

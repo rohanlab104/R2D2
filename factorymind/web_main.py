@@ -24,6 +24,7 @@ load_dotenv()
 # so no window or video driver is required.
 from factorymind import main as M
 from factorymind import memory as MEM
+from factorymind import nemoclaw
 from factorymind import web_server
 from factorymind.agents import (
     Blackboard,
@@ -139,9 +140,12 @@ def run() -> None:
 
     world_state = M._reset_demo_state(layout, speed_multiplier, "online")
     blackboard = Blackboard()
+    engine = nemoclaw.activate(blackboard=blackboard, world_state=world_state)
+    blackboard.post(-1, "POLICY", f"OpenClaw runtime active: {engine.describe()}")
     blackboard.post(
         -1, "STRATEGY",
-        "FactoryMind 3D ready — type a delivery like 'take Parts to QA' to begin.",
+        "FactoryMind 3D ready — type 'do 100 deliveries' for an autonomous fleet run, "
+        "or 'take Parts to QA' for a single task.",
     )
     M._sim_started = False
     manual_control = False
@@ -218,9 +222,11 @@ def run() -> None:
                         OPEN_FLOOR, speed_multiplier, world_state["connection_status"]
                     )
                     blackboard.clear()
+                    nemoclaw.activate(blackboard=blackboard, world_state=world_state)
                     blackboard.post(
                         -1, "STRATEGY",
-                        "Simulation reset — type a delivery like 'take Parts to QA' to begin.",
+                        "Simulation reset — type 'do 100 deliveries' for a fleet run "
+                        "or 'take Parts to QA' for a single task.",
                     )
                     M._sim_started = False
                     manual_control = False
@@ -302,11 +308,19 @@ def run() -> None:
                         )
                         timers["last_strategist_tick"] = now
 
+                # Autonomous fleet dispatcher — drains queued tasks one at a
+                # time onto whichever worker is closest and free. Each
+                # delegation is gated by NemoClaw (see _fleet_dispatch_step).
+                if world_state.get("task_queue"):
+                    M._fleet_dispatch_step(world_state, blackboard)
+
                 if now - timers["last_move_tick"] >= M.MOVE_TICK_INTERVAL:
                     move_steps = min(int((now - timers["last_move_tick"]) // M.MOVE_TICK_INTERVAL), 4)
                     for _ in range(max(1, move_steps)):
                         M._advance_robots_coordinated(world_state, blackboard)
                     timers["last_move_tick"] += max(1, move_steps) * M.MOVE_TICK_INTERVAL
+                    if world_state.get("task_queue"):
+                        M._fleet_dispatch_step(world_state, blackboard)
 
                 world_state["stats"]["elapsed"] = round(sim_elapsed, 1)
                 completed = world_state["stats"]["completed"]
@@ -354,6 +368,11 @@ def _build_info(manual_control: bool) -> dict:
             info["circuit"] = inference.circuit_status()
     except Exception as exc:
         info["endpoints"] = f"(unavailable: {exc})"
+
+    engine = nemoclaw.get_engine()
+    if engine is not None:
+        info["nemoclaw"] = engine.stats_snapshot()
+        info["nemoclaw"]["describe"] = engine.describe()
     return info
 
 

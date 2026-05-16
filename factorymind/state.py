@@ -14,6 +14,8 @@ INTENT = "INTENT"
 BOTTLENECK = "BOTTLENECK"
 STRATEGY = "STRATEGY"
 COMPLETE = "COMPLETE"
+# NemoClaw / OpenClaw runtime policy events (allow/deny + agent decisions).
+POLICY = "POLICY"
 
 # ---------------------------------------------------------------------------
 # Robot roles
@@ -130,12 +132,28 @@ def create_initial_state(
     return {
         "robots": robots,
         "tasks": [],
+        # NEW: pending tasks the leader has not yet delegated. Populated by
+        # natural-language "do 100 deliveries" requests; drained by the
+        # fleet dispatcher in main.py / web_main.py one-by-one as workers
+        # become idle.
+        "task_queue": [],
         "workstations": _make_workstations(layout),
         "blackboard": [],
         "layout": layout,
         "wall": _make_wall(layout),
-        "stats": {"completed": 0, "elapsed": 0.0, "rate": 0.0},
+        "stats": {
+            "completed": 0,
+            "elapsed": 0.0,
+            "rate": 0.0,
+            # Total work the user requested in this run (queued + done).
+            "queued_total": 0,
+            # NemoClaw runtime accounting.
+            "policy_allowed": 0,
+            "policy_denied": 0,
+        },
         "connection_status": "online",
+        # When True the leader is the OpenClaw-style autonomous fleet manager.
+        "fleet_mode": False,
         "tick": 0,
     }
 
