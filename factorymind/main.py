@@ -21,11 +21,14 @@ from factorymind.agents import Blackboard
 from factorymind.state import GRID_HEIGHT, GRID_WIDTH, OPEN_FLOOR
 
 FPS = 60
-MOVE_TICK_INTERVAL = 0.055
+MOVE_TICK_INTERVAL = 0.18
 LEADER_TICK_INTERVAL = 1.25
 FACTORY_TICK_INTERVAL = 0.05
-CONVEYOR_SPEED = 1.35
+CONVEYOR_SPEED = 0.45
+MAX_FACTORY_BACKLOG = 4
+MAX_CONVEYOR_PACKAGES = 2
 SPEED_OPTIONS = (1, 2, 4)
+TRAFFIC_REPLAN_TICKS = 8
 
 _decision_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="openclaw")
 _pending_leader: Future | None = None
@@ -220,11 +223,6 @@ def _make_package(world_state: dict, factory: dict) -> dict:
 
 def _update_factories(world_state: dict, dt: float, elapsed: float, blackboard: Blackboard) -> None:
     for factory in world_state.get("factories", []):
-        factory["produce_timer"] = float(factory.get("produce_timer", 0.0)) - dt
-        while factory["produce_timer"] <= 0.0:
-            package = _make_package(world_state, factory)
-            factory.setdefault("conveyor", []).append(package)
-            factory["produce_timer"] += float(factory.get("produce_every", 2.4))
         remaining = []
         for package in factory.get("conveyor", []):
             package["progress"] = float(package.get("progress", 0.0)) + CONVEYOR_SPEED * dt
@@ -235,6 +233,20 @@ def _update_factories(world_state: dict, dt: float, elapsed: float, blackboard: 
             else:
                 remaining.append(package)
         factory["conveyor"] = remaining
+        backlog = len(factory.get("conveyor", [])) + len(factory.get("pad_packages", []))
+        if backlog >= MAX_FACTORY_BACKLOG or len(factory.get("conveyor", [])) >= MAX_CONVEYOR_PACKAGES:
+            factory["produce_timer"] = max(float(factory.get("produce_timer", 0.0)), 0.65)
+            continue
+        factory["produce_timer"] = float(factory.get("produce_timer", 0.0)) - dt
+        while (
+            factory["produce_timer"] <= 0.0
+            and backlog < MAX_FACTORY_BACKLOG
+            and len(factory.get("conveyor", [])) < MAX_CONVEYOR_PACKAGES
+        ):
+            package = _make_package(world_state, factory)
+            factory.setdefault("conveyor", []).append(package)
+            backlog += 1
+            factory["produce_timer"] += float(factory.get("produce_every", 6.5))
 
     if int(elapsed * 2) % 6 == 0 and world_state.get("_last_observe_bucket") != int(elapsed * 2):
         world_state["_last_observe_bucket"] = int(elapsed * 2)
@@ -270,13 +282,18 @@ def _leader_plan_prompt(world_state: dict) -> str:
         {"id": b["id"], "name": b["name"], "color": b["color"], "pos": b["pos"]}
         for b in world_state.get("dropboxes", [])
     ]
-    return f"""You are the FactoryMind leader running inside OpenClaw.
+    policy_status = world_state.get("policy_status", "unknown")
+    return f"""You are the FactoryMind leader running inside OpenClaw/NemoClaw.
 Observe the entire floor and assign idle workers to packages waiting on conveyor pads.
 
-Policy:
+NemoClaw guardrails are active: policy_status={policy_status}.
 - You may post directives to workers.
 - You cannot directly move workers or modify factories.
 - Workers can pick up only from conveyor pads and drop only at matching-color drop boxes.
+- Use only idle workers.
+- Assign each worker and each package at most once.
+- Prefer the nearest reachable same-color drop box; the runtime will deny unsafe directives.
+- Do not assign disabled, busy, carrying, unreachable, or mismatched-color routes.
 
 Factories: {factories}
 Workers: {workers}
@@ -323,6 +340,7 @@ def _validate_llm_assignments(world_state: dict, proposed: object) -> list[dict]
     factory_ids = {f["id"] for f in world_state.get("factories", [])}
     assignments = []
     used_workers: set[int] = set()
+    used_packages: set[int] = set()
     for item in proposed:
         if not isinstance(item, dict):
             continue
@@ -338,7 +356,9 @@ def _validate_llm_assignments(world_state: dict, proposed: object) -> list[dict]
             factory["drop_pad"],
             {tuple(c) for c in world_state.get("wall", [])},
         ) if factory else None
-        if not factory or not package or not dropbox:
+        if not factory or not package or package["id"] in used_packages or not dropbox:
+            continue
+        if not _nemoclaw_allows_leader_assignment(world_state, _worker_by_id(world_state, worker_id), factory, package, dropbox, "llm_validate"):
             continue
         assignments.append({
             "worker_id": worker_id,
@@ -348,6 +368,7 @@ def _validate_llm_assignments(world_state: dict, proposed: object) -> list[dict]
             "reason": str(item.get("reason") or "LLM selected this worker/package pair."),
         })
         used_workers.add(worker_id)
+        used_packages.add(package["id"])
     return assignments
 
 
@@ -441,6 +462,8 @@ def _assign_worker_to_package(world_state: dict, assignment: dict,
         dropbox = best_dropbox
     if not dropbox:
         return False
+    if not _nemoclaw_allows_leader_assignment(world_state, worker, factory, package, dropbox, "post_directive"):
+        return False
     path = a_star(worker["pos"], factory["drop_pad"], wall_set)
     if worker["pos"] != factory["drop_pad"] and not path:
         _thought(world_state, S.WARNING, "Leader", f"{worker['name']} cannot reach {factory['name']} pad.", elapsed, blackboard)
@@ -494,7 +517,24 @@ def _move_workers(world_state: dict, elapsed: float, blackboard: Blackboard) -> 
             continue
         blocker_id = occupied.get(tuple(next_pos))
         if blocker_id is not None and blocker_id != worker["id"]:
+            worker["traffic_wait_ticks"] = int(worker.get("traffic_wait_ticks", 0)) + 1
+            worker["blocked_by_worker_id"] = blocker_id
+            if worker["traffic_wait_ticks"] >= TRAFFIC_REPLAN_TICKS:
+                worker["traffic_wait_ticks"] = 0
+                blockers = _dynamic_blockers(world_state, worker)
+                if _replan_worker(world_state, worker, elapsed, blackboard, blockers):
+                    _thought(
+                        world_state,
+                        S.RETHINK,
+                        worker["name"],
+                        f"Traffic conflict with Worker-{blocker_id}; rerouting around occupied cells.",
+                        elapsed,
+                        blackboard,
+                    )
+                    _policy_log(world_state, worker["name"], "reroute_traffic", True, f"blocked by Worker-{blocker_id}")
             continue
+        worker["traffic_wait_ticks"] = 0
+        worker["blocked_by_worker_id"] = None
         old_pos = tuple(worker["pos"])
         new_pos = tuple(worker["path"].pop(0))
         worker["pos"] = [new_pos[0], new_pos[1]]
@@ -503,8 +543,23 @@ def _move_workers(world_state: dict, elapsed: float, blackboard: Blackboard) -> 
         _worker_transition(world_state, worker, elapsed, blackboard)
 
 
-def _replan_worker(world_state: dict, worker: dict, elapsed: float, blackboard: Blackboard) -> None:
-    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+def _dynamic_blockers(world_state: dict, worker: dict) -> set[tuple[int, int]]:
+    return {
+        tuple(other["pos"])
+        for other in world_state.get("workers", [])
+        if other.get("id") != worker.get("id") and other.get("status") != "disabled"
+    }
+
+
+def _replan_worker(
+    world_state: dict,
+    worker: dict,
+    elapsed: float,
+    blackboard: Blackboard,
+    dynamic_blockers: set[tuple[int, int]] | None = None,
+) -> bool:
+    base_wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    wall_set = base_wall_set | (dynamic_blockers or set())
     target: list[int] | None = None
     if worker.get("status") == "to_pickup":
         factory = _factory_by_id(world_state, worker.get("target_factory_id"))
@@ -516,11 +571,16 @@ def _replan_worker(world_state: dict, worker: dict, elapsed: float, blackboard: 
     if target:
         worker["path"] = a_star(worker["pos"], target, wall_set)
         if worker["pos"] == target or worker["path"]:
-            return
+            return True
+        if dynamic_blockers:
+            worker["path"] = a_star(worker["pos"], target, base_wall_set)
+            if worker["pos"] == target or worker["path"]:
+                _thought(world_state, S.WARNING, worker["name"], "Traffic route boxed in; waiting for aisle to clear.", elapsed, blackboard)
+                return False
 
     if worker.get("carrying"):
         _thought(world_state, S.WARNING, worker["name"], "Route blocked while carrying; holding package.", elapsed, blackboard)
-        return
+        return False
 
     factory = _factory_by_id(world_state, worker.get("target_factory_id"))
     if factory:
@@ -536,6 +596,7 @@ def _replan_worker(world_state: dict, worker: dict, elapsed: float, blackboard: 
     worker["target_dropbox_id"] = None
     worker["status"] = "idle"
     _thought(world_state, S.WARNING, worker["name"], "Route blocked; assignment released.", elapsed, blackboard)
+    return False
 
 
 def _worker_transition(world_state: dict, worker: dict, elapsed: float, blackboard: Blackboard) -> None:
@@ -681,6 +742,45 @@ def _nearest_dropbox_for_color(
 
 def _first_unreserved_package(factory: dict) -> dict | None:
     return next((p for p in factory.get("pad_packages", []) if p.get("reserved_by") is None), None)
+
+
+def _nemoclaw_allows_leader_assignment(
+    world_state: dict,
+    worker: dict | None,
+    factory: dict | None,
+    package: dict | None,
+    dropbox: dict | None,
+    action: str,
+) -> bool:
+    def deny(detail: str) -> bool:
+        _policy_log(world_state, "NemoClaw", action, False, detail)
+        return False
+
+    if not world_state.get("policy_loaded"):
+        _policy_log(world_state, "NemoClaw", action, True, "policy file missing; runtime safety checks still enforced")
+    if not worker or not factory or not package or not dropbox:
+        return deny("directive references missing worker, factory, package, or dropbox")
+    if worker.get("status") != "idle" or worker.get("path") or worker.get("carrying"):
+        return deny(f"{worker.get('name', 'worker')} is not idle")
+    if package.get("reserved_by") not in (None, worker.get("id")):
+        return deny(f"package {package.get('id')} is already reserved")
+    if package not in factory.get("pad_packages", []):
+        return deny(f"package {package.get('id')} is not waiting on {factory.get('name')} pad")
+    if package.get("color") != dropbox.get("color"):
+        return deny(f"package color {package.get('color')} cannot go to {dropbox.get('name')} color {dropbox.get('color')}")
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    if worker.get("pos") != factory.get("drop_pad") and _route_len(worker["pos"], factory["drop_pad"], wall_set) >= 10**6:
+        return deny(f"{worker.get('name')} cannot reach {factory.get('name')} pickup pad")
+    if factory.get("drop_pad") != dropbox.get("pos") and _route_len(factory["drop_pad"], dropbox["pos"], wall_set) >= 10**6:
+        return deny(f"{dropbox.get('name')} is unreachable from {factory.get('name')} pickup pad")
+    _policy_log(
+        world_state,
+        "NemoClaw",
+        action,
+        True,
+        f"{worker.get('name')} may move package {package.get('id')} {package.get('color')} -> {dropbox.get('name')}",
+    )
+    return True
 
 
 def _cell_occupied_by_asset(world_state: dict, cell: list[int]) -> bool:

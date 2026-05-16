@@ -80,3 +80,23 @@ def test_builder_stores_rotated_dropbox() -> None:
     )
 
     assert math.isclose(world_state["dropboxes"][-1]["rotation_y"], math.pi / 2)
+
+
+def test_worker_replans_around_traffic_blocker() -> None:
+    world_state = create_initial_state()
+    blackboard = Blackboard()
+    worker = world_state["workers"][0]
+    blocker = world_state["workers"][1]
+
+    worker["pos"] = [10, 10]
+    worker["status"] = "to_dropbox"
+    worker["target_dropbox_id"] = world_state["dropboxes"][0]["id"]
+    worker["path"] = [[11, 10], [12, 10]]
+    blocker["pos"] = [11, 10]
+
+    for step in range(8):
+        _move_workers(world_state, float(step), blackboard)
+
+    assert worker["path"]
+    assert worker["path"][0] != [11, 10]
+    assert any("rerouting around occupied cells" in event["content"] for event in world_state["thought_log"])

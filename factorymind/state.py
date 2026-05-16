@@ -110,8 +110,8 @@ def make_factory(
         "belt_length": belt_length,
         "belt_start": belt_start,
         "drop_pad": drop_pad,
-        "produce_every": 2.4,
-        "produce_timer": 0.8 + (factory_id * 0.55),
+        "produce_every": 6.5,
+        "produce_timer": 1.4 + (factory_id * 1.35),
         "conveyor": [],
         "pad_packages": [],
     }

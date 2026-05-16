@@ -236,7 +236,7 @@ addChargingPads();
 
 const factories = new Map(), dropboxes = new Map(), workers = new Map(), packages = new Map(), walls = new Map();
 const workerVisual = new Map();
-let pathLines = [], latestWorld = {};
+let pathLines = [], latestWorld = {}, leaderTower = null;
 let buildMode = "camera";
 let activeTab = "ops";
 const buildRotation = { dropbox: 0 };
@@ -295,6 +295,40 @@ function makeShelfObstacle() {
     crate.position.set(level % 2 ? -0.18 : 0.18, shelf.position.y + 0.15, level % 2 ? 0.14 : -0.16);
     crate.castShadow = true; group.add(crate);
   }
+  return group;
+}
+
+function makeLeaderTower() {
+  const group = new THREE.Group();
+  const steel = new THREE.MeshStandardMaterial({ color: 0x4a5662, roughness: 0.44, metalness: 0.62 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x111820, roughness: 0.68, metalness: 0.2 });
+  const glass = new THREE.MeshStandardMaterial({ color: 0x16323a, emissive: 0x6de7ff, emissiveIntensity: 0.16, roughness: 0.22, metalness: 0.18, transparent: true, opacity: 0.74 });
+  const base = new THREE.Mesh(new THREE.BoxGeometry(3.2, 0.18, 3.2), dark);
+  base.position.set(0, 0.09, 0); base.castShadow = true; group.add(base);
+  for (const x of [-1.25, 1.25]) {
+    for (const z of [-1.25, 1.25]) {
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.055, 4.2, 12), steel);
+      leg.position.set(x, 2.15, z); leg.castShadow = true; group.add(leg);
+    }
+  }
+  for (let y = 0.9; y < 4.0; y += 0.72) {
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.06, 2.8), steel);
+    deck.position.set(0, y, 0); deck.castShadow = true; group.add(deck);
+  }
+  const cabin = new THREE.Mesh(new THREE.BoxGeometry(2.25, 1.1, 1.75), glass);
+  cabin.position.set(0, 4.25, 0); cabin.castShadow = true; group.add(cabin);
+  const roof = new THREE.Mesh(new THREE.BoxGeometry(2.55, 0.14, 2.05), steel);
+  roof.position.set(0, 4.9, 0); roof.castShadow = true; group.add(roof);
+  const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 1.2, 10), steel);
+  antenna.position.set(0.82, 5.55, -0.55); group.add(antenna);
+  const dish = new THREE.Mesh(new THREE.SphereGeometry(0.22, 18, 10), new THREE.MeshStandardMaterial({ color: 0x6de7ff, emissive: 0x6de7ff, emissiveIntensity: 0.45 }));
+  dish.position.set(0.82, 6.15, -0.55); group.add(dish); group.userData.dish = dish;
+  const beam = new THREE.Mesh(new THREE.ConeGeometry(0.95, 5.8, 32, 1, true), new THREE.MeshBasicMaterial({ color: 0x6de7ff, transparent: true, opacity: 0.08, depthWrite: false }));
+  beam.rotation.x = Math.PI;
+  beam.position.set(0, 1.85, 0);
+  group.add(beam); group.userData.beam = beam;
+  const label = makeLabel("LEADER", "#9fefff");
+  label.position.set(0, 6.35, 0); group.add(label);
   return group;
 }
 
@@ -510,9 +544,23 @@ function syncPaths(world) {
   }
 }
 
+function syncLeader(world) {
+  const leader = world.leader || {};
+  if (!leaderTower) {
+    leaderTower = makeLeaderTower();
+    scene.add(leaderTower);
+  }
+  const p = worldPos(leader.pos || [25, 47]);
+  leaderTower.position.set(p.x, 0, p.z);
+  leaderTower.rotation.y = -Math.PI / 5;
+  const thinking = Boolean(world.leader_thinking || leader.thinking);
+  leaderTower.userData.dish.material.emissiveIntensity = thinking ? 1.0 : 0.45;
+  leaderTower.userData.beam.material.opacity = thinking ? 0.16 : 0.08;
+}
+
 function syncScene(world) {
   latestWorld = world;
-  syncWalls(world); syncFactories(world); syncDropboxes(world); syncWorkers(world); syncPackages(world); syncPaths(world);
+  syncWalls(world); syncFactories(world); syncDropboxes(world); syncWorkers(world); syncPackages(world); syncLeader(world); syncPaths(world);
 }
 
 function fmtTime(v) {
@@ -754,6 +802,10 @@ function animate() {
       const next = worldPos(w.path[0]);
       group.rotation.y = Math.atan2(next.x - v.x, next.z - v.z);
     }
+  }
+  if (leaderTower) {
+    const pulse = 1 + Math.sin(clock.elapsedTime * 2.6) * 0.08;
+    leaderTower.userData.dish.scale.setScalar(pulse);
   }
   controls.update();
   renderer.render(scene, camera);
