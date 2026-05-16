@@ -339,7 +339,7 @@ let activeTab = "ops";
 let uploadedLayout = null;
 let uploadedValidation = null;
 let scenarios = [];
-const buildRotation = { dropbox: 0 };
+const buildRotation = { dropbox: 0, factory: 0 };
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 const pickPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -352,6 +352,58 @@ const preview = new THREE.Mesh(
 preview.position.y = 0.09;
 preview.visible = false;
 scene.add(preview);
+
+function makeOutlinePart(w, h, d, x, y, z, lineMat, fillMat) {
+  const part = new THREE.Group();
+  const geom = new THREE.BoxGeometry(w, h, d);
+  const fill = new THREE.Mesh(geom, fillMat);
+  fill.position.set(x, y, z);
+  part.add(fill);
+  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geom), lineMat);
+  edges.position.set(x, y, z);
+  part.add(edges);
+  return part;
+}
+function makeFactoryOutline() {
+  const group = new THREE.Group();
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x6de7ff, transparent: true, opacity: 0.95, depthWrite: false });
+  const fillMat = new THREE.MeshBasicMaterial({ color: 0x6de7ff, transparent: true, opacity: 0.18, depthWrite: false });
+  group.userData.line = lineMat;
+  group.userData.fill = fillMat;
+  group.add(makeOutlinePart(3.2, 1.45, 2.7, 1.6, 0.72, 1.35, lineMat, fillMat));
+  group.add(makeOutlinePart(5.0, 0.16, 0.98, 5.5, 0.18, 1.5, lineMat, fillMat));
+  group.add(makeOutlinePart(1.1, 0.08, 1.1, 8.0, 0.10, 1.5, lineMat, fillMat));
+  return group;
+}
+function makeDropboxOutline() {
+  const group = new THREE.Group();
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x6de7ff, transparent: true, opacity: 0.95, depthWrite: false });
+  const fillMat = new THREE.MeshBasicMaterial({ color: 0x6de7ff, transparent: true, opacity: 0.18, depthWrite: false });
+  group.userData.line = lineMat;
+  group.userData.fill = fillMat;
+  group.add(makeOutlinePart(3.0, 0.12, 2.2, 1.5, 0.06, 1.1, lineMat, fillMat));
+  group.add(makeOutlinePart(3.0, 0.9, 0.16, 1.5, 0.52, 2.1, lineMat, fillMat));
+  group.add(makeOutlinePart(0.16, 0.9, 2.2, 0.08, 0.52, 1.1, lineMat, fillMat));
+  group.add(makeOutlinePart(0.16, 0.9, 2.2, 2.92, 0.52, 1.1, lineMat, fillMat));
+  return group;
+}
+function tintOutline(outline, color, ok) {
+  outline.userData.line.color.setHex(color);
+  outline.userData.line.opacity = ok ? 0.95 : 0.4;
+  outline.userData.fill.color.setHex(color);
+  outline.userData.fill.opacity = ok ? 0.18 : 0.07;
+}
+const factoryOutline = makeFactoryOutline();
+factoryOutline.visible = false;
+scene.add(factoryOutline);
+const dropboxOutline = makeDropboxOutline();
+dropboxOutline.visible = false;
+scene.add(dropboxOutline);
+function hidePreviews() {
+  preview.visible = false;
+  factoryOutline.visible = false;
+  dropboxOutline.visible = false;
+}
 
 function addRack(x, z) {
   const group = new THREE.Group();
@@ -881,8 +933,7 @@ async function sendAction(payload) {
 function setBuildMode(mode) {
   buildMode = mode;
   controls.enabled = mode === "camera";
-  preview.visible = false;
-  preview.rotation.y = rotationForMode(mode);
+  hidePreviews();
   document.getElementById("build-shelf").classList.toggle("active", mode === "shelf");
   document.getElementById("build-conveyor").classList.toggle("active", mode === "factory");
   document.getElementById("build-dropbox").classList.toggle("active", mode === "dropbox");
@@ -891,15 +942,17 @@ function setBuildMode(mode) {
   document.getElementById("camera-mode").classList.toggle("active", mode === "camera");
   document.getElementById("build-status").textContent = mode === "dropbox"
     ? `DROP BOX ${rotationLabel(buildRotation.dropbox)}`
-    : mode.replace("_", " ").toUpperCase();
+    : mode === "factory"
+      ? `CONVEYOR ${rotationLabel(buildRotation.factory)}`
+      : mode.replace("_", " ").toUpperCase();
   const hint = mode === "shelf"
     ? "Build mode · click or drag to paint shelves · right-drag removes shelf cells"
     : mode === "remove"
       ? "Build mode · click a shelf, worker, factory, or drop box to remove it"
       : mode === "factory"
-        ? "Build mode · click an open area to add a conveyor intake for the selected type"
+        ? "Build mode · press R to rotate conveyor 45deg on Y axis · click to place"
         : mode === "dropbox"
-          ? "Build mode · press R to rotate drop box on Y axis · click to place"
+          ? "Build mode · press R to rotate drop box 45deg on Y axis · click to place"
           : mode === "worker"
             ? "Build mode · click an open floor cell to add a robot"
             : "Drag rotate · scroll zoom · right drag pan";
@@ -947,14 +1000,18 @@ function buildColor() {
   return document.getElementById("build-color").value || "Red";
 }
 function rotationForMode(mode) {
-  return mode === "dropbox" ? buildRotation.dropbox : 0;
+  if (mode === "dropbox") return buildRotation.dropbox;
+  if (mode === "factory") return buildRotation.factory;
+  return 0;
 }
 function rotationLabel(value) {
   return `${Math.round((value * 180 / Math.PI) % 360)}deg`;
 }
 function rotateActiveBuildAsset() {
-  if (buildMode !== "dropbox") return;
-  buildRotation.dropbox = (buildRotation.dropbox + Math.PI / 2) % (Math.PI * 2);
+  if (buildMode !== "dropbox" && buildMode !== "factory") return;
+  // Negative Y rotation in Three.js right-handed = clockwise when viewed from above.
+  const step = -Math.PI / 4;
+  buildRotation[buildMode] = (buildRotation[buildMode] + step + Math.PI * 2) % (Math.PI * 2);
   setBuildMode(buildMode);
 }
 function footprintSize(mode) {
@@ -971,15 +1028,36 @@ function footprintForMode(mode, cell) {
   return { x: cell[0] + 0.5, z: cell[1] + 0.5, sx: 1, sz: 1, color: mode === "worker" ? 0x56d986 : mode === "remove" ? 0xe06363 : 0x6de7ff };
 }
 function updatePreview(event) {
-  if (buildMode === "camera") { preview.visible = false; return; }
+  if (buildMode === "camera") { hidePreviews(); return; }
   const cell = eventToCell(event);
-  if (!cell) { preview.visible = false; return; }
+  if (!cell) { hidePreviews(); return; }
+  const ok = canPlace(buildMode, cell) || buildMode === "remove";
+  if (buildMode === "factory") {
+    preview.visible = false;
+    dropboxOutline.visible = false;
+    factoryOutline.visible = true;
+    factoryOutline.position.set(cell[0], 0, cell[1]);
+    factoryOutline.rotation.y = buildRotation.factory;
+    tintOutline(factoryOutline, colorFallback[buildColor()] || 0x6de7ff, ok);
+    return;
+  }
+  if (buildMode === "dropbox") {
+    preview.visible = false;
+    factoryOutline.visible = false;
+    dropboxOutline.visible = true;
+    dropboxOutline.position.set(cell[0], 0, cell[1]);
+    dropboxOutline.rotation.y = buildRotation.dropbox;
+    tintOutline(dropboxOutline, colorFallback[buildColor()] || 0x6de7ff, ok);
+    return;
+  }
+  factoryOutline.visible = false;
+  dropboxOutline.visible = false;
   const fp = footprintForMode(buildMode, cell);
   preview.position.set(fp.x, 0.09, fp.z);
   preview.scale.set(fp.sx, 1, fp.sz);
-  preview.rotation.y = rotationForMode(buildMode);
+  preview.rotation.y = 0;
   preview.material.color.setHex(fp.color);
-  preview.material.opacity = canPlace(buildMode, cell) || buildMode === "remove" ? 0.35 : 0.15;
+  preview.material.opacity = ok ? 0.35 : 0.15;
   preview.visible = true;
 }
 function paintBuildCell(event, actionType) {
@@ -1074,7 +1152,7 @@ document.getElementById("clear-scenarios").onclick = () => {
 window.addEventListener("keydown", e => {
   const target = e.target;
   if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
-  if (activeTab === "build" && buildMode === "dropbox" && e.key.toLowerCase() === "r") {
+  if (activeTab === "build" && (buildMode === "dropbox" || buildMode === "factory") && e.key.toLowerCase() === "r") {
     e.preventDefault();
     rotateActiveBuildAsset();
   }
@@ -1122,7 +1200,7 @@ renderer.domElement.addEventListener("pointerup", e => {
   } else if (buildMode === "remove") {
     sendAction({type:"remove_asset", cell});
   } else if (buildMode === "factory" && canPlace(buildMode, cell)) {
-    sendAction({type:"place_factory", cell, color: buildColor()});
+    sendAction({type:"place_factory", cell, color: buildColor(), rotation_y: buildRotation.factory});
   } else if (buildMode === "dropbox" && canPlace(buildMode, cell)) {
     sendAction({type:"place_dropbox", cell, color: buildColor(), rotation_y: buildRotation.dropbox});
   } else if (buildMode === "worker" && canPlace(buildMode, cell)) {
