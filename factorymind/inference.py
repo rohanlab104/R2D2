@@ -54,7 +54,7 @@ STRATEGIST_MODEL = os.getenv(
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-USE_LOCAL = os.getenv("USE_LOCAL_NIM", "false").lower() == "true"
+USE_LOCAL = os.getenv("USE_LOCAL_NIM", "true").lower() == "true"
 GX10_IP = os.getenv("GX10_IP", "localhost").strip() or "localhost"
 _CLOUD_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
 _SHARED_LOCAL_URL = (

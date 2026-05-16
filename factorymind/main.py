@@ -233,9 +233,69 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
 # Demo / integration helpers
 # ---------------------------------------------------------------------------
 
+def _station_for_user_command(text: str, world_state: dict) -> dict | None:
+    """Return the workstation named in a simple human command, if any."""
+    lowered = text.lower()
+    aliases = {
+        "parts": "Parts",
+        "part": "Parts",
+        "assembly": "Assembly",
+        "assemble": "Assembly",
+        "qa": "QA",
+        "quality": "QA",
+        "shipping": "Shipping",
+        "ship": "Shipping",
+    }
+    wanted = next((name for word, name in aliases.items() if word in lowered), None)
+    if wanted is None:
+        return None
+    return next(
+        (ws for ws in world_state.get("workstations", []) if ws.get("name") == wanted),
+        None,
+    )
+
+
+def _is_go_and_stop_command(text: str) -> bool:
+    """Detect direct movement commands that should override autonomous work."""
+    lowered = text.lower()
+    has_motion = any(word in lowered for word in ("go", "move", "send", "park", "route"))
+    has_stop = any(word in lowered for word in ("stop", "hold", "wait", "park"))
+    return has_motion and has_stop
+
+
+def _apply_go_to_station_and_stop(
+    text: str,
+    world_state: dict,
+    blackboard: Blackboard,
+) -> bool:
+    """Handle hard commands like 'go to Parts and stop' without LLM routing."""
+    station = _station_for_user_command(text, world_state)
+    if station is None or not _is_go_and_stop_command(text):
+        return False
+
+    _cancel_pending_decisions()
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    target = list(station["pos"])
+    for robot in world_state.get("robots", []):
+        robot["current_task"] = None
+        robot["path"] = a_star(robot["pos"], target, wall_set)
+
+    for task in world_state.get("tasks", []):
+        if task.get("status") != "done":
+            task["status"] = "cancelled"
+            task["assigned_to"] = None
+
+    world_state["manual_control"] = True
+    blackboard.post(
+        -1,
+        "STRATEGY",
+        f"Manual command: all robots moving to {station['name']} and holding there.",
+    )
+    return True
+
 def _active_task_count(world_state: dict) -> int:
     """Return tasks still visible as work in the demo."""
-    return sum(1 for t in world_state["tasks"] if t.get("status") != "done")
+    return sum(1 for t in world_state["tasks"] if t.get("status") not in {"done", "cancelled"})
 
 
 def _reset_demo_state(layout: str, speed_multiplier: int, connection_status: str) -> dict:
@@ -245,6 +305,7 @@ def _reset_demo_state(layout: str, speed_multiplier: int, connection_status: str
     world_state = S.create_initial_state(layout)
     world_state["speed_multiplier"] = speed_multiplier
     world_state["connection_status"] = connection_status
+    world_state["manual_control"] = False
     return world_state
 
 
@@ -763,6 +824,7 @@ def main() -> None:
     blackboard = Blackboard()
     blackboard.post(-1, "STRATEGY", "FactoryMind ready — type a command below to begin production.")
     _sim_started = False
+    manual_control = False
 
     print("[main] initializing pygame display...", flush=True)
     screen = R.init_display()
@@ -851,6 +913,7 @@ def main() -> None:
                 blackboard.clear()
                 blackboard.post(-1, "STRATEGY", "Simulation reset — type a command to begin production.")
                 _sim_started = False
+                manual_control = False
                 sim_elapsed = 0.0
                 last_leader_tick = -LEADER_TICK_INTERVAL
                 last_worker_tick = -WORKER_TICK_INTERVAL
@@ -884,6 +947,13 @@ def main() -> None:
                     user_text = result["text"]
                     _sim_started = True
                     blackboard.post(-1, "USER", user_text)
+                    if _apply_go_to_station_and_stop(user_text, world_state, blackboard):
+                        manual_control = True
+                        last_leader_tick = now
+                        last_worker_tick = now
+                        last_strategist_tick = now
+                        continue
+                    manual_control = False
                     # Trigger immediate strategist response to user command
                     if _pending_strategist is None:
                         try:
@@ -903,56 +973,57 @@ def main() -> None:
 
         # --- Sim logic: only runs while started ---
         if _sim_started:
-            # --- Spawn new tasks ---
-            if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
-                if _active_task_count(world_state) < TARGET_ACTIVE_TASKS:
-                    world_state["tasks"].append(_spawn_task(world_state))
-                last_task_spawn = now
+            if not manual_control:
+                # --- Spawn new tasks ---
+                if now - last_task_spawn >= TASK_SPAWN_INTERVAL:
+                    if _active_task_count(world_state) < TARGET_ACTIVE_TASKS:
+                        world_state["tasks"].append(_spawn_task(world_state))
+                    last_task_spawn = now
 
-            # --- Leader ticks (dispatch async LLM calls) ---
-            if now - last_leader_tick >= LEADER_TICK_INTERVAL:
-                for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
-                    if leader["id"] in _pending_leader:
-                        continue  # previous decision still in flight; don't pile up
-                    _pending_leader[leader["id"]] = _decision_executor.submit(
-                        leader_decide, leader, world_state, blackboard,
-                    )
-                last_leader_tick = now
-
-            # --- Worker ticks: each ball is its own LLM-driven agent ---
-            if now - last_worker_tick >= WORKER_TICK_INTERVAL:
-                if _ALL_AGENTS_LLM:
-                    workers = [r for r in world_state["robots"] if r["role"] == WORKER]
-                    for worker in workers:
-                        if worker["id"] in _pending_worker:
-                            continue
-                        if worker.get("current_task") is not None:
-                            continue  # busy executing a claim — let it finish
-                        _pending_worker[worker["id"]] = _decision_executor.submit(
-                            worker_decide, worker, world_state, blackboard,
+                # --- Leader ticks (dispatch async LLM calls) ---
+                if now - last_leader_tick >= LEADER_TICK_INTERVAL:
+                    for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
+                        if leader["id"] in _pending_leader:
+                            continue  # previous decision still in flight; don't pile up
+                        _pending_leader[leader["id"]] = _decision_executor.submit(
+                            leader_decide, leader, world_state, blackboard,
                         )
-                else:
-                    _assign_idle_workers(world_state, blackboard)
-                last_worker_tick = now
+                    last_leader_tick = now
 
-            # --- Strategist tick (one in flight at a time) ---
-            if (
-                now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
-                and _pending_strategist is None
-            ):
-                try:
-                    state_description = M.describe_world_state(world_state)
-                    retrieved = M.retrieve_strategies(
-                        world_state["layout"],
-                        state_description=state_description,
+                # --- Worker ticks: each ball is its own LLM-driven agent ---
+                if now - last_worker_tick >= WORKER_TICK_INTERVAL:
+                    if _ALL_AGENTS_LLM:
+                        workers = [r for r in world_state["robots"] if r["role"] == WORKER]
+                        for worker in workers:
+                            if worker["id"] in _pending_worker:
+                                continue
+                            if worker.get("current_task") is not None:
+                                continue  # busy executing a claim — let it finish
+                            _pending_worker[worker["id"]] = _decision_executor.submit(
+                                worker_decide, worker, world_state, blackboard,
+                            )
+                    else:
+                        _assign_idle_workers(world_state, blackboard)
+                    last_worker_tick = now
+
+                # --- Strategist tick (one in flight at a time) ---
+                if (
+                    now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
+                    and _pending_strategist is None
+                ):
+                    try:
+                        state_description = M.describe_world_state(world_state)
+                        retrieved = M.retrieve_strategies(
+                            world_state["layout"],
+                            state_description=state_description,
+                        )
+                    except Exception as exc:
+                        print(f"[main] strategy retrieval failed: {exc}", file=sys.stderr, flush=True)
+                        retrieved = []
+                    _pending_strategist = _decision_executor.submit(
+                        strategist_decide, world_state, blackboard, retrieved,
                     )
-                except Exception as exc:
-                    print(f"[main] strategy retrieval failed: {exc}", file=sys.stderr, flush=True)
-                    retrieved = []
-                _pending_strategist = _decision_executor.submit(
-                    strategist_decide, world_state, blackboard, retrieved,
-                )
-                last_strategist_tick = now
+                    last_strategist_tick = now
 
             # --- Movement tick ---
             if now - last_move_tick >= MOVE_TICK_INTERVAL:
