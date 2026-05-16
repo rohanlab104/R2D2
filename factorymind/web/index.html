@@ -33,7 +33,7 @@
     content: "";
     pointer-events: none;
     position: absolute; inset: 0;
-    background: radial-gradient(ellipse 80% 70% at 50% 42%, transparent 35%, rgba(8, 12, 24, 0.45) 100%);
+    background: radial-gradient(ellipse 85% 72% at 50% 36%, transparent 48%, rgba(8, 12, 24, 0.28) 100%);
   }
   #stage canvas { display: block; width: 100%; height: 100%; }
   #panel {
@@ -220,8 +220,9 @@ const WS_LIGHT = { Parts: 0xff5050, Assembly: 0x5080ff, QA: 0x44dd66, Shipping: 
 // Scene setup
 // ---------------------------------------------------------------------------
 const stage = document.getElementById("stage");
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setClearColor(0x000000, 0);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.42;
@@ -231,8 +232,9 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 stage.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x1a1e2c);
-scene.fog = new THREE.FogExp2(0x1c2335, 0.0082);
+// Open sky: stack shows through (#stage gradient) instead of a solid ceiling.
+scene.background = null;
+scene.fog = new THREE.FogExp2(0x1c2335, 0.0024);
 
 const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 1200);
 camera.position.set(GRID * 1.35, GRID * 1.05, GRID * 1.95);
@@ -1557,20 +1559,93 @@ function syncRobots(world) {
   }
 }
 
+function disposeTaskGroup(g) {
+  scene.remove(g);
+  g.traverse((obj) => {
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) {
+      if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+      else obj.material.dispose();
+    }
+  });
+}
+
+function cargoRgbFromTask(t) {
+  if (Array.isArray(t.cargo_color) && t.cargo_color.length >= 3) {
+    return t.cargo_color.map((x) => Math.max(0, Math.min(255, Number(x) | 0)));
+  }
+  const fb = {
+    Parts: [245, 52, 68],
+    Assembly: [52, 118, 255],
+    QA: [48, 235, 146],
+    Shipping: [255, 214, 64],
+  };
+  const row = fb[t.delivery_name];
+  return row ? row : [190, 190, 200];
+}
+
+function cargoKindFromTask(t) {
+  if (t.cargo_kind) return String(t.cargo_kind);
+  const m = { Parts: "parts", Assembly: "assembly", QA: "qa", Shipping: "shipping" };
+  return m[t.delivery_name] || "generic";
+}
+
+function cargoBodyHex(rgb) {
+  const [cr, cg, cb] = rgb;
+  return (cr << 16) | (cg << 8) | cb;
+}
+
+function cargoYLift(kind) {
+  switch (kind) {
+    case "assembly": return 0.27;
+    case "qa": return 0.34;
+    case "shipping": return 0.14;
+    case "parts":
+    default: return 0.23;
+  }
+}
+
+function makeCargoBody(kind, mat) {
+  switch (kind) {
+    case "assembly":
+      return new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.32, 0.52, 22), mat);
+    case "qa":
+      return new THREE.Mesh(new THREE.OctahedronGeometry(0.38), mat);
+    case "shipping":
+      return new THREE.Mesh(new THREE.BoxGeometry(0.74, 0.26, 0.48), mat);
+    case "parts":
+    default:
+      return new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.46, 0.52), mat);
+  }
+}
+
 function syncTasks(world) {
   const seen = new Set();
   for (const t of world.tasks ?? []) {
     if (t.status === "done" || t.status === "cancelled") continue;
     seen.add(t.id);
-    let g = taskMeshes.get(t.id);
     const wantCargo = !!t.cargo;
-    if (!g) {
+    const cargoKind = wantCargo ? cargoKindFromTask(t) : "";
+    const bodyKey = wantCargo ? `cargo:${cargoKind}` : "station:gem";
+
+    let g = taskMeshes.get(t.id);
+    if (!g || g.userData.bodyKey !== bodyKey) {
+      if (g) {
+        disposeTaskGroup(g);
+        taskMeshes.delete(t.id);
+      }
       g = new THREE.Group();
+      const rgb = wantCargo ? cargoRgbFromTask(t) : [255, 90, 90];
+      const bodyHex = cargoBodyHex(rgb);
       const pickupMat = new THREE.MeshStandardMaterial({
-        color: 0xff5a5a, emissive: 0xff5a5a, emissiveIntensity: 0.8,
+        color: bodyHex,
+        emissive: bodyHex,
+        emissiveIntensity: wantCargo ? 0.42 : 0.85,
+        roughness: 0.45,
+        metalness: 0.25,
       });
       const pickup = wantCargo
-        ? new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.42, 0.55), pickupMat)
+        ? makeCargoBody(cargoKind, pickupMat)
         : new THREE.Mesh(new THREE.OctahedronGeometry(0.4), pickupMat);
 
       const lineGeo = new THREE.BufferGeometry();
@@ -1583,28 +1658,49 @@ function syncTasks(world) {
         }),
       );
 
-      g.add(pickup); g.add(line);
-      g.userData = { pickup, line, isCargo: wantCargo };
+      g.add(pickup);
+      g.add(line);
+      const ud = { pickup, line, bodyKey };
+      if (wantCargo) {
+        const ringGeo = new THREE.RingGeometry(0.44, 0.62, 36);
+        ringGeo.rotateX(-Math.PI / 2);
+        const ringMat = new THREE.MeshBasicMaterial({
+          color: 0x3a4a68,
+          transparent: true,
+          opacity: 0.9,
+          depthWrite: false,
+        });
+        const claimRing = new THREE.Mesh(ringGeo, ringMat);
+        claimRing.position.y = 0.02;
+        g.add(claimRing);
+        ud.claimRing = claimRing;
+      }
+      g.userData = ud;
       scene.add(g);
       taskMeshes.set(t.id, g);
     }
+
     const p = gridToWorld(t.pickup[0], t.pickup[1]);
     const d = gridToWorld(t.delivery[0], t.delivery[1]);
-    const yLift = wantCargo ? 0.31 : 1.6;
-    g.userData.pickup.position.set(p.x, yLift, p.z);
     const assigned = t.assigned_to !== null && t.assigned_to !== undefined;
-    let claimedColor = assigned ? 0x55dd77 : 0xff5a5a;
-    if (
-      wantCargo
-      && !assigned
-      && t.cargo_color
-      && t.cargo_color.length >= 3
-    ) {
-      const [cr, cg, cb] = t.cargo_color;
-      claimedColor = (cr << 16) | (cg << 8) | cb;
+    const yLift = wantCargo ? cargoYLift(cargoKind) : 1.6;
+    g.userData.baseYLift = yLift;
+    g.userData.pickup.position.set(p.x, yLift, p.z);
+
+    if (wantCargo) {
+      const rgb = cargoRgbFromTask(t);
+      const bodyHex = cargoBodyHex(rgb);
+      g.userData.pickup.material.color.setHex(bodyHex);
+      g.userData.pickup.material.emissive.setHex(bodyHex);
+      if (g.userData.claimRing) {
+        g.userData.claimRing.material.color.setHex(assigned ? 0x55ff99 : 0x3a4a68);
+      }
+    } else {
+      const gemHex = assigned ? 0x55dd77 : 0xff5a5a;
+      g.userData.pickup.material.color.setHex(gemHex);
+      g.userData.pickup.material.emissive.setHex(gemHex);
     }
-    g.userData.pickup.material.color.setHex(claimedColor);
-    g.userData.pickup.material.emissive.setHex(claimedColor);
+
     const positions = g.userData.line.geometry.attributes.position.array;
     positions[0] = p.x; positions[1] = 0.15; positions[2] = p.z;
     positions[3] = d.x; positions[4] = 0.15; positions[5] = d.z;
@@ -1613,7 +1709,7 @@ function syncTasks(world) {
   }
   for (const [id, g] of taskMeshes) {
     if (!seen.has(id)) {
-      scene.remove(g);
+      disposeTaskGroup(g);
       taskMeshes.delete(id);
     }
   }
@@ -1800,7 +1896,10 @@ function animate() {
   for (const [, g] of taskMeshes) {
     if (g.userData.pickup) {
       g.userData.pickup.rotation.y += dt * 1.4;
-      g.userData.pickup.position.y = 1.6 + Math.sin(t * 2.5) * 0.12;
+      const base = g.userData.baseYLift != null ? g.userData.baseYLift : 1.6;
+      const isCargo = g.userData.bodyKey && String(g.userData.bodyKey).startsWith("cargo:");
+      const amp = isCargo ? 0.038 : 0.12;
+      g.userData.pickup.position.y = base + Math.sin(t * 2.5) * amp;
     }
   }
   for (const m of vfxMeshes) {

@@ -782,7 +782,7 @@ _WS_ABBREV = {"Parts": "P", "Assembly": "A", "QA": "Q", "Shipping": "S"}
 
 
 def draw_cargo_pickups(screen: "pygame.Surface", world_state: dict) -> None:
-    """Draw floor crates for autonomous cargo tasks while the load is still on the floor."""
+    """Draw floor cargo by destination type (shape + color) until picked up."""
     tasks = list(world_state.get("tasks", [])) + list(
         world_state.get("task_queue", [])
     )
@@ -799,17 +799,40 @@ def draw_cargo_pickups(screen: "pygame.Surface", world_state: dict) -> None:
         sy = GRID_OFFSET_Y + gy * CELL_SIZE
         col = t.get("cargo_color")
         if isinstance(col, (list, tuple)) and len(col) >= 3:
-            band = (int(col[0]), int(col[1]), int(col[2]))
+            accent = (int(col[0]), int(col[1]), int(col[2]))
         else:
-            band = (160, 110, 70)
-        rect = pygame.Rect(sx + 3, sy + 3, CELL_SIZE - 6, CELL_SIZE - 6)
-        pygame.draw.rect(screen, (90, 70, 45), rect)
-        pygame.draw.rect(
-            screen,
-            band,
-            pygame.Rect(rect.x + 2, rect.y + 2, rect.width - 4, rect.height // 2),
-        )
-        pygame.draw.rect(screen, C_GRID_MAJOR, rect, 1)
+            accent = (160, 110, 70)
+        base = (72, 58, 42)
+        kind = str(t.get("cargo_kind", "parts")).lower()
+        cx = sx + CELL_SIZE // 2
+        cy = sy + CELL_SIZE // 2
+
+        if kind == "assembly":
+            pygame.draw.circle(screen, base, (cx, cy), 6)
+            pygame.draw.circle(screen, accent, (cx, cy), 5)
+            pygame.draw.circle(screen, C_GRID_MAJOR, (cx, cy), 6, 1)
+        elif kind == "qa":
+            s = 7
+            pts = [(cx, cy - s), (cx + s, cy), (cx, cy + s), (cx - s, cy)]
+            pygame.draw.polygon(screen, base, pts)
+            pygame.draw.polygon(
+                screen, accent, [(cx, cy - s + 2), (cx + s - 2, cy), (cx, cy + s - 2), (cx - s + 2, cy)]
+            )
+            pygame.draw.polygon(screen, C_GRID_MAJOR, pts, 1)
+        elif kind == "shipping":
+            rect = pygame.Rect(sx + 2, cy - 4, CELL_SIZE - 4, 9)
+            pygame.draw.rect(screen, base, rect)
+            pygame.draw.rect(screen, accent, rect.inflate(-3, -3))
+            pygame.draw.rect(screen, C_GRID_MAJOR, rect, 1)
+        else:
+            rect = pygame.Rect(sx + 3, sy + 3, CELL_SIZE - 6, CELL_SIZE - 6)
+            pygame.draw.rect(screen, base, rect)
+            pygame.draw.rect(
+                screen,
+                accent,
+                pygame.Rect(rect.x + 2, rect.y + 2, rect.width - 4, rect.height // 2),
+            )
+            pygame.draw.rect(screen, C_GRID_MAJOR, rect, 1)
 
 
 def draw_workstations(screen: "pygame.Surface", workstations: list[dict]) -> None:

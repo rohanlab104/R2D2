@@ -344,11 +344,33 @@ def _pick_cargo_cell(
     return [choice[0], choice[1]]
 
 
-def _cargo_color_for_delivery(delivery_ws: dict) -> list[int]:
+_CARGO_STYLE_BY_STATION: dict[str, dict[str, object]] = {
+    # Saturated, divergent hues + shape kind for web / pygame viewers.
+    "Parts": {"color": [245, 52, 68], "kind": "parts"},
+    "Assembly": {"color": [52, 118, 255], "kind": "assembly"},
+    "QA": {"color": [48, 235, 146], "kind": "qa"},
+    "Shipping": {"color": [255, 214, 64], "kind": "shipping"},
+}
+
+
+def _apply_cargo_task_style(task: dict, delivery_ws: dict) -> None:
+    """Tag cargo tasks with a stable color + geometry kind for their destination."""
+    name = str(delivery_ws.get("name", ""))
+    spec = _CARGO_STYLE_BY_STATION.get(name)
+    if spec:
+        rgb = spec["color"]
+        if isinstance(rgb, list) and len(rgb) >= 3:
+            task["cargo_color"] = [int(rgb[0]), int(rgb[1]), int(rgb[2])]
+        else:
+            task["cargo_color"] = [188, 188, 200]
+        task["cargo_kind"] = str(spec["kind"])
+        return
     c = delivery_ws.get("color")
     if isinstance(c, list) and len(c) >= 3:
-        return [int(c[0]), int(c[1]), int(c[2])]
-    return [180, 140, 90]
+        task["cargo_color"] = [int(c[0]), int(c[1]), int(c[2])]
+    else:
+        task["cargo_color"] = [188, 188, 200]
+    task["cargo_kind"] = "generic"
 
 
 def _create_task(
@@ -372,7 +394,7 @@ def _create_task(
     }
     if str(pickup_ws.get("name", "")) == "Cargo":
         task["cargo"] = True
-        task["cargo_color"] = _cargo_color_for_delivery(delivery_ws)
+        _apply_cargo_task_style(task, delivery_ws)
     _task_counter += 1
     return task
 
