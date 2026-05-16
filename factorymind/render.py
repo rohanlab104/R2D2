@@ -46,10 +46,12 @@ C_BTN_BOTTLE = (100, 30,  200)
 C_BANNER     = (180, 20,  20)
 C_WHITE      = (255, 255, 255)
 
-# Button rectangles (x, y, w, h) — defined in panel space
+# Button rectangles (x, y, w, h) defined in panel space.
 _BTN_DISCONNECT  = pygame.Rect(910, 820, 180, 40) if pygame else None
 _BTN_OPEN        = pygame.Rect(910, 760, 80,  40) if pygame else None
 _BTN_BOTTLENECK  = pygame.Rect(1000, 760, 120, 40) if pygame else None
+_BTN_RESET       = pygame.Rect(1130, 760, 80,  40) if pygame else None
+_BTN_SPEED       = pygame.Rect(910, 820, 80,  40) if pygame else None
 
 
 def _ensure_pygame() -> None:
@@ -66,7 +68,7 @@ def init_display(width: int = 1400, height: int = 900) -> "pygame.Surface":
     """Initialise pygame and return the main screen surface."""
     _ensure_pygame()
     pygame.init()
-    pygame.display.set_caption("FactoryMind — R2D2")
+    pygame.display.set_caption("FactoryMind - R2D2")
     screen = pygame.display.set_mode((width, height))
     return screen
 
@@ -150,7 +152,7 @@ def draw_robots(screen: "pygame.Surface", robots: list[dict]) -> None:
 
 def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     """Draw the side panel with stats, blackboard feed, and buttons."""
-    global _BTN_DISCONNECT, _BTN_OPEN, _BTN_BOTTLENECK
+    global _BTN_DISCONNECT, _BTN_OPEN, _BTN_BOTTLENECK, _BTN_RESET, _BTN_SPEED
     panel_rect = pygame.Rect(PANEL_X, 0, screen.get_width() - PANEL_X, screen.get_height())
     pygame.draw.rect(screen, C_PANEL_BG, panel_rect)
 
@@ -174,6 +176,11 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     tick_label = font_body.render(f"Tick: {world_state.get('tick', 0)}", True, C_TEXT)
     screen.blit(tick_label, (PANEL_X + 10, y_cursor))
     y_cursor += 25
+
+    speed = world_state.get("speed_multiplier", 1)
+    speed_label = font_body.render(f"Speed: {speed}x", True, C_TEXT)
+    screen.blit(speed_label, (PANEL_X + 10, y_cursor))
+    y_cursor += 20
 
     # Stats
     stats = world_state.get("stats", {})
@@ -205,13 +212,21 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     # Layout switch buttons
     _BTN_OPEN       = pygame.Rect(PANEL_X + 10, 760, 80, 40)
     _BTN_BOTTLENECK = pygame.Rect(PANEL_X + 100, 760, 120, 40)
-    _BTN_DISCONNECT = pygame.Rect(PANEL_X + 10, 820, 180, 40)
+    _BTN_RESET      = pygame.Rect(PANEL_X + 230, 760, 80, 40)
+    _BTN_SPEED      = pygame.Rect(PANEL_X + 10, 820, 80, 40)
+    _BTN_DISCONNECT = pygame.Rect(PANEL_X + 100, 820, 180, 40)
 
     pygame.draw.rect(screen, C_BTN_OPEN, _BTN_OPEN, border_radius=6)
     screen.blit(font_body.render("Open", True, C_WHITE), (_BTN_OPEN.x + 10, _BTN_OPEN.y + 10))
 
     pygame.draw.rect(screen, C_BTN_BOTTLE, _BTN_BOTTLENECK, border_radius=6)
     screen.blit(font_body.render("Bottleneck", True, C_WHITE), (_BTN_BOTTLENECK.x + 5, _BTN_BOTTLENECK.y + 10))
+
+    pygame.draw.rect(screen, C_BTN_OPEN, _BTN_RESET, border_radius=6)
+    screen.blit(font_body.render("Reset", True, C_WHITE), (_BTN_RESET.x + 10, _BTN_RESET.y + 10))
+
+    pygame.draw.rect(screen, C_BTN_BOTTLE, _BTN_SPEED, border_radius=6)
+    screen.blit(font_body.render(f"{speed}x", True, C_WHITE), (_BTN_SPEED.x + 25, _BTN_SPEED.y + 10))
 
     pygame.draw.rect(screen, C_BTN_DISC, _BTN_DISCONNECT, border_radius=6)
     disc_label = font_body.render("DISCONNECT", True, C_WHITE)
@@ -223,7 +238,7 @@ def draw_disconnect_banner(screen: "pygame.Surface") -> None:
     banner_rect = pygame.Rect(0, 0, screen.get_width(), 30)
     pygame.draw.rect(screen, C_BANNER, banner_rect)
     font = pygame.font.SysFont("monospace", 14, bold=True)
-    msg = "CLOUD DISCONNECTED — RUNNING LOCALLY ON GX10"
+    msg = "CLOUD DISCONNECTED - RUNNING LOCALLY ON GX10"
     surf = font.render(msg, True, C_WHITE)
     screen.blit(surf, (screen.get_width() // 2 - surf.get_width() // 2, 6))
 
@@ -239,6 +254,10 @@ def get_button_click(pos: tuple[int, int]) -> Optional[str]:
         return "layout_open"
     if _BTN_BOTTLENECK and _BTN_BOTTLENECK.collidepoint(pos):
         return "layout_bottleneck"
+    if _BTN_RESET and _BTN_RESET.collidepoint(pos):
+        return "reset"
+    if _BTN_SPEED and _BTN_SPEED.collidepoint(pos):
+        return "speedup"
     return None
 
 
@@ -273,4 +292,4 @@ if __name__ == "__main__":
         clock.tick(60)
 
     pygame.quit()
-    print("render.py smoke test OK — window ran for 5 seconds")
+    print("render.py smoke test OK - window ran for 5 seconds")

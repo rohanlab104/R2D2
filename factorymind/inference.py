@@ -62,6 +62,7 @@ _SHARED_LOCAL_URL = (
     or ""
 ).rstrip("/")
 _API_KEY = os.getenv("NVIDIA_API_KEY") or "no-key-needed-for-local"
+_TIMEOUT_SECONDS = float(os.getenv("NEMOTRON_TIMEOUT_SECONDS", "3.0"))
 
 
 def _leader_base_url() -> str:
@@ -85,7 +86,7 @@ def _strategist_base_url() -> str:
 
 
 def _make_client(base_url: str) -> OpenAI:
-    return OpenAI(base_url=base_url, api_key=_API_KEY)
+    return OpenAI(base_url=base_url, api_key=_API_KEY, timeout=_TIMEOUT_SECONDS)
 
 
 _leader_client = _make_client(_leader_base_url())
