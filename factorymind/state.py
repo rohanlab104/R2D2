@@ -57,14 +57,9 @@ def _initial_shelf_walls() -> list[list[int]]:
     """Warehouse rack aisles represented as wall cells for pathfinding."""
     cells: set[tuple[int, int]] = set()
     rack_runs = [
-        (17, 19, 8, 17),
-        (17, 19, 22, 32),
-        (17, 19, 36, 43),
-        (26, 28, 6, 15),
-        (26, 28, 20, 30),
-        (26, 28, 35, 41),
-        (34, 36, 10, 20),
-        (34, 36, 25, 35),
+        (13, 23, 16, 18),
+        (26, 36, 24, 26),
+        (18, 28, 33, 35),
     ]
     for x0, x1, y0, y1 in rack_runs:
         for x in range(x0, x1 + 1):
@@ -138,7 +133,7 @@ def make_dropbox(
 def make_worker(worker_id: int, pos: list[int]) -> dict:
     return {
         "id": worker_id,
-        "name": f"Worker-{worker_id}",
+        "name": f"R{worker_id}D{worker_id}",
         "role": WORKER,
         "pos": list(pos),
         "spawn_pos": list(pos),
