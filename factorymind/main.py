@@ -57,10 +57,19 @@ STRATEGIST_TICK_INTERVAL = 20.0
 MOVE_TICK_INTERVAL = 0.05  # how often robots advance one step
 SPEED_OPTIONS = (1, 2, 3, 4)
 
-# Defaults favor the full agentic demo: every idle worker gets its own model
-# decision, while path execution stays deterministic and locally verifiable.
-_ALL_AGENTS_LLM = os.getenv("ALL_AGENTS_LLM", "true").lower() == "true"
-_COOPERATIVE_PATHING = os.getenv("COOPERATIVE_PATHING", "true").lower() == "true"
+# When FLEET_MASTER_ONLY is on (default), the leader/master is the sole dispatcher:
+# workers never self-claim tasks; they only execute master-assigned routes.
+_FLEET_MASTER_ONLY = os.getenv("FLEET_MASTER_ONLY", "true").lower() == "true"
+_ALL_AGENTS_LLM = os.getenv("ALL_AGENTS_LLM", "false").lower() == "true"
+_COOPERATIVE_PATHING = os.getenv(
+    "COOPERATIVE_PATHING",
+    "false" if os.getenv("FLEET_MASTER_ONLY", "true").lower() == "true" else "true",
+).lower() == "true"
+
+
+def _master_controls_fleet(world_state: dict) -> bool:
+    """True when the OpenClaw leader owns the task queue (not worker autonomy)."""
+    return bool(world_state.get("fleet_mode") or world_state.get("task_queue"))
 
 # ---------------------------------------------------------------------------
 # Background inference workers
@@ -305,6 +314,7 @@ def _complete_task_delivery(
     route_time = round(time.time() - task.get("started_at", time.time()), 2)
     task["status"] = "done"
     robot["current_task"] = None
+    robot.pop("master_assigned", None)
 
     world_state["stats"]["completed"] += 1
     world_state["stats"]["last_route_time"] = route_time
@@ -326,8 +336,10 @@ def _complete_task_delivery(
 
     robot["path"] = []
     pos = robot["pos"]
+    # In master-dispatch mode, do not send workers back to spawn (causes "orbiting").
     if (
-        not world_state.get("task_queue")
+        not _master_controls_fleet(world_state)
+        and not world_state.get("task_queue")
         and _is_workstation_cell(pos, world_state)
     ):
         _park_robot_at_spawn(robot, world_state)
@@ -475,6 +487,7 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
     task["assigned_to"] = robot["id"]
     task["started_at"] = time.time()
     robot["current_task"] = task["id"]
+    robot.pop("master_assigned", None)
     robot["path"] = _planned_path_to(robot, task["pickup"], world_state)
     if (
         not robot["path"]
@@ -735,13 +748,32 @@ def _generate_fleet_routes(
     return routes
 
 
+def _fleet_pick_worker_deterministic(
+    task: dict,
+    idle_workers: list[dict],
+    wall_set: set,
+    world_state: dict,
+) -> tuple[dict | None, int]:
+    """Assign tasks in stable round-robin order (master plan, not nearest-neighbor chaos)."""
+    if not idle_workers:
+        return None, 10**6
+    ordered = sorted(idle_workers, key=lambda r: r["id"])
+    cursor = int(world_state.get("fleet_dispatch_cursor", 0))
+    n = len(ordered)
+    for offset in range(n):
+        worker = ordered[(cursor + offset) % n]
+        cost = _estimate_task_cost(worker, task, wall_set, world_state)
+        if cost < 10**6:
+            world_state["fleet_dispatch_cursor"] = (cursor + offset + 1) % n
+            return worker, cost
+    return None, 10**6
+
+
 def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
     """One tick of the autonomous fleet loop.
 
-    Drains as many queued tasks as there are idle workers, picking the closest
-    free worker for each. Every assignment passes through NemoClaw; if the
-    engine denies (and is in enforce mode) the assignment is skipped and the
-    denial is logged. Returns the number of tasks actually dispatched.
+    Drains queued tasks onto idle workers in FIFO queue order with deterministic
+    round-robin worker selection. Returns the number of tasks dispatched.
     """
     queue: list[dict] = world_state.get("task_queue", []) or []
     if not queue:
@@ -778,18 +810,10 @@ def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
 
     while queue and idle_workers:
         task = queue[0]
-        scored = sorted(
-            idle_workers,
-            key=lambda r: (
-                _estimate_task_cost(r, task, wall_set, world_state),
-                r["id"],
-            ),
+        worker, cost = _fleet_pick_worker_deterministic(
+            task, idle_workers, wall_set, world_state,
         )
-        if not scored:
-            break
-        worker = scored[0]
-        cost = _estimate_task_cost(worker, task, wall_set, world_state)
-        if cost >= 10**6:
+        if worker is None or cost >= 10**6:
             # No reachable worker for this task right now — don't pop, retry next tick.
             break
 
@@ -820,14 +844,16 @@ def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
             world_state["tasks"].append(task)
         _assign_task_to_robot(worker, task, world_state)
         task["delegated_by"] = leader["id"]
+        task["master_order"] = True
         task["estimated_route_cost"] = cost
+        worker["master_assigned"] = task["id"]
 
         route = f"{task.get('pickup_name', '?')}->{task.get('delivery_name', '?')}"
         blackboard.post(
             leader["id"],
             "CLAIM",
-            f"OpenClaw leader: delegating {route} task {task['id']} to W{worker['id']} "
-            f"(cost={cost}, queue_remaining={len(queue)}).",
+            f"MASTER -> W{worker['id']}: task {task['id']} {route} "
+            f"(queue #{dispatched + 1}, {len(queue)} left).",
         )
         blackboard.post(
             worker["id"],
@@ -1101,25 +1127,42 @@ def _parse_user_task_request(text: str, world_state: dict) -> tuple[dict, dict, 
     return pickup, delivery, _requested_task_count(text)
 
 
-def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, dict, int]]:
+def _parse_user_task_requests(
+    text: str,
+    world_state: dict,
+    blackboard: "Blackboard | None" = None,
+) -> list[tuple[dict, dict, int]]:
     """Parse one or more route clauses from a user prompt.
 
-    Examples:
-    - "deliver 4 Parts to QA"
-    - "move 2 Assembly to Shipping and 2 Parts to QA"
+    LLM interpretation is tried first (USE_LLM_TASK_INTERPRETER, default on).
+    Regex parsing is only a fallback when the interpreter is off or unavailable.
     """
     if _is_go_and_stop_command(text):
         return []
 
-    # Reliable local parse for "5 tasks for Parts and 2 for Assembly".
+    use_llm = os.getenv("USE_LLM_TASK_INTERPRETER", "true").lower() == "true"
+    if use_llm and not _use_mock_agents():
+        interpreted = _interpret_user_task_requests(text, world_state, blackboard)
+        if interpreted:
+            return interpreted
+
+    return _parse_user_task_requests_regex(text, world_state)
+
+
+def _use_mock_agents() -> bool:
+    return os.getenv("AGENTS_USE_MOCK", "false").lower() == "true"
+
+
+def _parse_user_task_requests_regex(
+    text: str, world_state: dict,
+) -> list[tuple[dict, dict, int]]:
+    """Regex fallback when the LLM task interpreter is off or failed."""
+    if _is_go_and_stop_command(text):
+        return []
+
     quota_requests = _parse_station_quota_requests(text, world_state)
     if quota_requests:
         return quota_requests
-
-    if os.getenv("USE_LLM_TASK_INTERPRETER", "true").lower() == "true":
-        interpreted = _interpret_user_task_requests(text, world_state)
-        if interpreted:
-            return interpreted
 
     worker_count = max(1, sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER))
     remaining = worker_count
@@ -1155,15 +1198,15 @@ def _parse_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, 
     if parsed is not None:
         return [parsed]
 
-    inferred = _infer_vague_task_requests(text, world_state)
-    if inferred:
-        return inferred
-
     return []
 
 
-def _interpret_user_task_requests(text: str, world_state: dict) -> list[tuple[dict, dict, int]]:
-    """Ask the interpreter model for structured mission groups."""
+def _interpret_user_task_requests(
+    text: str,
+    world_state: dict,
+    blackboard: "Blackboard | None" = None,
+) -> list[tuple[dict, dict, int]]:
+    """Ask the interpreter model for structured mission groups (exact counts)."""
     parsed = interpret_user_tasks(text, world_state)
     if not parsed:
         return []
@@ -1178,12 +1221,12 @@ def _interpret_user_task_requests(text: str, world_state: dict) -> list[tuple[di
     remaining = worker_count
     requests: list[tuple[dict, dict, int]] = []
     confidence = _coerce_float(parsed.get("confidence"), 0.0)
-    if parsed.get("needs_clarification") and confidence < 0.7:
+    if parsed.get("needs_clarification") and confidence < 0.85:
         question = str(parsed.get("clarifying_question", "")).strip()
-        print(
-            f"[task-interpreter] clarification needed: {question or 'no safe warehouse action inferred'}",
-            flush=True,
-        )
+        msg = question or "Could not interpret command — try: do 5 tasks for Parts and 2 for Assembly"
+        print(f"[task-interpreter] clarification needed: {msg}", flush=True)
+        if blackboard is not None:
+            blackboard.post(-1, "STRATEGY", f"Task interpreter: {msg}")
         return []
 
     for item in parsed.get("tasks", []):
@@ -1209,29 +1252,30 @@ def _interpret_user_task_requests(text: str, world_state: dict) -> list[tuple[di
             count = remaining
         else:
             try:
-                count = int(raw_count)
+                count = int(float(raw_count))
             except (TypeError, ValueError):
                 count = 1
-        # Match the non-LLM clause parser: small counts cap at worker pool
-        # size; large counts are fleet-scale and only clamp to the safety max.
-        if count <= worker_count:
-            count = max(1, count)
-        else:
-            count = min(count, _FLEET_TASK_COUNT_LIMIT)
+            count = max(1, min(count, _FLEET_TASK_COUNT_LIMIT))
         remaining = max(0, remaining - min(count, remaining))
         requests.append((pickup, delivery, count))
 
     if requests:
-        strategy = str(parsed.get("strategy", "minimize_average_completion_time"))
-        constraints = parsed.get("constraints", [])
+        summary = "; ".join(
+            f"{cnt}x {pu['name']}->{de['name']}" for pu, de, cnt in requests
+        )
+        strategy = str(parsed.get("strategy", "fifo_exact_counts"))
         assumptions = parsed.get("assumptions", [])
         print(
-            f"[task-interpreter] parsed {len(requests)} route group(s); "
-            f"intent={parsed.get('intent', 'create_delivery_tasks')}; "
-            f"confidence={confidence:.2f}; strategy={strategy}; "
-            f"constraints={constraints}; assumptions={assumptions}",
+            f"[task-interpreter] LLM plan: {summary}; "
+            f"confidence={confidence:.2f}; strategy={strategy}; assumptions={assumptions}",
             flush=True,
         )
+        if blackboard is not None:
+            blackboard.post(
+                -1,
+                "STRATEGY",
+                f"Master understood: {summary} (queued in order, exact counts).",
+            )
     return requests
 
 
@@ -1240,60 +1284,6 @@ def _coerce_float(value, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _infer_vague_task_requests(text: str, world_state: dict) -> list[tuple[dict, dict, int]]:
-    """Local fallback for vague commands when the LLM interpreter is unavailable."""
-    lower = text.lower()
-    actionish = bool(
-        re.search(
-            r"\b(clear|empty|backlog|catch\s*up|speed|faster|optimi[sz]e|rebalance|get\s+.*moving|busy|priority)\b",
-            lower,
-        )
-    )
-    if not actionish:
-        return []
-
-    worker_count = max(1, sum(1 for r in world_state.get("robots", []) if r.get("role") == WORKER))
-    idle_count = sum(
-        1
-        for r in world_state.get("robots", [])
-        if r.get("role") == WORKER and r.get("current_task") is None and not r.get("path")
-    )
-    count = idle_count or worker_count
-    stations = _station_mentions_in_order(text, world_state)
-
-    if len(stations) >= 2:
-        pickup, delivery = stations[0], stations[1]
-    elif len(stations) == 1:
-        pickup = stations[0]
-        delivery = _default_downstream_station(pickup["name"], world_state)
-    else:
-        pickup = _highest_backlog_station(world_state) or _station_by_name("Parts", world_state)
-        delivery = _default_downstream_station(pickup["name"], world_state) if pickup else None
-
-    if not pickup or not delivery or pickup["name"] == delivery["name"]:
-        return []
-
-    print(
-        f"[task-interpreter] local vague fallback inferred {count}x "
-        f"{pickup['name']}->{delivery['name']}",
-        flush=True,
-    )
-    return [(pickup, delivery, count)]
-
-
-def _highest_backlog_station(world_state: dict) -> dict | None:
-    """Return the station with the most open pickup work, if any."""
-    counts: dict[str, int] = {}
-    for task in world_state.get("tasks", []):
-        if task.get("status") == "open":
-            name = str(task.get("pickup_name", ""))
-            counts[name] = counts.get(name, 0) + 1
-    if not counts:
-        return None
-    name, count = max(counts.items(), key=lambda item: (item[1], item[0]))
-    return _station_by_name(name, world_state) if count > 0 else None
 
 
 def _create_user_task(world_state: dict, pickup_ws: dict, delivery_ws: dict) -> dict:
@@ -1332,16 +1322,22 @@ def _apply_user_task_request(
 ) -> bool:
     """Convert a natural-language task request into queued fleet work.
 
-    Tasks are pushed onto ``world_state["task_queue"]`` rather than dispatched
-    all at once. The autonomous OpenClaw leader then drains the queue one
-    task at a time, sending each to whichever worker is closest and free.
+    Tasks are pushed onto ``world_state["task_queue"]`` in order. The master
+    leader drains the queue with deterministic round-robin worker assignment.
     """
-    requests = _parse_user_task_requests(text, world_state)
+    requests = _parse_user_task_requests(text, world_state, blackboard)
     bulk_count = 0
     if not requests:
-        # Fallback: bare numeric request like "do 100 tasks" with no stations.
+        # Only use cycle fallback for explicit bulk with no station names (not vague chat).
         bulk_count = _parse_bulk_fleet_request(text, world_state)
         if bulk_count <= 0:
+            if os.getenv("USE_LLM_TASK_INTERPRETER", "true").lower() == "true":
+                blackboard.post(
+                    -1,
+                    "STRATEGY",
+                    "Could not interpret that command. Example: "
+                    "'do 5 tasks for Parts, and 2 for Assembly'.",
+                )
             return False
 
     _cancel_pending_decisions()
@@ -1360,6 +1356,8 @@ def _apply_user_task_request(
     # user just said "do 100 deliveries"). A "+100" prefix can be wired up
     # later if additive enqueue is preferred.
     world_state["task_queue"] = []
+    world_state["fleet_dispatch_cursor"] = 0
+    world_state["fleet_mode"] = True
     _reset_station_quota_targets(world_state)
 
     routes: list[tuple[dict, dict]] = []
@@ -1592,7 +1590,7 @@ def _reset_demo_state(layout: str, speed_multiplier: int, connection_status: str
 
 def _seed_startup_fleet(world_state: dict, blackboard: Blackboard) -> int:
     """Queue and dispatch initial delivery tasks so workers spread out immediately."""
-    if os.getenv("FACTORYMIND_AUTO_START", "true").lower() not in ("true", "1", "yes"):
+    if os.getenv("FACTORYMIND_AUTO_START", "false").lower() not in ("true", "1", "yes"):
         return 0
 
     num_workers = sum(
@@ -1604,6 +1602,7 @@ def _seed_startup_fleet(world_state: dict, blackboard: Blackboard) -> int:
     default_tasks = max(num_workers * 2, 20)
     task_count = int(os.getenv("FACTORYMIND_STARTUP_TASKS", str(default_tasks)))
     routes = _generate_fleet_routes(world_state, task_count)
+    world_state["fleet_dispatch_cursor"] = 0
     enqueued = _enqueue_fleet_tasks(world_state, blackboard, routes, source="startup")
 
     # Assign one task per idle worker right away (repeat until queue or workers exhausted).
@@ -1734,6 +1733,10 @@ def _apply_worker_decision(
     """Mutate state based on a per-worker LLM decision (each ball is an agent)."""
     from factorymind.state import CLAIM, INTENT
 
+    # Master dispatch mode: workers only follow assignments from the fleet queue.
+    if _FLEET_MASTER_ONLY and _master_controls_fleet(world_state):
+        return
+
     claimed_id = decision.get("claim_task_id")
     if claimed_id is not None:
         task = next(
@@ -1746,7 +1749,6 @@ def _apply_worker_decision(
             if assigned_to in (None, worker["id"]):
                 _assign_task_to_robot(worker, task, world_state)
             else:
-                # Take over from a leader only if we're closer to the pickup.
                 leader = next(
                     (r for r in world_state["robots"] if r["id"] == assigned_to),
                     None,
@@ -1771,7 +1773,9 @@ def _apply_worker_decision(
 
 
 def _assign_idle_workers(world_state: dict, blackboard: Blackboard) -> None:
-    """Rule-based worker dispatch — runs every leader tick when ALL_AGENTS_LLM=false."""
+    """Rule-based worker dispatch — disabled when the master owns the fleet queue."""
+    if _FLEET_MASTER_ONLY and _master_controls_fleet(world_state):
+        return
     idle_workers = [
         r for r in world_state["robots"]
         if r["role"] == WORKER and r.get("current_task") is None and not r.get("path")
@@ -2146,7 +2150,8 @@ def main() -> None:
     blackboard.post(
         -1,
         "STRATEGY",
-        "FactoryMind ready — workers auto-dispatch on load; chat can add more tasks.",
+        "FactoryMind ready — MASTER dispatches from chat (e.g. 'do 5 tasks for Parts'). "
+        "Workers follow orders exactly; set FACTORYMIND_AUTO_START=true to queue on load.",
     )
     _bootstrap_demo_run(world_state, blackboard)
     manual_control = False
@@ -2307,52 +2312,53 @@ def main() -> None:
         # --- Sim logic: only runs while started ---
         if _sim_started:
             if not manual_control:
-                # --- Leader ticks (dispatch async LLM calls) ---
-                if now - last_leader_tick >= LEADER_TICK_INTERVAL:
-                    for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
-                        if leader["id"] in _pending_leader:
-                            continue  # previous decision still in flight; don't pile up
-                        _pending_leader[leader["id"]] = _decision_executor.submit(
-                            leader_decide, leader, world_state, blackboard,
-                        )
-                    last_leader_tick = now
-
-                # --- Worker ticks: each ball is its own LLM-driven agent ---
-                if now - last_worker_tick >= WORKER_TICK_INTERVAL:
-                    if _ALL_AGENTS_LLM:
-                        workers = [r for r in world_state["robots"] if r["role"] == WORKER]
-                        for worker in workers:
-                            if worker["id"] in _pending_worker:
+                master_only = _FLEET_MASTER_ONLY and _master_controls_fleet(world_state)
+                if not master_only:
+                    # --- Leader ticks (dispatch async LLM calls) ---
+                    if now - last_leader_tick >= LEADER_TICK_INTERVAL:
+                        for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
+                            if leader["id"] in _pending_leader:
                                 continue
-                            if worker.get("current_task") is not None:
-                                continue  # busy executing a claim — let it finish
-                            _pending_worker[worker["id"]] = _decision_executor.submit(
-                                worker_decide, worker, world_state, blackboard,
+                            _pending_leader[leader["id"]] = _decision_executor.submit(
+                                leader_decide, leader, world_state, blackboard,
                             )
-                    else:
-                        _assign_idle_workers(world_state, blackboard)
-                    last_worker_tick = now
+                        last_leader_tick = now
 
-                # --- Strategist tick (one in flight at a time) ---
-                if (
-                    now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
-                    and _pending_strategist is None
-                ):
-                    try:
-                        state_description = M.describe_world_state(world_state)
-                        retrieved = M.retrieve_strategies(
-                            world_state["layout"],
-                            state_description=state_description,
+                    # --- Worker ticks (only when master is NOT controlling the fleet) ---
+                    if now - last_worker_tick >= WORKER_TICK_INTERVAL:
+                        if _ALL_AGENTS_LLM:
+                            workers = [r for r in world_state["robots"] if r["role"] == WORKER]
+                            for worker in workers:
+                                if worker["id"] in _pending_worker:
+                                    continue
+                                if worker.get("current_task") is not None:
+                                    continue
+                                _pending_worker[worker["id"]] = _decision_executor.submit(
+                                    worker_decide, worker, world_state, blackboard,
+                                )
+                        else:
+                            _assign_idle_workers(world_state, blackboard)
+                        last_worker_tick = now
+
+                    if (
+                        now - last_strategist_tick >= STRATEGIST_TICK_INTERVAL
+                        and _pending_strategist is None
+                    ):
+                        try:
+                            state_description = M.describe_world_state(world_state)
+                            retrieved = M.retrieve_strategies(
+                                world_state["layout"],
+                                state_description=state_description,
+                            )
+                        except Exception as exc:
+                            print(f"[main] strategy retrieval failed: {exc}", file=sys.stderr, flush=True)
+                            retrieved = []
+                        _pending_strategist = _decision_executor.submit(
+                            strategist_decide, world_state, blackboard, retrieved,
                         )
-                    except Exception as exc:
-                        print(f"[main] strategy retrieval failed: {exc}", file=sys.stderr, flush=True)
-                        retrieved = []
-                    _pending_strategist = _decision_executor.submit(
-                        strategist_decide, world_state, blackboard, retrieved,
-                    )
-                    last_strategist_tick = now
+                        last_strategist_tick = now
 
-            # --- Autonomous fleet dispatch (cheap; runs every loop iteration) ---
+            # --- Master fleet dispatch (deterministic; runs every tick while queued) ---
             if world_state.get("task_queue"):
                 _fleet_dispatch_step(world_state, blackboard)
 

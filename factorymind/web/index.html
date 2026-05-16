@@ -535,7 +535,7 @@ function makeTruck(x, z, rotY = 0) {
 }
 
 // ---------------------------------------------------------------------------
-// Build perimeter, pillars, trusses, and scattered outdoor props
+// Build perimeter, pillars, wall lights, and scattered outdoor props
 // ---------------------------------------------------------------------------
 {
   const half = GRID / 2;
@@ -573,43 +573,17 @@ function makeTruck(x, z, rotY = 0) {
   scene.add(makeCornerPillar(-PERIM_OFFSET,        GRID + PERIM_OFFSET));
   scene.add(makeCornerPillar(GRID + PERIM_OFFSET,  GRID + PERIM_OFFSET));
 
-  // Cathedral roof — trusses + hanging high-bay lights.
-  for (let z = 6; z < GRID; z += 10) {
-    const truss = new THREE.Mesh(
-      new THREE.BoxGeometry(GRID + 6, 0.35, 0.65),
-      matTruss,
-    );
-    truss.position.set(GRID / 2, ROOF_H - 1.2, z);
-    scene.add(truss);
-
+  // Open ceiling (no indoor roof) — perimeter wall lights only.
+  for (let z = 8; z < GRID; z += 12) {
     const strip = new THREE.Mesh(
       new THREE.BoxGeometry(GRID + 2, 0.08, 0.28),
       matLightStrip,
     );
-    strip.position.set(GRID / 2, ROOF_H - 1.45, z);
+    strip.position.set(GRID / 2, WALL_H + 0.6, z);
     scene.add(strip);
-
-    for (let lx = 8; lx < GRID; lx += 14) {
-      const housing = new THREE.Mesh(
-        new THREE.BoxGeometry(1.8, 0.35, 0.9),
-        new THREE.MeshStandardMaterial({ color: 0x2a2a40, metalness: 0.6, roughness: 0.4 }),
-      );
-      housing.position.set(lx, ROOF_H - 2.0, z);
-      scene.add(housing);
-      const bulb = new THREE.PointLight(0xfff0d0, 0.35, 16);
-      bulb.position.set(lx, ROOF_H - 2.2, z);
-      scene.add(bulb);
-    }
-  }
-
-  // Roof spine beams along X.
-  for (let x = 5; x < GRID; x += 12) {
-    const spine = new THREE.Mesh(
-      new THREE.BoxGeometry(0.45, ROOF_H, GRID + 4),
-      matPillar,
-    );
-    spine.position.set(x, ROOF_H / 2, GRID / 2);
-    scene.add(spine);
+    const bulb = new THREE.PointLight(0xfff0d0, 0.45, 22);
+    bulb.position.set(GRID / 2, WALL_H + 0.8, z);
+    scene.add(bulb);
   }
 
   // Decorative props scattered OUTSIDE the playable area only — never in 0..GRID.

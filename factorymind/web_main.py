@@ -144,7 +144,7 @@ def run() -> None:
     blackboard.post(-1, "POLICY", f"OpenClaw runtime active: {engine.describe()}")
     blackboard.post(
         -1, "STRATEGY",
-        "FactoryMind 3D ready — workers auto-dispatch on load; chat can add more tasks.",
+        "FactoryMind 3D — MASTER dispatches from chat; workers execute assigned routes only.",
     )
     M._bootstrap_demo_run(world_state, blackboard)
     manual_control = False
@@ -261,50 +261,51 @@ def run() -> None:
             # ---- only run the simulation once started ---------------------
             if M._sim_started:
                 if not manual_control:
-                    if now - timers["last_leader_tick"] >= M.LEADER_TICK_INTERVAL:
-                        for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
-                            if leader["id"] in M._pending_leader:
-                                continue
-                            M._pending_leader[leader["id"]] = M._decision_executor.submit(
-                                leader_decide, leader, world_state, blackboard,
-                            )
-                        timers["last_leader_tick"] = now
-
-                    if now - timers["last_worker_tick"] >= M.WORKER_TICK_INTERVAL:
-                        if M._ALL_AGENTS_LLM:
-                            for worker in [r for r in world_state["robots"] if r["role"] == WORKER]:
-                                if worker["id"] in M._pending_worker:
+                    master_only = (
+                        M._FLEET_MASTER_ONLY and M._master_controls_fleet(world_state)
+                    )
+                    if not master_only:
+                        if now - timers["last_leader_tick"] >= M.LEADER_TICK_INTERVAL:
+                            for leader in [r for r in world_state["robots"] if r["role"] == LEADER]:
+                                if leader["id"] in M._pending_leader:
                                     continue
-                                if worker.get("current_task") is not None:
-                                    continue
-                                M._pending_worker[worker["id"]] = M._decision_executor.submit(
-                                    worker_decide, worker, world_state, blackboard,
+                                M._pending_leader[leader["id"]] = M._decision_executor.submit(
+                                    leader_decide, leader, world_state, blackboard,
                                 )
-                        else:
-                            M._assign_idle_workers(world_state, blackboard)
-                        timers["last_worker_tick"] = now
+                            timers["last_leader_tick"] = now
 
-                    if (
-                        now - timers["last_strategist_tick"] >= M.STRATEGIST_TICK_INTERVAL
-                        and M._pending_strategist is None
-                    ):
-                        try:
-                            retrieved = MEM.retrieve_strategies(
-                                world_state["layout"],
-                                state_description=MEM.describe_world_state(world_state),
+                        if now - timers["last_worker_tick"] >= M.WORKER_TICK_INTERVAL:
+                            if M._ALL_AGENTS_LLM:
+                                for worker in [r for r in world_state["robots"] if r["role"] == WORKER]:
+                                    if worker["id"] in M._pending_worker:
+                                        continue
+                                    if worker.get("current_task") is not None:
+                                        continue
+                                    M._pending_worker[worker["id"]] = M._decision_executor.submit(
+                                        worker_decide, worker, world_state, blackboard,
+                                    )
+                            else:
+                                M._assign_idle_workers(world_state, blackboard)
+                            timers["last_worker_tick"] = now
+
+                        if (
+                            now - timers["last_strategist_tick"] >= M.STRATEGIST_TICK_INTERVAL
+                            and M._pending_strategist is None
+                        ):
+                            try:
+                                retrieved = MEM.retrieve_strategies(
+                                    world_state["layout"],
+                                    state_description=MEM.describe_world_state(world_state),
+                                )
+                            except Exception as exc:
+                                print(f"[web] strategy retrieval failed: {exc}",
+                                      file=sys.stderr, flush=True)
+                                retrieved = []
+                            M._pending_strategist = M._decision_executor.submit(
+                                strategist_decide, world_state, blackboard, retrieved,
                             )
-                        except Exception as exc:
-                            print(f"[web] strategy retrieval failed: {exc}",
-                                  file=sys.stderr, flush=True)
-                            retrieved = []
-                        M._pending_strategist = M._decision_executor.submit(
-                            strategist_decide, world_state, blackboard, retrieved,
-                        )
-                        timers["last_strategist_tick"] = now
+                            timers["last_strategist_tick"] = now
 
-                # Autonomous fleet dispatcher — drains queued tasks one at a
-                # time onto whichever worker is closest and free. Each
-                # delegation is gated by NemoClaw (see _fleet_dispatch_step).
                 if world_state.get("task_queue"):
                     M._fleet_dispatch_step(world_state, blackboard)
 

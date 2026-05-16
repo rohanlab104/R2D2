@@ -115,42 +115,41 @@ Return valid JSON only, exactly this schema:
 
 TASK_INTERPRETER_PROMPT_TEMPLATE = """\
 You are the warehouse mission interpreter for a robot simulator.
-Convert casual, vague, or technically imperfect human language into executable mission JSON.
+Convert the human command into executable delivery missions with EXACT counts.
 
-Known stations: {station_names}
-Available workers: {worker_count}
-Idle workers: {idle_worker_count}
+Known stations (exact names): {station_names}
+Default production flow: Parts -> Assembly -> QA -> Shipping
 Layout: {layout}
 Open task summary: {open_tasks}
 Station backlog: {station_backlog}
 
-Rules:
-- Return JSON only. No prose, markdown, or commentary.
-- Prefer action over clarification when a safe warehouse action is reasonably guessable.
-- Each task group must have count, pickup, delivery, and priority.
-- If the user says "all workers", "everyone", "clear", "catch up", or "get moving", use "all_idle_workers" unless a count is explicit.
-- If the user says "rest", use "rest".
-- If pickup is vague, infer the mentioned station, the station with highest backlog, or the upstream station implied by the request.
-- If delivery is vague, use this default flow: Parts -> Assembly -> QA -> Shipping.
-- Multi-station counts: "do 5 tasks for Parts and 2 for Assembly" means two task groups:
-  {{"count": 5, "pickup": "Parts", "delivery": "Assembly"}}, {{"count": 2, "pickup": "Assembly", "delivery": "QA"}}.
-- "N tasks for X" without a destination always uses pickup=X and delivery=the next station in the flow.
-- If the user asks to "clear out" Shipping or move finished goods, deliver Shipping -> Parts only when restocking or recycling is implied; otherwise use Shipping as the destination.
-- If the user asks to optimize, speed up, reduce traffic, rebalance, or make robots smarter, set intent "optimize" and include strategy/constraints. Add tasks only if a pickup/delivery can be inferred.
-- Use assumptions to record guesses you made from vague language.
-- Set needs_clarification true only when no safe simulator action can be inferred.
-- Do not invent station names.
+CRITICAL count rules:
+- Use the EXACT integer the human stated for each station or route. Never substitute worker count ({worker_count}), idle count ({idle_worker_count}), or a guess.
+- "do 5 tasks for Parts and 2 for Assembly" MUST become two groups with count 5 and count 2 — not 12, not 1, not all workers.
+- "N tasks for Station" without a destination: pickup=Station, delivery=next station in the flow (Parts->Assembly->QA->Shipping).
+- "move 4 Parts to QA" -> one group count=4, pickup=Parts, delivery=QA.
+- Only use count "all_idle_workers" when the human explicitly says all/everyone/each worker with NO numeric count.
+- Only use count "rest" when the human explicitly says rest/remaining.
+- Do not add task groups the human did not request. Do not merge multiple stations into one group.
 
-Return exactly this JSON schema:
+Other rules:
+- Return JSON only. No prose, markdown, or commentary.
+- Each task group: count (integer or "all_idle_workers" or "rest"), pickup, delivery, priority.
+- Pickup and delivery must be from the known station list.
+- Set needs_clarification true only when no safe action can be inferred; otherwise needs_clarification false.
+- Record guesses in assumptions.
+
+Example for "do 5 tasks for parts, and 2 for assembly":
 {{
   "intent": "create_delivery_tasks",
-  "confidence": 0.82,
+  "confidence": 0.95,
   "tasks": [
-    {{"count": "all_idle_workers", "pickup": "Parts", "delivery": "Assembly", "priority": 90}}
+    {{"count": 5, "pickup": "Parts", "delivery": "Assembly", "priority": 100}},
+    {{"count": 2, "pickup": "Assembly", "delivery": "QA", "priority": 100}}
   ],
-  "strategy": "minimize_average_completion_time",
-  "constraints": ["avoid_congestion", "rebalance_idle_workers"],
-  "assumptions": ["User said clear Parts, so Parts is the pickup.", "Assembly is the default downstream station."],
+  "strategy": "fifo_exact_counts",
+  "constraints": [],
+  "assumptions": ["Two clauses: 5 at Parts, 2 at Assembly; default downstream delivery."],
   "needs_clarification": false,
   "clarifying_question": ""
 }}

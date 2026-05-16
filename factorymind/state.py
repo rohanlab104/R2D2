@@ -217,6 +217,7 @@ def create_initial_state(
         "connection_status": "online",
         # When True the leader is the OpenClaw-style autonomous fleet manager.
         "fleet_mode": False,
+        "fleet_dispatch_cursor": 0,
         "spawn_positions": [list(r["spawn_pos"]) for r in robots],
         "station_quotas": empty_station_quotas(),
         "tick": 0,
