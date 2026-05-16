@@ -98,6 +98,7 @@ _builder_dragged_cells: set                       = set()
 # Chat input state
 _chat_text:    str  = ""
 _chat_focused: bool = False
+_CHAT_MAX_CHARS = 320
 
 # Button rects — updated every frame by draw_sidepanel
 _BTN_DISCONNECT:   Optional["pygame.Rect"] = None
@@ -343,7 +344,7 @@ def _handle_chat_keydown(event: "pygame.event.Event") -> Optional[dict]:
         _chat_text = _chat_text[:-1]
     elif event.key == pygame.K_ESCAPE:
         _chat_focused = False
-    elif event.unicode and len(_chat_text) < 120:
+    elif event.unicode and len(_chat_text) < _CHAT_MAX_CHARS:
         _chat_text += event.unicode
     return None
 
@@ -733,7 +734,7 @@ def draw_sidepanel(screen: "pygame.Surface", world_state: dict) -> None:
     pygame.draw.rect(screen, bdr, _BTN_CHAT_INPUT, 2 if _chat_focused else 1, border_radius=4)
 
     if _chat_text:
-        disp = _chat_text[-36:]
+        disp = _chat_text[-44:]
         ct   = f_chat.render(disp, True, C_TEXT)
     else:
         ct   = f_chat.render("Give the agents a task...", True, C_DIM)
