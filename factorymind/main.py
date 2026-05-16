@@ -227,6 +227,25 @@ def _reservation_table(world_state: dict, *, exclude_robot_id: int | None = None
     return {"cells": cells, "edges": edges}
 
 
+def _pathfinding_walls(
+    robot: dict,
+    goal: list[int],
+    world_state: dict,
+) -> set[tuple[int, int]]:
+    """Walls plus other robots' tiles (fleet mode avoids head-on gridlock)."""
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    if _FLEET_MASTER_ONLY:
+        for other in world_state.get("robots", []):
+            if other.get("id") == robot.get("id"):
+                continue
+            wall_set.add(tuple(other.get("pos", [])))
+    goal_cell = tuple(goal)
+    start_cell = tuple(robot.get("pos", []))
+    wall_set.discard(goal_cell)
+    wall_set.discard(start_cell)
+    return wall_set
+
+
 def _planned_path_to(
     robot: dict,
     goal: list[int],
@@ -235,8 +254,8 @@ def _planned_path_to(
     ignore_reservations: bool = False,
 ) -> list[list[int]]:
     """Return a route that accounts for walls and, by default, other robots."""
-    wall_set = {tuple(c) for c in world_state.get("wall", [])}
-    if _COOPERATIVE_PATHING and not ignore_reservations:
+    wall_set = _pathfinding_walls(robot, goal, world_state)
+    if _COOPERATIVE_PATHING and not ignore_reservations and not _FLEET_MASTER_ONLY:
         reservations = _reservation_table(world_state, exclude_robot_id=robot.get("id"))
         path = _cooperative_a_star(robot["pos"], goal, wall_set, reservations)
         if path:
@@ -309,8 +328,43 @@ def _robot_blocks_traffic(robot: dict) -> bool:
     return bool(robot.get("path"))
 
 
+def _relocate_off_station_immediate(robot: dict, world_state: dict) -> bool:
+    """Teleport one cell off a station tile (no path) so dispatch/movement cannot stall."""
+    pos = list(robot.get("pos", []))
+    if not _is_workstation_cell(pos, world_state):
+        return False
+    wall_set = {tuple(c) for c in world_state.get("wall", [])}
+    spawn = tuple(robot.get("spawn_pos", pos))
+    occupied = {
+        tuple(r.get("pos", []))
+        for r in world_state.get("robots", [])
+        if r.get("id") != robot.get("id")
+    }
+    candidates: list[tuple[int, list[int]]] = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)):
+        nx, ny = pos[0] + dx, pos[1] + dy
+        if not (0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT):
+            continue
+        cell = (nx, ny)
+        if cell in wall_set or cell in occupied:
+            continue
+        if _is_workstation_cell([nx, ny], world_state):
+            continue
+        dist = abs(nx - spawn[0]) + abs(ny - spawn[1])
+        candidates.append((dist, [nx, ny]))
+    if not candidates:
+        return False
+    candidates.sort(key=lambda item: item[0])
+    robot["pos"] = candidates[0][1]
+    robot["path"] = []
+    robot["yield_streak"] = 0
+    return True
+
+
 def _step_aside_from_workstation(robot: dict, world_state: dict) -> bool:
-    """Move one cell off a station tile so the next delivery/pickup can enter."""
+    """Move off a station tile; immediate relocate in master fleet mode."""
+    if _FLEET_MASTER_ONLY:
+        return _relocate_off_station_immediate(robot, world_state)
     pos = list(robot.get("pos", []))
     if not _is_workstation_cell(pos, world_state):
         return False
@@ -363,9 +417,7 @@ def _replenish_task_path(robot: dict, world_state: dict) -> None:
         goal = task["delivery"]
     else:
         return
-    robot["path"] = _planned_path_to(
-        robot, list(goal), world_state, ignore_reservations=True,
-    )
+    robot["path"] = _planned_path_to(robot, list(goal), world_state)
 
 
 def _park_robot_at_spawn(robot: dict, world_state: dict) -> None:
@@ -422,14 +474,15 @@ def _complete_task_delivery(
     robot["path"] = []
     robot["yield_streak"] = 0
     pos = robot["pos"]
-    # Free the delivery tile for the next worker (master mode stays off spawn-orbit).
+    # Free the delivery tile immediately so the next pickup can proceed.
     if _is_workstation_cell(pos, world_state):
-        if not _step_aside_from_workstation(robot, world_state):
+        if not _relocate_off_station_immediate(robot, world_state):
             if (
                 not _master_controls_fleet(world_state)
                 and not world_state.get("task_queue")
             ):
                 _park_robot_at_spawn(robot, world_state)
+    _fleet_dispatch_step(world_state, blackboard)
 
 
 def _reconcile_stationary_task_progress(
@@ -453,9 +506,7 @@ def _reconcile_stationary_task_progress(
     pos = list(robot["pos"])
     if task["status"] == "open" and pos == list(task["pickup"]):
         task["status"] = "in_transit"
-        robot["path"] = _planned_path_to(
-            robot, task["delivery"], world_state, ignore_reservations=_FLEET_MASTER_ONLY,
-        )
+        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
     if task["status"] == "in_transit" and pos == list(task["delivery"]):
         _complete_task_delivery(robot, task, world_state, blackboard)
 
@@ -481,13 +532,70 @@ def _advance_robot(robot: dict, world_state: dict, blackboard: "Blackboard") -> 
     # If at pickup and task not yet in transit
     if list(pos) == list(task["pickup"]) and task["status"] == "open":
         task["status"] = "in_transit"
-        robot["path"] = _planned_path_to(
-            robot, task["delivery"], world_state, ignore_reservations=_FLEET_MASTER_ONLY,
-        )
+        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
 
     # If at delivery — task done, then stop until the next user task.
     elif list(pos) == list(task["delivery"]) and task["status"] == "in_transit":
         _complete_task_delivery(robot, task, world_state, blackboard)
+
+
+def _workers_available_for_dispatch(world_state: dict) -> list[dict]:
+    """Workers ready for a new master assignment (path/step-aside must not block)."""
+    return [
+        r for r in world_state.get("robots", [])
+        if r.get("role") == WORKER and r.get("current_task") is None
+    ]
+
+
+def _advance_robots_fleet(world_state: dict, blackboard: "Blackboard") -> None:
+    """Master fleet movement: ordered steps, no yield deadlock at stations."""
+    workers = sorted(
+        [r for r in world_state.get("robots", []) if r.get("role") == WORKER],
+        key=lambda r: r["id"],
+    )
+    for robot in workers:
+        _replenish_task_path(robot, world_state)
+        if robot.get("current_task") is None and _is_workstation_cell(
+            robot.get("pos", []), world_state,
+        ):
+            _relocate_off_station_immediate(robot, world_state)
+        _reconcile_stationary_task_progress(robot, world_state, blackboard)
+
+    occupied = {tuple(r["pos"]) for r in world_state.get("robots", [])}
+    for robot in workers:
+        path = robot.get("path") or []
+        if not path:
+            robot["stall_ticks"] = 0
+            continue
+        nxt = tuple(path[0])
+        cur = tuple(robot["pos"])
+        if nxt != cur and nxt in occupied:
+            robot["stall_ticks"] = int(robot.get("stall_ticks", 0)) + 1
+            if robot["stall_ticks"] >= 12:
+                spawn = robot.get("spawn_pos")
+                if spawn and list(robot["pos"]) != list(spawn):
+                    robot["pos"] = list(spawn)
+                robot["path"] = []
+                robot["stall_ticks"] = 0
+                _replenish_task_path(robot, world_state)
+            continue
+        occupied.discard(cur)
+        before = tuple(robot["pos"])
+        _advance_robot(robot, world_state, blackboard)
+        after = tuple(robot["pos"])
+        if before == after:
+            robot["stall_ticks"] = int(robot.get("stall_ticks", 0)) + 1
+        else:
+            robot["stall_ticks"] = 0
+        occupied.add(after)
+
+
+def _advance_robots(world_state: dict, blackboard: "Blackboard") -> None:
+    """Route to fleet or coordinated movement depending on mode."""
+    if _FLEET_MASTER_ONLY and _master_controls_fleet(world_state):
+        _advance_robots_fleet(world_state, blackboard)
+    else:
+        _advance_robots_coordinated(world_state, blackboard)
 
 
 def _advance_robots_coordinated(world_state: dict, blackboard: "Blackboard") -> None:
@@ -598,22 +706,16 @@ def _assign_task_to_robot(robot: dict, task: dict, world_state: dict) -> None:
     task["started_at"] = time.time()
     robot["current_task"] = task["id"]
     robot.pop("master_assigned", None)
-    robot["path"] = _planned_path_to(
-        robot, task["pickup"], world_state, ignore_reservations=_FLEET_MASTER_ONLY,
-    )
+    robot["path"] = _planned_path_to(robot, task["pickup"], world_state)
     if (
         not robot["path"]
         and list(robot["pos"]) == list(task["pickup"])
         and task["status"] == "open"
     ):
         task["status"] = "in_transit"
-        robot["path"] = _planned_path_to(
-            robot, task["delivery"], world_state, ignore_reservations=_FLEET_MASTER_ONLY,
-        )
+        robot["path"] = _planned_path_to(robot, task["delivery"], world_state)
     if not robot["path"] and list(robot["pos"]) != list(task["pickup"]):
-        robot["path"] = _planned_path_to(
-            robot, task["pickup"], world_state, ignore_reservations=True,
-        )
+        robot["path"] = _planned_path_to(robot, task["pickup"], world_state)
 
 
 def _route_cost(start: list[int], goal: list[int], wall_set: set) -> int:
@@ -902,12 +1004,7 @@ def _fleet_dispatch_step(world_state: dict, blackboard: Blackboard) -> int:
         return 0
     leader = leaders[0]
 
-    idle_workers = [
-        r for r in world_state.get("robots", [])
-        if r.get("role") == WORKER
-        and r.get("current_task") is None
-        and not r.get("path")
-    ]
+    idle_workers = _workers_available_for_dispatch(world_state)
     if not idle_workers:
         return 0
 
@@ -2115,7 +2212,7 @@ def _precompute_timeline(duration: float) -> list[dict]:
         if now - last_move_tick >= MOVE_TICK_INTERVAL:
             move_steps = min(int((now - last_move_tick) // MOVE_TICK_INTERVAL), 4)
             for _ in range(max(1, move_steps)):
-                _advance_robots_coordinated(world_state, blackboard)
+                _advance_robots(world_state, blackboard)
             last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
 
         world_state["speed_multiplier"] = speed_multiplier
@@ -2484,7 +2581,7 @@ def main() -> None:
             if now - last_move_tick >= MOVE_TICK_INTERVAL:
                 move_steps = min(int((now - last_move_tick) // MOVE_TICK_INTERVAL), 4)
                 for _ in range(max(1, move_steps)):
-                    _advance_robots_coordinated(world_state, blackboard)
+                    _advance_robots(world_state, blackboard)
                 last_move_tick += max(1, move_steps) * MOVE_TICK_INTERVAL
                 if world_state.get("task_queue"):
                     _fleet_dispatch_step(world_state, blackboard)

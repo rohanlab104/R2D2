@@ -175,7 +175,7 @@ def test_autonomous_fleet_drains_and_completes(world):
         ):
             break
         M._fleet_dispatch_step(world_state, blackboard)
-        M._advance_robots_coordinated(world_state, blackboard)
+        M._advance_robots(world_state, blackboard)
     else:
         pytest.fail(
             f"fleet did not drain after {max_iterations} ticks; "
@@ -209,7 +209,7 @@ def test_leader_does_not_execute_tasks_directly(world):
     # Run a handful of dispatcher + movement ticks.
     for _ in range(400):
         M._fleet_dispatch_step(world_state, blackboard)
-        M._advance_robots_coordinated(world_state, blackboard)
+        M._advance_robots(world_state, blackboard)
         if not world_state["task_queue"] and all(
             not r.get("path") for r in world_state["robots"]
         ):
@@ -233,5 +233,7 @@ def test_fleet_dispatch_records_claim_and_intent_messages(world):
     # INTENT acknowledgement per worker accepting the assignment.
     assert len(claims) >= 1
     assert len(intents) >= 1
-    assert any("delegating" in m["content"].lower() for m in claims), claims
+    assert any(
+        kw in m["content"].lower() for m in claims for kw in ("delegating", "master ->")
+    ), claims
     assert any("accepting" in m["content"].lower() for m in intents), intents

@@ -312,7 +312,7 @@ def run() -> None:
                 if now - timers["last_move_tick"] >= M.MOVE_TICK_INTERVAL:
                     move_steps = min(int((now - timers["last_move_tick"]) // M.MOVE_TICK_INTERVAL), 4)
                     for _ in range(max(1, move_steps)):
-                        M._advance_robots_coordinated(world_state, blackboard)
+                        M._advance_robots(world_state, blackboard)
                     timers["last_move_tick"] += max(1, move_steps) * M.MOVE_TICK_INTERVAL
                     if world_state.get("task_queue"):
                         M._fleet_dispatch_step(world_state, blackboard)
