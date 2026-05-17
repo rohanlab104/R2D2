@@ -156,10 +156,5 @@ python3 -m pytest tests/
 
 ## Where inference actually runs
 
-`factorymind/inference.py` is only an **HTTP client**. GPUs execute models **wherever the base URL points**: **this machine** (e.g. DGX Spark with NIM on localhost), **another host** on the LAN, or **NVIDIA cloud**. The **Python simulation** itself runs on a laptop or workstation without a GPU.
-
+`factorymind/inference.py` is only an **HTTP client**. GPUs execute models on DGX Spark with NIM on localhost
 ---
-
-## License / attribution
-
-Add your team’s license and hackathon attribution if required. This README describes the FactoryMind R2D2 demo as shipped in this repository.
