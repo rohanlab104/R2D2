@@ -1,6 +1,6 @@
 # FactoryMind R2D2
 
-**FactoryMind R2D2** is a research and demo stack for orchestrating **general-purpose autonomous robots** in a **factory or warehouse** setting. It combines a real-time **digital twin** simulation, **path planning**, and an **optional AI leader** (NVIDIA **Nemotron** via NIM or cloud) that proposes work assignments—while **NemoClaw-style policies** define what the leader and workers are allowed to do.
+**FactoryMind R2D2** is a research and demo stack for orchestrating **general-purpose autonomous robots** in a **factory or warehouse** setting. It combines a real-time **digital twin** simulation, **path planning**, and an **optional AI leader** (NVIDIA **Nemotron** via NIM) that proposes work assignments—while **NemoClaw-style policies** define what the leader and workers are allowed to do.
 
 The project makes concrete a problem many operations teams face: *how to coordinate many mobile agents safely under one “brain,” with guardrails, without each robot running unconstrained logic.* Here, that brain is explicit, inspectable, and policy-bound.
 
@@ -15,7 +15,7 @@ Modern warehouses and plants mix **fixed automation** (conveyors, AS/RS) with **
 - **Predictable fallback** when the cloud, GPU host, or model endpoint is slow or down  
 - Something you can **demo, replay, and explain** to stakeholders—not only a slide deck  
 
-FactoryMind R2D2 is a **compact simulation** that stresses exactly those ideas: multi-agent dispatch, constraints, and optional LLM reasoning—without requiring a full ROS stack to get started.
+FactoryMind R2D2 is a **compact simulation** that stresses exactly those ideas: multi-agent dispatch, constraints, and optional LLM reasoning.
 
 ---
 
@@ -27,9 +27,6 @@ FactoryMind R2D2 is a **compact simulation** that stresses exactly those ideas: 
 | **Planning** | `A*` pathfinding and a **deterministic assignment** planner (nearest idle worker to pad + matching-color drop box) so the system always runs. |
 | **Optional AI** | The **leader** can call **Nemotron** (`factorymind/inference.py`) to output JSON assignments; output is **validated** and ignored if illegal. |
 | **Governance** | `scripts/nemoclaw_policy.yaml` describes **allow/deny** rules for leader vs worker; the runtime **loads** it and **logs** decisions to `logs/nemoclaw.log`. |
-| **Digital twin UI** | **Three.js** viewer served over **stdlib HTTP** (`factorymind/web_server.py`) so you can watch the floor from a browser. |
-
-This is **not** a production WMS or fleet manager. It is a **credible slice** of one: enough to show how policy, models, and visualization fit together on a laptop or on a **DGX Spark / GX10** class box running **local NIM**.
 
 ---
 
